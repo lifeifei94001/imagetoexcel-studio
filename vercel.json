@@ -1,0 +1,25 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "frontend/package.json",
+      "use": "@vercel/static-build",
+      "config": { "distDir": "dist" }
+    },
+    {
+      "src": "backend/main.py",
+      "use": "@vercel/python",
+      "config": {
+        "maxDuration": 60,
+        "excludeFiles": "{frontend/**,node_modules/**,.git/**,storage/**,*.db,*.db-*}"
+      }
+    }
+  ],
+  "routes": [
+    { "src": "/api/(.*)", "dest": "backend/main.py" },
+    { "src": "/assets/(.*)", "dest": "frontend/assets/$1" },
+    { "src": "/samples/(.*)", "dest": "frontend/samples/$1" },
+    { "src": "/(.*\\.(js|css|ico|png|jpg|jpeg|svg|json|woff2?|ttf))", "dest": "frontend/$1" },
+    { "src": "/(.*)", "dest": "frontend/index.html" }
+  ]
+}

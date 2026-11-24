@@ -1,0 +1,12 @@
+node_modules/
+frontend/dist/
+backend/__pycache__/
+backend/**/__pycache__/
+*.pyc
+backend/*.db
+backend/*.db-*
+storage/
+.env
+.vercel/
+
+.vercel
