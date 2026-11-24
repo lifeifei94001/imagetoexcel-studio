@@ -23,6 +23,7 @@ from services.ocr_service import (
     extract_tables_from_image,
     get_active_model,
     has_gemini_key,
+    merge_quotation_slices,
 )
 
 router = APIRouter(prefix="/api", tags=["convert"])
@@ -180,55 +181,27 @@ def create_batch_job(req: CreateJobRequest, session: Session = Depends(get_sessi
     return job.model_dump()
 
 
-@router.post("/jobs/{job_uid}/process-item")
-async def process_batch_item(
-    job_uid: str,
-    file: UploadFile = File(...),
-    item_index: int = Form(0),
-    mode: str = Form("excel"),
-    force_demo: bool = Form(False),
-    custom_hint: str = Form(""),
-    merge_per_image: bool = Form(True),
-    session: Session = Depends(get_session),
+class CommitQuotationRequest(BaseModel):
+    item_index: int = 0
+    source_filename: str
+    file_size_bytes: int = 0
+    mode: str = "excel"
+    merge_per_image: bool = True
+    slice_results: List[Dict[str, Any]] = []
+    failed_error: str = ""
+
+
+def _persist_completed_quotation(
+    session: Session,
+    job: BatchJob,
+    quota: DailyQuota,
+    item_index: int,
+    fname: str,
+    file_size_bytes: int,
+    mode: str,
+    merge_per_image: bool,
+    result: Dict[str, Any],
 ) -> Dict[str, Any]:
-    job = session.exec(select(BatchJob).where(BatchJob.job_uid == job_uid)).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="未找到对应的批处理任务")
-
-    quota = _get_or_create_today_quota(session)
-    if not force_demo and has_gemini_key() and (quota.used_count + 1 > quota.daily_limit):
-        raise HTTPException(status_code=429, detail="今日免费转换次数已达上限，请明日再试或开启演示模式")
-
-    raw_bytes = await file.read()
-    fname = _validate_upload_image(file, raw_bytes, item_index)
-
-    try:
-        result = extract_tables_from_image(
-            image_bytes=raw_bytes,
-            filename=fname,
-            content_type=file.content_type,
-            mode=mode,
-            force_demo=force_demo,
-            custom_hint=custom_hint,
-            merge_per_image=merge_per_image,
-        )
-    except RuntimeError as exc:
-        failed_item = BatchJobItem(
-            job_uid=job_uid,
-            item_index=item_index,
-            source_filename=fname[:120],
-            quote_title=Path(fname).stem[:48],
-            status="failed",
-            error_message=str(exc)[:300],
-            created_at=utc_now_str(),
-        )
-        job.failed_items += 1
-        job.updated_at = utc_now_str()
-        session.add(failed_item)
-        session.add(job)
-        session.commit()
-        raise HTTPException(status_code=502, detail=str(exc))
-
     used_engine = result.get("engine", "demo")
     is_demo = bool(result.get("is_demo", True))
     quote_title = result.get("quote_title") or Path(fname).stem
@@ -246,7 +219,7 @@ async def process_batch_item(
     target_sheet = merged_sheet if merge_per_image else (raw_sheets[0] if raw_sheets else merged_sheet)
     xlsx_bytes = build_single_xlsx_bytes(target_sheet)
     safe_xlsx_name = f"{_safe_filename(quote_title, Path(fname).stem)}.xlsx"
-    b2_xlsx_key = f"jobs/{job_uid}/{item_index + 1:02d}_{safe_xlsx_name}"
+    b2_xlsx_key = f"jobs/{job.job_uid}/{item_index + 1:02d}_{safe_xlsx_name}"
 
     try:
         stored_xlsx_ref = save_object(
@@ -263,7 +236,7 @@ async def process_batch_item(
     warn_cnt = len(merged_sheet.get("warnings") or [])
 
     job_item = BatchJobItem(
-        job_uid=job_uid,
+        job_uid=job.job_uid,
         item_index=item_index,
         source_filename=fname[:120],
         quote_title=quote_title[:64],
@@ -281,7 +254,7 @@ async def process_batch_item(
 
     record = ConversionRecord(
         filename=fname[:120],
-        file_size_bytes=len(raw_bytes),
+        file_size_bytes=file_size_bytes,
         mode=mode,
         engine=used_engine,
         sheet_count=1 if merge_per_image else len(raw_sheets),
@@ -304,7 +277,7 @@ async def process_batch_item(
     session.refresh(job_item)
 
     return {
-        "job_uid": job_uid,
+        "job_uid": job.job_uid,
         "item": job_item.model_dump(),
         "quotation": {
             "source_filename": fname,
@@ -324,6 +297,145 @@ async def process_batch_item(
             "remaining": max(0, quota.daily_limit - quota.used_count),
         },
     }
+
+
+@router.post("/extract-slice")
+async def extract_single_slice(
+    file: UploadFile = File(...),
+    slice_index: int = Form(0),
+    mode: str = Form("excel"),
+    force_demo: bool = Form(False),
+    custom_hint: str = Form(""),
+    model_tier: str = Form("fast"),
+) -> Dict[str, Any]:
+    """长图切片独立识别接口（仅返回结构化切片结果，待全部切片完成后再统一计费与入库）。"""
+    raw_bytes = await file.read()
+    fname = _validate_upload_image(file, raw_bytes, slice_index)
+    try:
+        result = extract_tables_from_image(
+            image_bytes=raw_bytes,
+            filename=fname,
+            content_type=file.content_type,
+            mode=mode,
+            force_demo=force_demo,
+            custom_hint=custom_hint,
+            merge_per_image=False,
+            model_tier=model_tier,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    return result
+
+
+@router.post("/jobs/{job_uid}/commit-quotation")
+def commit_sliced_quotation(
+    job_uid: str,
+    req: CommitQuotationRequest,
+    session: Session = Depends(get_session),
+) -> Dict[str, Any]:
+    """将长图各分段识别结果无损拼接、重叠去重，并生成单份 .xlsx 归档至 Backblaze B2。"""
+    job = session.exec(select(BatchJob).where(BatchJob.job_uid == job_uid)).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="未找到对应的批处理任务")
+
+    if req.failed_error and not req.slice_results:
+        failed_item = BatchJobItem(
+            job_uid=job_uid,
+            item_index=req.item_index,
+            source_filename=req.source_filename[:120],
+            quote_title=Path(req.source_filename).stem[:48],
+            status="failed",
+            error_message=req.failed_error[:300],
+            created_at=utc_now_str(),
+        )
+        job.failed_items += 1
+        job.updated_at = utc_now_str()
+        session.add(failed_item)
+        session.add(job)
+        session.commit()
+        return {"job_uid": job_uid, "item": failed_item.model_dump()}
+
+    quota = _get_or_create_today_quota(session)
+    merged_result = merge_quotation_slices(
+        req.slice_results,
+        filename=req.source_filename,
+        merge_per_image=req.merge_per_image,
+    )
+    return _persist_completed_quotation(
+        session=session,
+        job=job,
+        quota=quota,
+        item_index=req.item_index,
+        fname=req.source_filename,
+        file_size_bytes=req.file_size_bytes,
+        mode=req.mode,
+        merge_per_image=req.merge_per_image,
+        result=merged_result,
+    )
+
+
+@router.post("/jobs/{job_uid}/process-item")
+async def process_batch_item(
+    job_uid: str,
+    file: UploadFile = File(...),
+    item_index: int = Form(0),
+    mode: str = Form("excel"),
+    force_demo: bool = Form(False),
+    custom_hint: str = Form(""),
+    merge_per_image: bool = Form(True),
+    model_tier: str = Form("fast"),
+    session: Session = Depends(get_session),
+) -> Dict[str, Any]:
+    job = session.exec(select(BatchJob).where(BatchJob.job_uid == job_uid)).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="未找到对应的批处理任务")
+
+    quota = _get_or_create_today_quota(session)
+    if not force_demo and has_gemini_key() and (quota.used_count + 1 > quota.daily_limit):
+        raise HTTPException(status_code=429, detail="今日免费转换次数已达上限，请明日再试或开启演示模式")
+
+    raw_bytes = await file.read()
+    fname = _validate_upload_image(file, raw_bytes, item_index)
+
+    try:
+        result = extract_tables_from_image(
+            image_bytes=raw_bytes,
+            filename=fname,
+            content_type=file.content_type,
+            mode=mode,
+            force_demo=force_demo,
+            custom_hint=custom_hint,
+            merge_per_image=merge_per_image,
+            model_tier=model_tier,
+        )
+    except RuntimeError as exc:
+        failed_item = BatchJobItem(
+            job_uid=job_uid,
+            item_index=item_index,
+            source_filename=fname[:120],
+            quote_title=Path(fname).stem[:48],
+            status="failed",
+            error_message=str(exc)[:300],
+            created_at=utc_now_str(),
+        )
+        job.failed_items += 1
+        job.updated_at = utc_now_str()
+        session.add(failed_item)
+        session.add(job)
+        session.commit()
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    return _persist_completed_quotation(
+        session=session,
+        job=job,
+        quota=quota,
+        item_index=item_index,
+        fname=fname,
+        file_size_bytes=len(raw_bytes),
+        mode=mode,
+        merge_per_image=merge_per_image,
+        result=result,
+    )
 
 
 @router.post("/jobs/{job_uid}/finalize")

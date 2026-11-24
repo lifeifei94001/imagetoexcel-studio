@@ -227,6 +227,14 @@
                 </div>
 
                 <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px">
+                  <span style="font-size: 12.5px; font-weight: 600">识别模型档位：</span>
+                  <el-radio-group v-model="modelTier" size="small">
+                    <el-radio value="fast">极速稳定 (Flash Lite)</el-radio>
+                    <el-radio value="accurate">旗舰精读 (Hydrogen)</el-radio>
+                  </el-radio-group>
+                </div>
+
+                <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px">
                   <span style="font-size: 12.5px; font-weight: 600">多图默认打包：</span>
                   <el-radio-group v-model="outputMode" size="small">
                     <el-radio value="per_image">一图一表 (多图打包 .zip)</el-radio>
@@ -518,13 +526,15 @@ import SpotlightCard from "./components/SpotlightCard.vue";
 import CommandPalette, { type CommandItem } from "./components/CommandPalette.vue";
 import TableEditorPanel from "./components/TableEditorPanel.vue";
 import { useTheme } from "./composables/useTheme";
-import { prepareImageForUpload } from "./utils/imageCompressor";
+import { splitLongImageIntoSlices } from "./utils/imageCompressor";
 import {
+  commitSlicedQuotation,
   createBatchJob,
   deleteBatchJob,
   deleteHistoryRecord,
   downloadJobArtifact,
   extractApiError,
+  extractSlice,
   fetchBatchJobs,
   fetchHealth,
   fetchHistory,
@@ -558,6 +568,7 @@ const { theme, glass, activeTab } = useTheme();
 const mode = ref<"excel" | "text">("excel");
 const outputMode = ref<"all_in_one" | "per_image">("per_image");
 const mergePerImage = ref(true);
+const modelTier = ref<"fast" | "accurate">("fast");
 const forceDemo = ref(false);
 const customHint = ref("");
 const isDragging = ref(false);
@@ -760,27 +771,71 @@ async function startBatchExtraction() {
         progressItems.value[myIdx].status = "processing";
         progressItems.value[myIdx].message = "正在进行长图 AI 结构识别并归档 B2...";
         try {
-          const prepared = await prepareImageForUpload(qItem.file);
-          const res = await processBatchJobItem({
-            jobUid: createdJob.job_uid,
-            file: prepared,
-            itemIndex: myIdx,
-            mode: mode.value,
-            forceDemo: forceDemo.value,
-            customHint: customHint.value,
-            mergePerImage: mergePerImage.value,
-          });
-          collected[myIdx] = res.quotation;
-          if (!res.quotation.is_demo) {
-            geminiConfigured.value = true;
-            activeModel.value = res.quotation.engine;
-          }
-          quotaRemaining.value = res.quota.remaining;
-          quotaLimit.value = res.quota.daily_limit;
+          const slices = await splitLongImageIntoSlices(qItem.file);
+          if (slices.length <= 1) {
+            const targetFile = slices[0] || qItem.file;
+            const res = await processBatchJobItem({
+              jobUid: createdJob.job_uid,
+              file: targetFile,
+              itemIndex: myIdx,
+              mode: mode.value,
+              forceDemo: forceDemo.value,
+              customHint: customHint.value,
+              mergePerImage: mergePerImage.value,
+              modelTier: modelTier.value,
+            });
+            collected[myIdx] = res.quotation;
+            if (!res.quotation.is_demo) {
+              geminiConfigured.value = true;
+              activeModel.value = res.quotation.engine;
+            }
+            quotaRemaining.value = res.quota.remaining;
+            quotaLimit.value = res.quota.daily_limit;
 
-          progressItems.value[myIdx].status = "completed";
-          progressItems.value[myIdx].quoteTitle = res.quotation.quote_title;
-          progressItems.value[myIdx].message = `识别完成 (${res.quotation.merged_sheet.rows.length} 行 · 已存对象存储)`;
+            progressItems.value[myIdx].status = "completed";
+            progressItems.value[myIdx].quoteTitle = res.quotation.quote_title;
+            progressItems.value[myIdx].message = `识别完成 (${res.quotation.merged_sheet.rows.length} 行 · 已存对象存储)`;
+          } else {
+            // 超长报价单自动切片识别 + 后端去重合并（每张图仅扣 1 次额度）
+            const sliceResults: Record<string, unknown>[] = [];
+            for (let sIdx = 0; sIdx < slices.length; sIdx++) {
+              progressItems.value[myIdx].message = `检测到超长图，正在高清分段提取 (${sIdx + 1}/${slices.length} 段)...`;
+              const sRes = await extractSlice({
+                file: slices[sIdx],
+                sliceIndex: sIdx,
+                mode: mode.value,
+                forceDemo: forceDemo.value,
+                customHint: customHint.value,
+                modelTier: modelTier.value,
+              });
+              sliceResults.push(sRes);
+            }
+            progressItems.value[myIdx].message = `正在去重拼接 ${slices.length} 段结果并归档 B2...`;
+            const committed = await commitSlicedQuotation({
+              jobUid: createdJob.job_uid,
+              itemIndex: myIdx,
+              sourceFilename: qItem.file.name,
+              fileSizeBytes: qItem.file.size,
+              mode: mode.value,
+              mergePerImage: mergePerImage.value,
+              sliceResults,
+            });
+            if (!committed.quotation) {
+              throw new Error("长图合并归档失败");
+            }
+            collected[myIdx] = committed.quotation;
+            if (!committed.quotation.is_demo) {
+              geminiConfigured.value = true;
+              activeModel.value = committed.quotation.engine;
+            }
+            if (committed.quota) {
+              quotaRemaining.value = committed.quota.remaining;
+              quotaLimit.value = committed.quota.daily_limit;
+            }
+            progressItems.value[myIdx].status = "completed";
+            progressItems.value[myIdx].quoteTitle = committed.quotation.quote_title;
+            progressItems.value[myIdx].message = `长图 ${slices.length} 段拼接完成 (${committed.quotation.merged_sheet.rows.length} 行 · 已存 B2)`;
+          }
 
           // 实时把已完成报价单展示进工作台
           quotations.value = collected.filter((x): x is QuotationGroup => x !== null);

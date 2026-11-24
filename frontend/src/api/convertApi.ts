@@ -201,6 +201,7 @@ export async function processBatchJobItem(params: {
   forceDemo: boolean;
   customHint?: string;
   mergePerImage: boolean;
+  modelTier?: "fast" | "accurate";
 }): Promise<{
   job_uid: string;
   item: BatchJobItem;
@@ -213,11 +214,62 @@ export async function processBatchJobItem(params: {
   formData.append("mode", params.mode);
   formData.append("force_demo", String(params.forceDemo));
   formData.append("merge_per_image", String(params.mergePerImage));
+  formData.append("model_tier", params.modelTier || "fast");
   if (params.customHint?.trim()) {
     formData.append("custom_hint", params.customHint.trim());
   }
   const { data } = await http.post(`/jobs/${params.jobUid}/process-item`, formData, {
     headers: { "Content-Type": "multipart/form-data" },
+  });
+  return data;
+}
+
+export async function extractSlice(params: {
+  file: File;
+  sliceIndex: number;
+  mode: "excel" | "text";
+  forceDemo: boolean;
+  customHint?: string;
+  modelTier?: "fast" | "accurate";
+}): Promise<Record<string, unknown>> {
+  const formData = new FormData();
+  formData.append("file", params.file);
+  formData.append("slice_index", String(params.sliceIndex));
+  formData.append("mode", params.mode);
+  formData.append("force_demo", String(params.forceDemo));
+  formData.append("model_tier", params.modelTier || "fast");
+  if (params.customHint?.trim()) {
+    formData.append("custom_hint", params.customHint.trim());
+  }
+  const { data } = await http.post("/extract-slice", formData, {
+    headers: { "Content-Type": "multipart/form-data" },
+  });
+  return data;
+}
+
+export async function commitSlicedQuotation(params: {
+  jobUid: string;
+  itemIndex: number;
+  sourceFilename: string;
+  fileSizeBytes: number;
+  mode: "excel" | "text";
+  mergePerImage: boolean;
+  sliceResults: Record<string, unknown>[];
+  failedError?: string;
+}): Promise<{
+  job_uid: string;
+  item: BatchJobItem;
+  quotation?: QuotationGroup;
+  quota?: QuotaInfo;
+}> {
+  const { data } = await http.post(`/jobs/${params.jobUid}/commit-quotation`, {
+    item_index: params.itemIndex,
+    source_filename: params.sourceFilename,
+    file_size_bytes: params.fileSizeBytes,
+    mode: params.mode,
+    merge_per_image: params.mergePerImage,
+    slice_results: params.sliceResults,
+    failed_error: params.failedError || "",
   });
   return data;
 }

@@ -9,7 +9,7 @@ import requests
 from database import _get_clean_env
 
 GEMINI_INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
-DEFAULT_GEMINI_MODEL = "gemini-4-hydrogen"
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 VALID_COL_TYPES = {"text", "number", "currency", "percent", "date"}
 
 TABLE_EXTRACTION_SCHEMA: Dict[str, Any] = {
@@ -23,19 +23,15 @@ TABLE_EXTRACTION_SCHEMA: Dict[str, Any] = {
             "type": "string",
             "description": "Top/edge rules, validity notices, or vendor terms outside the table rows (empty string if none).",
         },
-        "plain_text": {
-            "type": "string",
-            "description": "Clean Markdown/plain-text representation of the table or text content.",
-        },
         "sheets": {
             "type": "array",
-            "description": "List of extracted tables, each represented as one worksheet.",
+            "description": "List of ALL extracted tables/blocks in order from top to bottom.",
             "items": {
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Worksheet tab name (concise, under 28 characters).",
+                        "description": "Section or worksheet name (concise, under 28 characters).",
                     },
                     "headers": {
                         "type": "array",
@@ -56,25 +52,11 @@ TABLE_EXTRACTION_SCHEMA: Dict[str, Any] = {
                             "type": "array",
                             "items": {"type": "string"},
                         },
-                        "description": "2D array of data rows (excluding the primary header row). Every row must match headers length.",
-                    },
-                    "merges": {
-                        "type": "array",
-                        "description": "Optional 0-indexed data-grid merge ranges (excluding header row).",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "start_row": {"type": "integer"},
-                                "start_col": {"type": "integer"},
-                                "end_row": {"type": "integer"},
-                                "end_col": {"type": "integer"},
-                            },
-                            "required": ["start_row", "start_col", "end_row", "end_col"],
-                        },
+                        "description": "ALL data rows from top to bottom. Every row must match headers length.",
                     },
                     "warnings": {
                         "type": "array",
-                        "description": "Cells that look blurry, ambiguous, or need human verification.",
+                        "description": "Only genuinely blurry/uncertain cells.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -90,7 +72,7 @@ TABLE_EXTRACTION_SCHEMA: Dict[str, Any] = {
             },
         },
     },
-    "required": ["title", "sheets", "plain_text"],
+    "required": ["title", "sheets"],
 }
 
 
@@ -457,6 +439,115 @@ def _extract_text_from_interactions_response(data: Dict[str, Any]) -> str:
     return "\n".join(texts)
 
 
+def _row_signature(row: List[str]) -> str:
+    return "|".join(re.sub(r"\s+", "", str(c or "")).lower() for c in row)
+
+
+def _dedupe_boundary_overlap(prev_rows: List[List[str]], next_rows: List[List[str]], max_window: int = 8) -> int:
+    """计算前后两段切片在重叠区域的重复行数，返回 next_rows 应跳过的起始下标。"""
+    if not prev_rows or not next_rows:
+        return 0
+    prev_tail = [_row_signature(r) for r in prev_rows[-max_window:]]
+    next_head = [_row_signature(r) for r in next_rows[:max_window]]
+    max_k = min(len(prev_tail), len(next_head))
+    for k in range(max_k, 0, -1):
+        if prev_tail[-k:] == next_head[:k]:
+            return k
+    # 单行逐一匹配（容忍首行切半只匹配到次行）
+    tail_set = set(s for s in prev_tail if s.replace("|", ""))
+    skip = 0
+    for sig in next_head[:4]:
+        if sig in tail_set:
+            skip += 1
+        else:
+            break
+    return skip
+
+
+def merge_quotation_slices(
+    slice_results: List[Dict[str, Any]],
+    filename: str,
+    merge_per_image: bool = True,
+) -> Dict[str, Any]:
+    """将同一张超长报价单切分后的多段识别结果无损拼接、重叠去重，并合成为 1 份完整报价单。"""
+    stem = Path(filename or "extracted").stem
+    if not slice_results:
+        return _build_demo_result(filename, "excel")
+    if len(slice_results) == 1:
+        return slice_results[0]
+
+    quote_title = stem[:28]
+    for sr in slice_results:
+        cand = str(sr.get("quote_title") or "").strip()
+        if cand and cand != stem[:28]:
+            quote_title = cand[:28]
+            break
+
+    notes_parts: List[str] = []
+    for sr in slice_results:
+        n = str(sr.get("document_notes") or "").strip()
+        if n and n not in notes_parts:
+            notes_parts.append(n)
+
+    combined_raw_sheets: List[Dict[str, Any]] = []
+    for sr in slice_results:
+        for sh in (sr.get("raw_sheets") or sr.get("sheets") or []):
+            sh_copy = json.loads(json.dumps(sh))
+            if not combined_raw_sheets:
+                combined_raw_sheets.append(sh_copy)
+                continue
+            prev = combined_raw_sheets[-1]
+            prev_name = str(prev.get("name", "")).strip()
+            cur_name = str(sh_copy.get("name", "")).strip()
+            same_name = prev_name == cur_name
+            same_headers = prev.get("headers") == sh_copy.get("headers")
+            is_continuation = cur_name.lower() in {"", "sheet1", "table", "continuation", "续表"}
+            if same_name or (same_headers and is_continuation):
+                prev_rows = prev.get("rows") or []
+                next_rows = sh_copy.get("rows") or []
+                skip = _dedupe_boundary_overlap(prev_rows, next_rows)
+                trimmed_next = next_rows[skip:]
+                if same_headers:
+                    offset = len(prev_rows)
+                    prev["rows"] = prev_rows + trimmed_next
+                    for w in (sh_copy.get("warnings") or []):
+                        wr = int(w.get("row", -1)) - skip
+                        if wr >= 0:
+                            prev.setdefault("warnings", []).append(
+                                {"row": offset + wr, "col": int(w.get("col", 0)), "reason": w.get("reason", "")}
+                            )
+                    continue
+                sh_copy["rows"] = trimmed_next
+            elif same_headers:
+                # 不同品牌名但相邻切片边界可能有重叠行，仍做重叠去重但保留各自品牌名
+                skip = _dedupe_boundary_overlap(prev.get("rows") or [], sh_copy.get("rows") or [])
+                sh_copy["rows"] = (sh_copy.get("rows") or [])[skip:]
+            if sh_copy.get("rows"):
+                combined_raw_sheets.append(sh_copy)
+
+    merged_sheet = merge_sheets_into_single_quotation(combined_raw_sheets, quote_title, stem)
+    last_res = slice_results[-1]
+    plain_lines = []
+    if merged_sheet.get("headers"):
+        plain_lines.append(" | ".join(merged_sheet["headers"]))
+        plain_lines.append(" | ".join(["---"] * len(merged_sheet["headers"])))
+        for r in merged_sheet.get("rows") or []:
+            plain_lines.append(" | ".join(r))
+
+    return {
+        "title": quote_title,
+        "quote_title": quote_title,
+        "document_notes": " | ".join(notes_parts),
+        "raw_sheets": combined_raw_sheets,
+        "merged_sheet": merged_sheet,
+        "sheets": [merged_sheet] if merge_per_image else combined_raw_sheets,
+        "plain_text": "\n".join(plain_lines),
+        "engine": last_res.get("engine", DEFAULT_GEMINI_MODEL),
+        "is_demo": bool(last_res.get("is_demo", False)),
+        "notice": f"长图已分 {len(slice_results)} 段高清切片提取并去重合并（共 {len(merged_sheet.get('rows') or [])} 行）",
+    }
+
+
 def extract_tables_from_image(
     image_bytes: bytes,
     filename: str,
@@ -465,12 +556,13 @@ def extract_tables_from_image(
     force_demo: bool = False,
     custom_hint: str = "",
     merge_per_image: bool = True,
+    model_tier: str = "fast",
 ) -> Dict[str, Any]:
     """
     核心图像表格提取函数：
-    - 配置了 GEMINI_API_KEY 且未开启 force_demo 时，调用 Gemini Interactions API + Structured Outputs；
-    - 针对长报价单设足 40s 主请求超时（503/429 瞬切备用模型），并将单图多子表按 Q1 规范合并为单一 Sheet；
-    - 未配置 Key 时自动平稳降级至本地结构化演示模式。
+    - 默认采用极速高可靠模型 gemini-3.5-flash-lite（不输出重复 plain_text 节省 50% token，彻底告别 ReadTimeout 与半途截断）；
+    - 支持 model_tier='accurate' 切换旗舰模型 gemini-4-hydrogen；
+    - 遇 503/429/超时 自动切换备用模型。
     """
     api_key = _get_gemini_api_key()
     if force_demo or not api_key:
@@ -481,28 +573,30 @@ def extract_tables_from_image(
 
     mime_type = normalize_mime_type(filename, content_type)
     b64_data = base64.b64encode(image_bytes).decode("ascii")
-    primary_model = get_active_model()
-    # Free-Tier 友好容灾排序：主模型 -> 3.5-flash-lite -> 3.1-flash-lite -> 4-argon
-    fallback_models = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-4-argon"]
+    env_model = _get_clean_env("GEMINI_MODEL")
+
+    if model_tier == "accurate":
+        ordered = ["gemini-4-hydrogen", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+    else:
+        ordered = [env_model or DEFAULT_GEMINI_MODEL, "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-4-hydrogen"]
+
     candidate_models: List[str] = []
-    for m in [primary_model] + fallback_models:
+    for m in ordered:
         if m and m not in candidate_models:
             candidate_models.append(m)
     candidate_models = candidate_models[:3]
+    primary_model = candidate_models[0]
 
     instruction = (
         "You are an expert document and quotation-sheet OCR extraction engine. "
-        "Extract every table/block visible in the image accurately into structured JSON. "
+        "CRITICAL: Extract EVERY SINGLE ROW and EVERY table/block visible in this image from the very top to the very bottom. "
+        "NEVER omit rows, NEVER stop after the first section, and NEVER truncate the output. "
         "Set `title` to the main quotation header visible in the image (e.g. vendor name + date like '新军强 靓机 11.24'). "
         "Put top/edge vendor rules, validity notices, or disclaimers outside data rows into `document_notes` (do NOT mix them into table rows). "
         "Preserve exact text, model names, capacities, numbers, currency symbols, range strings (e.g. '3200-3300'), '+50', and leading zeros (e.g. '001042'). "
         "Every row in `rows` MUST have the exact same number of elements as `headers` (use empty string '' for blank cells). "
-        "Set `col_types` accurately for each column (`text`, `number`, `currency`, `percent`, `date`). "
-        "If any cell is blurry, occluded, or uncertain, still provide your best reading and record it in `warnings`. "
-        "Also generate `plain_text` as a clean Markdown table."
+        "Set `col_types` accurately for each column (`text`, `number`, `currency`, `percent`, `date`)."
     )
-    if mode == "text":
-        instruction += " Since mode is 'text', prioritize clean readable `plain_text` while also populating `sheets` if a table is present."
     if custom_hint.strip():
         instruction += f"\nAdditional user hint: {custom_hint.strip()}"
 
@@ -534,7 +628,7 @@ def extract_tables_from_image(
                 GEMINI_INTERACTIONS_URL,
                 json=payload,
                 headers=headers,
-                timeout=40 if attempt_idx == 0 else 18,
+                timeout=36 if attempt_idx == 0 else 20,
             )
         except requests.RequestException as exc:
             last_error = f"连接 Gemini 视觉识别服务超时或网络异常：{type(exc).__name__}"
