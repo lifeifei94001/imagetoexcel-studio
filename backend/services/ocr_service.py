@@ -281,19 +281,18 @@ def _map_subsheet_columns(
     master_len: int,
 ) -> List[int]:
     """
-    智能对齐同一报价单内各子表的列映射（杜绝因表头文字微调把价格挤到右侧 K/L/M 列）：
-    1. 列数与主表相同时，直接按位置 1:1 对齐（型号/容量/各价位/面容/备注/电池项全部留在原位）；
-    2. 列数少于主表时（如某区块省略了 '-' 占位列），先匹配已知锚点列名，剩余价位列自动填入主表空余价格槽位（右对齐优先）。
+    智能对齐同一报价单内各子表的列映射（0-indexed，直接对应原图真实列序，不增设分类列）：
+    1. 列数与主表相同时，直接按位置 1:1 对齐（型号/容量/各价位/面容/备注/扣费项全部留在原位）；
+    2. 列数少于主表时（如某区块省略了 '-' 占位列），先匹配已知锚点列名，剩余价位列自动右对齐填入空余价格槽位。
     """
     n = len(sh_headers)
     if n == master_len:
-        return [1 + i for i in range(n)]
+        return [i for i in range(n)]
 
-    norm_master = {_norm_header(h): idx for idx, h in enumerate(unified_headers) if idx >= 1}
+    norm_master = {_norm_header(h): idx for idx, h in enumerate(unified_headers)}
     assigned: List[Optional[int]] = [None] * n
     used_targets: set = set()
 
-    # 第一步：匹配锚点列（精确或归一化匹配）
     for i, h in enumerate(sh_headers):
         h_clean = str(h or f"列{i + 1}").strip() or f"列{i + 1}"
         if h_clean in header_to_col and header_to_col[h_clean] not in used_targets:
@@ -307,12 +306,10 @@ def _map_subsheet_columns(
             assigned[i] = t_col
             used_targets.add(t_col)
 
-    # 第二步：为未匹配的价位列分配主表空余槽位（保持相对顺序，缺高保充新位时靠右对齐）
     unmatched_indices = [i for i, v in enumerate(assigned) if v is None]
-    free_slots = [c for c in range(1, 1 + master_len) if c not in used_targets]
+    free_slots = [c for c in range(master_len) if c not in used_targets]
 
     if unmatched_indices and len(free_slots) >= len(unmatched_indices):
-        # 靠右对齐，使 靓机/小靓机/小花 落在对应的后几列价格槽位
         offset = len(free_slots) - len(unmatched_indices)
         for k, local_idx in enumerate(unmatched_indices):
             assigned[local_idx] = free_slots[offset + k]
@@ -332,7 +329,7 @@ def _map_subsheet_columns(
                 header_to_col[h_clean] = new_col
                 assigned[local_idx] = new_col
 
-    return [int(c if c is not None else 1) for c in assigned]
+    return [int(c if c is not None else 0) for c in assigned]
 
 
 def merge_sheets_into_single_quotation(
@@ -341,9 +338,10 @@ def merge_sheets_into_single_quotation(
     fallback_stem: str = "报价单",
 ) -> Dict[str, Any]:
     """
-    Q1 规格落地：将同一张报价单图片内的多个区块子表合并为单一 Sheet：
-    - 1 个子表时直接保留原列结构；
-    - 多个子表时首列增设「分类/区块」，并采用位置+锚点智能对齐主表头（保证价格始终留在同一批列中）。
+    忠实原图合表：
+    - 彻底去掉人工「分类/区块」列，A 列直接为原图第 1 列（如 型号）；
+    - 当后续区块表头文字与上一区块不同时，在数据流中保留该区块原表头行并记入 section_header_rows，
+      导出 Excel 时自动渲染为苹果绿区块表头，最大程度贴近原图与 WPS 效果。
     """
     final_name = _pick_quote_title(quote_title, fallback_stem)
     if not sheets:
@@ -354,15 +352,32 @@ def merge_sheets_into_single_quotation(
             "rows": [[""]],
             "merges": [],
             "warnings": [],
+            "section_header_rows": [],
         }
 
-    if len(sheets) == 1:
-        single = json.loads(json.dumps(sheets[0]))
+    # 先对每个区块独立清洗（防重复表头/残缺行/合并空型号），避免干扰后续区块小表头
+    cleaned_sheets: List[Dict[str, Any]] = []
+    for sh in sheets:
+        sh_copy = json.loads(json.dumps(sh))
+        c_rows, c_warns = _clean_quotation_rows(
+            sh_copy.get("headers") or [], sh_copy.get("rows") or [], sh_copy.get("warnings") or []
+        )
+        if c_rows:
+            sh_copy["rows"] = c_rows
+            sh_copy["warnings"] = c_warns
+            cleaned_sheets.append(sh_copy)
+
+    if not cleaned_sheets:
+        cleaned_sheets = [json.loads(json.dumps(sheets[0]))]
+
+    if len(cleaned_sheets) == 1:
+        single = cleaned_sheets[0]
         single["name"] = final_name
+        single.setdefault("section_header_rows", [])
         return single
 
-    # 选用列数最完整（同列数取最靠前）的子表作为主表头基准
-    master_sheet = max(sheets, key=lambda s: len(s.get("headers") or []))
+    # 选用列数最完整（同列数取第 1 个）的子表作为顶部主表头
+    master_sheet = max(cleaned_sheets, key=lambda s: len(s.get("headers") or []))
     master_headers = [
         str(h or f"列{i + 1}").strip() or f"列{i + 1}"
         for i, h in enumerate(master_sheet.get("headers") or [])
@@ -370,16 +385,15 @@ def merge_sheets_into_single_quotation(
     master_types = master_sheet.get("col_types") or []
     master_len = len(master_headers)
 
-    unified_headers: List[str] = ["分类/区块"] + master_headers
-    unified_types: List[str] = ["text"] + [
+    unified_headers: List[str] = list(master_headers)
+    unified_types: List[str] = [
         (master_types[i] if i < len(master_types) and master_types[i] in VALID_COL_TYPES else "text")
         for i in range(master_len)
     ]
-    header_to_col: Dict[str, int] = {h: 1 + i for i, h in enumerate(master_headers)}
+    header_to_col: Dict[str, int] = {h: i for i, h in enumerate(master_headers)}
 
-    # 预先计算每个子表的列映射（可能会在极端多列时扩展 unified_headers）
     mappings: List[List[int]] = []
-    for sh in sheets:
+    for sh in cleaned_sheets:
         sh_headers = [str(h or f"列{i + 1}").strip() or f"列{i + 1}" for i, h in enumerate(sh.get("headers") or [])]
         sh_types = sh.get("col_types") or []
         mappings.append(
@@ -389,15 +403,32 @@ def merge_sheets_into_single_quotation(
     total_cols = len(unified_headers)
     merged_rows: List[List[str]] = []
     merged_warnings: List[Dict[str, Any]] = []
+    section_header_rows: List[int] = []
 
-    for s_idx, sh in enumerate(sheets):
-        section_name = str(sh.get("name") or f"区块{s_idx + 1}").strip()
+    # 第 0 区块的表头已作为 Excel 第 1 行表头
+    prev_header_row = [""] * total_cols
+    first_headers = cleaned_sheets[0].get("headers") or []
+    for i, h in enumerate(first_headers):
+        if i < len(mappings[0]):
+            prev_header_row[mappings[0][i]] = str(h or "").strip()
+
+    for s_idx, sh in enumerate(cleaned_sheets):
         local_to_global = mappings[s_idx]
+        cur_headers = sh.get("headers") or []
+        cur_header_row = [""] * total_cols
+        for i, h in enumerate(cur_headers):
+            if i < len(local_to_global):
+                cur_header_row[local_to_global[i]] = str(h or "").strip()
+
+        # 若当前区块表头与上一区块不同，则原样保留一条区块小表头行
+        if s_idx > 0 and cur_header_row != prev_header_row and any(cur_header_row):
+            section_header_rows.append(len(merged_rows))
+            merged_rows.append(cur_header_row)
+            prev_header_row = cur_header_row
 
         base_row_offset = len(merged_rows)
         for row in (sh.get("rows") or []):
             new_row = [""] * total_cols
-            new_row[0] = section_name
             for local_c, val in enumerate(row):
                 if local_c < len(local_to_global):
                     new_row[local_to_global[local_c]] = str(val if val is not None else "")
@@ -425,6 +456,7 @@ def merge_sheets_into_single_quotation(
         "rows": merged_rows,
         "merges": [],
         "warnings": merged_warnings,
+        "section_header_rows": section_header_rows,
     }
 
 
@@ -729,20 +761,15 @@ def merge_quotation_slices(
             if sh_copy.get("rows"):
                 combined_raw_sheets.append(sh_copy)
 
-    merged_sheet = merge_sheets_into_single_quotation(combined_raw_sheets, quote_title, stem)
-    cleaned_rows, cleaned_warnings = _clean_quotation_rows(
-        merged_sheet["headers"], merged_sheet["rows"], merged_sheet.get("warnings") or []
-    )
-    merged_sheet["rows"] = cleaned_rows
-    merged_sheet["warnings"] = cleaned_warnings
-
     for rsh in combined_raw_sheets:
         r_rows, r_warns = _clean_quotation_rows(
             rsh["headers"], rsh["rows"], rsh.get("warnings") or []
         )
         rsh["rows"] = r_rows
         rsh["warnings"] = r_warns
+        rsh.setdefault("section_header_rows", [])
 
+    merged_sheet = merge_sheets_into_single_quotation(combined_raw_sheets, quote_title, stem)
     last_res = slice_results[-1]
     plain_lines = []
     if merged_sheet.get("headers"):
@@ -807,11 +834,12 @@ def extract_tables_from_image(
         "CRITICAL: Extract EVERY SINGLE ROW and EVERY table/block visible in this image from the very top to the very bottom. "
         "NEVER omit rows, NEVER omit price cells, NEVER stop after the first section, and NEVER truncate the output. "
         "IMPORTANT: When a model name cell spans multiple capacity rows (vertically merged cell like '17pro max' over 256G/512G/1TB), REPEAT the exact model name on EVERY row! "
-        "Do NOT include repeated sub-table header rows (like '型号 | 容量 | 靓机...') inside `rows`. "
+        "Do NOT include repeated sub-table header rows (like '型号 | 容量 | 靓机...') inside `rows`; instead represent each sub-block as an item in `sheets` with its exact `headers`. "
         "If a sub-table has '-' or blank placeholder columns (for example no highest price tier), KEEP that column slot so all blocks preserve consistent column structure and alignment. "
-        "Set `title` to the main quotation header visible in the image (e.g. vendor name + date like '新军强 靓机 11.24'). "
+        "Preserve EVERY Chinese character verbatim with 100% precision (e.g. '全套', '不需保修', '在保', '高保充新', '靓机', '小靓机', '小花', '蓝光/彩点', '扣费项', '电芯'). NEVER substitute lookalike Chinese characters and NEVER translate titles or section names into English. "
+        "Set `title` to the main quotation header visible in the image (e.g. vendor name + date like '萧军强 靓机 11.24'). "
         "Put top/edge vendor rules, validity notices, or disclaimers outside data rows into `document_notes` (do NOT mix them into table rows). "
-        "Preserve exact text, model names, capacities, numbers, currency symbols, range strings (e.g. '3200-3300'), '+50', and leading zeros (e.g. '001042'). "
+        "Preserve exact text, model names, capacities, numbers, range strings (e.g. '3200-3300'), '+50', and leading zeros (e.g. '001042'). "
         "Every row in `rows` MUST have the exact same number of elements as `headers` (use empty string '' for blank cells). "
         "Set `col_types` accurately for each column (`text`, `number`, `currency`, `percent`, `date`)."
     )
@@ -824,18 +852,25 @@ def extract_tables_from_image(
         "Api-Revision": "2026-05-20",
     }
 
+    target_resolution = "ultra_high" if model_tier == "accurate" else "high"
     resp = None
     used_model = primary_model
     last_error = ""
     for attempt_idx, candidate in enumerate(candidate_models):
         if attempt_idx == 2:
             time.sleep(0.8)
+        image_block: Dict[str, Any] = {
+            "type": "image",
+            "data": b64_data,
+            "mime_type": mime_type,
+            "resolution": target_resolution,
+        }
         payload = {
             "model": candidate,
             "store": False,
             "input": [
                 {"type": "text", "text": instruction},
-                {"type": "image", "data": b64_data, "mime_type": mime_type},
+                image_block,
             ],
             "response_format": {
                 "type": "text",
@@ -850,6 +885,15 @@ def extract_tables_from_image(
                 headers=headers,
                 timeout=36 if attempt_idx == 0 else 20,
             )
+            # 若个别端点暂不支持 resolution 字段则返回 400，立即剥离后原模型重试
+            if resp.status_code == 400 and "resolution" in resp.text.lower():
+                image_block.pop("resolution", None)
+                resp = requests.post(
+                    GEMINI_INTERACTIONS_URL,
+                    json=payload,
+                    headers=headers,
+                    timeout=36 if attempt_idx == 0 else 20,
+                )
         except requests.RequestException as exc:
             last_error = f"连接 Gemini 视觉识别服务超时或网络异常：{type(exc).__name__}"
             resp = None
@@ -886,20 +930,16 @@ def extract_tables_from_image(
     stem = Path(filename or "extracted").stem
     normalized = normalize_table_grid(parsed, fallback_name=stem)
     raw_sheets = normalized["sheets"]
-    quote_title = _pick_quote_title(normalized["title"], stem)
-    merged_sheet = merge_sheets_into_single_quotation(raw_sheets, quote_title, stem)
-
-    m_rows, m_warns = _clean_quotation_rows(
-        merged_sheet["headers"], merged_sheet["rows"], merged_sheet.get("warnings") or []
-    )
-    merged_sheet["rows"] = m_rows
-    merged_sheet["warnings"] = m_warns
     for rsh in raw_sheets:
         r_rows, r_warns = _clean_quotation_rows(
             rsh["headers"], rsh["rows"], rsh.get("warnings") or []
         )
         rsh["rows"] = r_rows
         rsh["warnings"] = r_warns
+        rsh.setdefault("section_header_rows", [])
+
+    quote_title = _pick_quote_title(normalized["title"], stem)
+    merged_sheet = merge_sheets_into_single_quotation(raw_sheets, quote_title, stem)
 
     normalized["quote_title"] = quote_title
     normalized["raw_sheets"] = raw_sheets

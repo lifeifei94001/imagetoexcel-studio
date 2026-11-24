@@ -124,12 +124,24 @@ def _populate_worksheet(ws: Any, sheet_data: Dict[str, Any]) -> None:
 
     final_widths = [min(max(w, 10), 34 if _is_note_column(headers[i]) else 28) for i, w in enumerate(col_widths)]
 
+    section_header_rows = set(int(x) for x in (sheet_data.get("section_header_rows") or []))
+
     for r_idx, row in enumerate(rows, start=2):
+        is_section_header = (r_idx - 2) in section_header_rows
         max_lines = 1
         for c_idx in range(1, len(headers) + 1):
             raw_cell = str(row[c_idx - 1]) if c_idx - 1 < len(row) else ""
             c_type = col_types[c_idx - 1] if c_idx - 1 < len(col_types) else "text"
             h_name = headers[c_idx - 1]
+
+            if is_section_header:
+                cell = ws.cell(row=r_idx, column=c_idx, value=raw_cell)
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                cell.border = cell_border
+                continue
+
             typed_val, num_fmt = _parse_typed_cell(raw_cell, c_type)
             cell = ws.cell(row=r_idx, column=c_idx, value=typed_val)
             cell.border = cell_border
@@ -153,7 +165,7 @@ def _populate_worksheet(ws: Any, sheet_data: Dict[str, Any]) -> None:
             if r_idx % 2 == 1:
                 cell.fill = zebra_fill
 
-        ws.row_dimensions[r_idx].height = max(22, min(140, max_lines * 16 + 6))
+        ws.row_dimensions[r_idx].height = 28 if is_section_header else max(22, min(140, max_lines * 16 + 6))
 
     # 合并单元格（跳过非锚点格，避免 openpyxl MergedCell 只读报错；数据行偏移 +2）
     for m in merges:

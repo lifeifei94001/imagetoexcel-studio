@@ -23,6 +23,7 @@ export interface ExtractedSheet {
   rows: string[][];
   merges: MergeRange[];
   warnings: CellWarning[];
+  section_header_rows?: number[];
   source_filename?: string;
 }
 

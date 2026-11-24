@@ -84,7 +84,7 @@ export async function splitLongImageIntoSlices(file: File): Promise<File[]> {
       const origH = img.height;
 
       // 常规尺寸图片无需切片
-      if (origH <= 1700 || origH / Math.max(1, origW) < 1.35) {
+      if (origH <= 1500 || origH / Math.max(1, origW) < 1.35) {
         resolve([await prepareImageForUpload(file)]);
         return;
       }
@@ -93,9 +93,9 @@ export async function splitLongImageIntoSlices(file: File): Promise<File[]> {
       const scale = targetW / origW;
       const targetH = Math.round(origH * scale);
 
-      const maxSlices = 4;
-      const overlap = 260;
-      const step = Math.max(1050, Math.ceil((targetH - overlap) / maxSlices));
+      const maxSlices = 6;
+      const overlap = 220;
+      const step = Math.max(860, Math.ceil((targetH - overlap) / maxSlices));
       const sliceCount = Math.min(maxSlices, Math.max(2, Math.ceil((targetH - overlap) / step)));
       const sliceHeight = Math.ceil((targetH + overlap * (sliceCount - 1)) / sliceCount);
 

@@ -41,6 +41,7 @@ class SheetPayload(BaseModel):
     rows: List[List[str]] = []
     merges: List[Dict[str, int]] = []
     warnings: List[Dict[str, Any]] = []
+    section_header_rows: List[int] = []
     source_filename: Optional[str] = None
 
 

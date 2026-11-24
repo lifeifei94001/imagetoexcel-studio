@@ -316,19 +316,34 @@
               </tr>
             </thead>
             <tbody v-auto-animate="activeSheet.rows.length <= 200 ? {} : undefined">
-              <tr v-for="(row, rIdx) in activeSheet.rows" :key="`r-${rIdx}`">
+              <tr
+                v-for="(row, rIdx) in activeSheet.rows"
+                :key="`r-${rIdx}`"
+                :style="
+                  isSectionHeaderRow(rIdx)
+                    ? { background: 'rgba(169, 208, 142, 0.28)', fontWeight: '700' }
+                    : undefined
+                "
+              >
                 <td class="sheet-row-index num-tabular">{{ rIdx + 1 }}</td>
                 <td
                   v-for="(cell, cIdx) in row"
                   :key="`c-${rIdx}-${cIdx}`"
                   :class="{ 'cell-warning': Boolean(getWarning(rIdx, cIdx)) }"
-                  :title="getWarning(rIdx, cIdx) || '点击可直接修改单元格'"
+                  :title="
+                    isSectionHeaderRow(rIdx)
+                      ? '区块小表头行（导出将自动标绿加粗）'
+                      : getWarning(rIdx, cIdx) || '点击可直接修改单元格'
+                  "
                 >
                   <input
                     :value="cell"
                     class="cell-input"
-                    :class="{ 'num-tabular': isNumericCol(cIdx) }"
-                    :style="{ textAlign: isNumericCol(cIdx) ? 'right' : 'left' }"
+                    :class="{ 'num-tabular': !isSectionHeaderRow(rIdx) && isNumericCol(cIdx) }"
+                    :style="{
+                      textAlign: isSectionHeaderRow(rIdx) || isNumericCol(cIdx) ? 'center' : 'left',
+                      fontWeight: isSectionHeaderRow(rIdx) ? '700' : undefined,
+                    }"
                     @input="updateCell(rIdx, cIdx, ($event.target as HTMLInputElement).value)"
                   />
                 </td>
@@ -454,6 +469,10 @@ function updateQuoteTitle(val: string) {
   emit("update:quotations", next);
 }
 
+function isSectionHeaderRow(rIdx: number): boolean {
+  return Boolean(activeSheet.value?.section_header_rows?.includes(rIdx));
+}
+
 function getWarning(rIdx: number, cIdx: number): string {
   const w = activeSheet.value?.warnings?.find((item) => item.row === rIdx && item.col === cIdx);
   return w ? w.reason : "";
@@ -505,6 +524,11 @@ function removeRow(rIdx: number) {
   sh.warnings = sh.warnings
     .filter((w) => w.row !== rIdx)
     .map((w) => (w.row > rIdx ? { ...w, row: w.row - 1 } : w));
+  if (sh.section_header_rows?.length) {
+    sh.section_header_rows = sh.section_header_rows
+      .filter((r) => r !== rIdx)
+      .map((r) => (r > rIdx ? r - 1 : r));
+  }
   emit("update:quotations", next);
 }
 
