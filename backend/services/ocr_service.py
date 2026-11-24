@@ -1,6 +1,7 @@
 import base64
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -427,6 +428,127 @@ def merge_sheets_into_single_quotation(
     }
 
 
+def _clean_quotation_rows(
+    headers: List[str],
+    rows: List[List[str]],
+    warnings: List[Dict[str, Any]],
+) -> tuple[List[List[str]], List[Dict[str, Any]]]:
+    """
+    Q2 智能清洗报价单异常行：
+    1. 剔除因分段识别混入数据区的重复表头行（如 型号/容量/靓机 行）；
+    2. 剔除切片边界处「缺型号但容量+价格与下一行重合」的残缺重复行；
+    3. 区块内合并单元格造成的空型号行向下继承机型名；仍无归属机型的孤立行自动过滤，彻底杜绝无机型却有价格。
+    """
+    if not rows or not headers:
+        return rows, warnings
+
+    model_col: Optional[int] = None
+    cap_col: Optional[int] = None
+    sec_col: Optional[int] = None
+    for i, h in enumerate(headers):
+        hn = _norm_header(h)
+        if hn == "分类区块":
+            sec_col = i
+        elif model_col is None and any(k in hn for k in ("型号", "机型", "model", "设备名称")):
+            model_col = i
+        elif cap_col is None and any(k in hn for k in ("容量", "内存", "配置", "规格")):
+            cap_col = i
+
+    if model_col is None:
+        return rows, warnings
+
+    header_tokens = {"型号", "机型", "model", "容量", "内存", "备注", "扣费项", "蓝光", "蓝光/彩点", "面容/拆修"}
+
+    def _is_embedded_header(r: List[str]) -> bool:
+        m_val = (r[model_col] if model_col < len(r) else "").strip().lower()
+        c_val = (r[cap_col] if cap_col is not None and cap_col < len(r) else "").strip().lower()
+        if m_val in {"型号", "机型", "model"}:
+            return True
+        if c_val in {"容量", "内存"}:
+            hits = sum(1 for cell in r if cell.strip().lower() in header_tokens or "靓机" in cell or "小花" in cell)
+            if hits >= 2:
+                return True
+        return False
+
+    def _price_sig(r: List[str]) -> tuple:
+        vals = []
+        for idx, val in enumerate(r):
+            if idx in (model_col, cap_col, sec_col):
+                continue
+            v = re.sub(r"[¥$€£,\s]", "", str(val or ""))
+            if re.match(r"^\d+(\.\d+)?$", v):
+                vals.append((idx, v))
+        return tuple(vals)
+
+    # 第一遍：过滤重复表头行
+    step1_rows: List[List[str]] = []
+    step1_map: Dict[int, int] = {}
+    for idx, r in enumerate(rows):
+        if _is_embedded_header(r):
+            continue
+        step1_map[idx] = len(step1_rows)
+        step1_rows.append(list(r))
+
+    # 第二遍：去除切片交界处「缺型号但容量+价格与下一行完全相同」的残缺行 + 向下补全合并型号
+    cleaned_rows: List[List[str]] = []
+    step2_map: Dict[int, int] = {}
+    last_section = None
+    last_model = ""
+
+    for idx, r in enumerate(step1_rows):
+        cur_sec = r[sec_col].strip() if sec_col is not None and sec_col < len(r) else ""
+        if cur_sec != last_section:
+            last_section = cur_sec
+            last_model = ""
+
+        m_val = r[model_col].strip() if model_col < len(r) else ""
+        c_val = r[cap_col].strip() if cap_col is not None and cap_col < len(r) else ""
+
+        if not m_val:
+            # 检查是否与后 1~2 行（带完整机型）容量+价格重复
+            p_sig = _price_sig(r)
+            is_orphan_dup = False
+            if p_sig:
+                for ahead in range(idx + 1, min(len(step1_rows), idx + 3)):
+                    nr = step1_rows[ahead]
+                    nm = nr[model_col].strip() if model_col < len(nr) else ""
+                    nc = nr[cap_col].strip() if cap_col is not None and cap_col < len(nr) else ""
+                    if nm and (cap_col is None or not c_val or nc == c_val) and _price_sig(nr) == p_sig:
+                        is_orphan_dup = True
+                        break
+            if is_orphan_dup:
+                continue
+
+            # 若前面同一区块已有合法机型，且本行有容量或价格 -> 继承合并单元格的机型名
+            if last_model and (c_val or p_sig):
+                r[model_col] = last_model
+            else:
+                # 无归属机型的孤立切片残行直接丢弃
+                continue
+        else:
+            last_model = m_val
+
+        step2_map[idx] = len(cleaned_rows)
+        cleaned_rows.append(r)
+
+    new_warnings: List[Dict[str, Any]] = []
+    for w in (warnings or []):
+        try:
+            orig_r = int(w["row"])
+            if orig_r in step1_map and step1_map[orig_r] in step2_map:
+                new_warnings.append(
+                    {
+                        "row": step2_map[step1_map[orig_r]],
+                        "col": int(w["col"]),
+                        "reason": str(w.get("reason") or ""),
+                    }
+                )
+        except Exception:
+            continue
+
+    return cleaned_rows, new_warnings
+
+
 def _build_demo_result(filename: str, mode: str) -> Dict[str, Any]:
     """R5 容错兜底：未配置 GEMINI_API_KEY 或选择演示模式时返回高保真结构化示例表。"""
     lower = (filename or "").lower()
@@ -608,6 +730,19 @@ def merge_quotation_slices(
                 combined_raw_sheets.append(sh_copy)
 
     merged_sheet = merge_sheets_into_single_quotation(combined_raw_sheets, quote_title, stem)
+    cleaned_rows, cleaned_warnings = _clean_quotation_rows(
+        merged_sheet["headers"], merged_sheet["rows"], merged_sheet.get("warnings") or []
+    )
+    merged_sheet["rows"] = cleaned_rows
+    merged_sheet["warnings"] = cleaned_warnings
+
+    for rsh in combined_raw_sheets:
+        r_rows, r_warns = _clean_quotation_rows(
+            rsh["headers"], rsh["rows"], rsh.get("warnings") or []
+        )
+        rsh["rows"] = r_rows
+        rsh["warnings"] = r_warns
+
     last_res = slice_results[-1]
     plain_lines = []
     if merged_sheet.get("headers"):
@@ -660,19 +795,19 @@ def extract_tables_from_image(
     if model_tier == "accurate":
         ordered = ["gemini-4-hydrogen", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
     else:
-        ordered = [env_model or DEFAULT_GEMINI_MODEL, "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-4-hydrogen"]
+        # 严格锁定极速稳定档：绝不擅自切换到容易 503/超时的 gemini-4-hydrogen
+        fast_primary = env_model if (env_model and "flash" in env_model.lower()) else DEFAULT_GEMINI_MODEL
+        ordered = [fast_primary, "gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]
 
-    candidate_models: List[str] = []
-    for m in ordered:
-        if m and m not in candidate_models:
-            candidate_models.append(m)
-    candidate_models = candidate_models[:3]
+    candidate_models: List[str] = ordered[:3]
     primary_model = candidate_models[0]
 
     instruction = (
         "You are an expert document and quotation-sheet OCR extraction engine. "
         "CRITICAL: Extract EVERY SINGLE ROW and EVERY table/block visible in this image from the very top to the very bottom. "
         "NEVER omit rows, NEVER omit price cells, NEVER stop after the first section, and NEVER truncate the output. "
+        "IMPORTANT: When a model name cell spans multiple capacity rows (vertically merged cell like '17pro max' over 256G/512G/1TB), REPEAT the exact model name on EVERY row! "
+        "Do NOT include repeated sub-table header rows (like '型号 | 容量 | 靓机...') inside `rows`. "
         "If a sub-table has '-' or blank placeholder columns (for example no highest price tier), KEEP that column slot so all blocks preserve consistent column structure and alignment. "
         "Set `title` to the main quotation header visible in the image (e.g. vendor name + date like '新军强 靓机 11.24'). "
         "Put top/edge vendor rules, validity notices, or disclaimers outside data rows into `document_notes` (do NOT mix them into table rows). "
@@ -693,6 +828,8 @@ def extract_tables_from_image(
     used_model = primary_model
     last_error = ""
     for attempt_idx, candidate in enumerate(candidate_models):
+        if attempt_idx == 2:
+            time.sleep(0.8)
         payload = {
             "model": candidate,
             "store": False,
@@ -751,6 +888,18 @@ def extract_tables_from_image(
     raw_sheets = normalized["sheets"]
     quote_title = _pick_quote_title(normalized["title"], stem)
     merged_sheet = merge_sheets_into_single_quotation(raw_sheets, quote_title, stem)
+
+    m_rows, m_warns = _clean_quotation_rows(
+        merged_sheet["headers"], merged_sheet["rows"], merged_sheet.get("warnings") or []
+    )
+    merged_sheet["rows"] = m_rows
+    merged_sheet["warnings"] = m_warns
+    for rsh in raw_sheets:
+        r_rows, r_warns = _clean_quotation_rows(
+            rsh["headers"], rsh["rows"], rsh.get("warnings") or []
+        )
+        rsh["rows"] = r_rows
+        rsh["warnings"] = r_warns
 
     normalized["quote_title"] = quote_title
     normalized["raw_sheets"] = raw_sheets

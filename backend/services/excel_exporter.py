@@ -68,33 +68,17 @@ def _parse_typed_cell(raw_val: str, col_type: str) -> Tuple[Any, str]:
         except ValueError:
             return text, "@"
 
-    if col_type == "currency":
+    if col_type in ("currency", "number"):
         if text.startswith("+"):
             return text, "@"
-        currency_symbol = "¥"
-        for sym in ("¥", "$", "€", "£"):
-            if sym in text:
-                currency_symbol = sym
-                break
         cleaned = re.sub(r"[¥$€£,\s]", "", text)
-        try:
-            num = float(cleaned)
-            fmt = f"{currency_symbol}#,##0.00"
-            return num, fmt
-        except ValueError:
-            return text, "@"
-
-    if col_type == "number":
-        if text.startswith("+"):
-            return text, "@"
-        cleaned = text.replace(",", "").strip()
-        # 前导零编号保持文本
         if re.match(r"^0\d+$", cleaned):
             return text, "@"
         try:
-            if "." in cleaned:
-                return float(cleaned), "#,##0.00"
-            return int(cleaned), "#,##0"
+            num = float(cleaned)
+            if num.is_integer():
+                return int(num), "0"
+            return num, "0.##"
         except ValueError:
             return text, "@"
 
@@ -107,41 +91,69 @@ def _populate_worksheet(ws: Any, sheet_data: Dict[str, Any]) -> None:
     col_types: List[str] = sheet_data.get("col_types") or ["text"] * len(headers)
     merges: List[Dict[str, int]] = sheet_data.get("merges") or []
 
-    header_fill = PatternFill(start_color="4F46E5", end_color="4F46E5", fill_type="solid")
-    header_font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
-    zebra_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
-    body_font = Font(name="Arial", size=10, color="0F172A")
-    thin_side = Side(style="thin", color="CBD5E1")
+    # Q3/Q4: WPS 清爽苹果绿报价单样式 + 不合并型号单元格以兼容筛选/VLOOKUP
+    header_fill = PatternFill(start_color="A9D08E", end_color="A9D08E", fill_type="solid")
+    header_font = Font(name="微软雅黑", size=11, bold=True, color="000000")
+    zebra_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+    body_font = Font(name="微软雅黑", size=10, color="0F172A")
+    price_font = Font(name="微软雅黑", size=10, bold=True, color="0F172A")
+    thin_side = Side(style="thin", color="8EA99B")
     cell_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
 
     col_widths = [_display_width(h) + 4 for h in headers]
 
-    # 写入第 1 行表头
+    def _is_note_column(header_text: str) -> bool:
+        return any(k in header_text for k in ("备注", "蓝光", "彩点", "面容", "拆修", "扣费", "说明"))
+
+    # 写入第 1 行苹果绿表头
     for c_idx, h_text in enumerate(headers, start=1):
         cell = ws.cell(row=1, column=c_idx, value=h_text)
         cell.fill = header_fill
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border = cell_border
-    ws.row_dimensions[1].height = 26
+    ws.row_dimensions[1].height = 30
 
-    # 写入数据行（从第 2 行开始）
+    # 先估算列宽，再写入数据行并自适应计算行高
+    for row in rows:
+        for c_idx in range(1, len(headers) + 1):
+            raw_cell = str(row[c_idx - 1]) if c_idx - 1 < len(row) else ""
+            # 多行备注按最长单行估算列宽，避免把备注列撑到太宽
+            max_line_w = max((_display_width(line) for line in raw_cell.splitlines()), default=0)
+            col_widths[c_idx - 1] = max(col_widths[c_idx - 1], max_line_w + 3)
+
+    final_widths = [min(max(w, 10), 34 if _is_note_column(headers[i]) else 28) for i, w in enumerate(col_widths)]
+
     for r_idx, row in enumerate(rows, start=2):
+        max_lines = 1
         for c_idx in range(1, len(headers) + 1):
             raw_cell = str(row[c_idx - 1]) if c_idx - 1 < len(row) else ""
             c_type = col_types[c_idx - 1] if c_idx - 1 < len(col_types) else "text"
+            h_name = headers[c_idx - 1]
             typed_val, num_fmt = _parse_typed_cell(raw_cell, c_type)
             cell = ws.cell(row=r_idx, column=c_idx, value=typed_val)
-            cell.font = body_font
             cell.border = cell_border
+
             if num_fmt and num_fmt != "@":
                 cell.number_format = num_fmt
-                cell.alignment = Alignment(horizontal="right", vertical="center")
-            else:
+                cell.font = price_font
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            elif _is_note_column(h_name) or "\n" in raw_cell or _display_width(raw_cell) > 18:
+                cell.font = body_font
                 cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+                col_w = max(8, final_widths[c_idx - 1] - 2)
+                line_cnt = 0
+                for line in (raw_cell.splitlines() or [""]):
+                    line_cnt += max(1, (_display_width(line) + col_w - 1) // col_w)
+                max_lines = max(max_lines, line_cnt)
+            else:
+                cell.font = body_font
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
             if r_idx % 2 == 1:
                 cell.fill = zebra_fill
-            col_widths[c_idx - 1] = max(col_widths[c_idx - 1], _display_width(raw_cell) + 3)
+
+        ws.row_dimensions[r_idx].height = max(22, min(140, max_lines * 16 + 6))
 
     # 合并单元格（跳过非锚点格，避免 openpyxl MergedCell 只读报错；数据行偏移 +2）
     for m in merges:
@@ -155,8 +167,8 @@ def _populate_worksheet(ws: Any, sheet_data: Dict[str, Any]) -> None:
         except Exception:
             continue
 
-    for c_idx, width in enumerate(col_widths, start=1):
-        ws.column_dimensions[get_column_letter(c_idx)].width = min(max(width, 11), 46)
+    for c_idx, width in enumerate(final_widths, start=1):
+        ws.column_dimensions[get_column_letter(c_idx)].width = width
 
     ws.freeze_panes = "A2"
 
