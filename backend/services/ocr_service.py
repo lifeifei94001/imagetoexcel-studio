@@ -267,6 +267,73 @@ def _pick_quote_title(raw_title: str, fallback_stem: str) -> str:
     return t[:28]
 
 
+def _norm_header(h: str) -> str:
+    return re.sub(r"[\s\-_/（）()]+", "", str(h or "").strip()).lower()
+
+
+def _map_subsheet_columns(
+    sh_headers: List[str],
+    sh_types: List[str],
+    unified_headers: List[str],
+    unified_types: List[str],
+    header_to_col: Dict[str, int],
+    master_len: int,
+) -> List[int]:
+    """
+    智能对齐同一报价单内各子表的列映射（杜绝因表头文字微调把价格挤到右侧 K/L/M 列）：
+    1. 列数与主表相同时，直接按位置 1:1 对齐（型号/容量/各价位/面容/备注/电池项全部留在原位）；
+    2. 列数少于主表时（如某区块省略了 '-' 占位列），先匹配已知锚点列名，剩余价位列自动填入主表空余价格槽位（右对齐优先）。
+    """
+    n = len(sh_headers)
+    if n == master_len:
+        return [1 + i for i in range(n)]
+
+    norm_master = {_norm_header(h): idx for idx, h in enumerate(unified_headers) if idx >= 1}
+    assigned: List[Optional[int]] = [None] * n
+    used_targets: set = set()
+
+    # 第一步：匹配锚点列（精确或归一化匹配）
+    for i, h in enumerate(sh_headers):
+        h_clean = str(h or f"列{i + 1}").strip() or f"列{i + 1}"
+        if h_clean in header_to_col and header_to_col[h_clean] not in used_targets:
+            t_col = header_to_col[h_clean]
+            assigned[i] = t_col
+            used_targets.add(t_col)
+            continue
+        nh = _norm_header(h_clean)
+        if nh and nh in norm_master and norm_master[nh] not in used_targets:
+            t_col = norm_master[nh]
+            assigned[i] = t_col
+            used_targets.add(t_col)
+
+    # 第二步：为未匹配的价位列分配主表空余槽位（保持相对顺序，缺高保充新位时靠右对齐）
+    unmatched_indices = [i for i, v in enumerate(assigned) if v is None]
+    free_slots = [c for c in range(1, 1 + master_len) if c not in used_targets]
+
+    if unmatched_indices and len(free_slots) >= len(unmatched_indices):
+        # 靠右对齐，使 靓机/小靓机/小花 落在对应的后几列价格槽位
+        offset = len(free_slots) - len(unmatched_indices)
+        for k, local_idx in enumerate(unmatched_indices):
+            assigned[local_idx] = free_slots[offset + k]
+            used_targets.add(free_slots[offset + k])
+    else:
+        for local_idx in unmatched_indices:
+            if free_slots:
+                slot = free_slots.pop(0)
+                assigned[local_idx] = slot
+                used_targets.add(slot)
+            else:
+                h_clean = str(sh_headers[local_idx] or f"列{local_idx + 1}").strip()
+                new_col = len(unified_headers)
+                unified_headers.append(h_clean)
+                t = sh_types[local_idx] if local_idx < len(sh_types) else "text"
+                unified_types.append(t if t in VALID_COL_TYPES else "text")
+                header_to_col[h_clean] = new_col
+                assigned[local_idx] = new_col
+
+    return [int(c if c is not None else 1) for c in assigned]
+
+
 def merge_sheets_into_single_quotation(
     sheets: List[Dict[str, Any]],
     quote_title: str,
@@ -275,7 +342,7 @@ def merge_sheets_into_single_quotation(
     """
     Q1 规格落地：将同一张报价单图片内的多个区块子表合并为单一 Sheet：
     - 1 个子表时直接保留原列结构；
-    - 多个子表时首列增设「分类/区块」，统一对齐主表头（不同列按并集补齐空列，零丢行），并重映射 warnings 坐标。
+    - 多个子表时首列增设「分类/区块」，并采用位置+锚点智能对齐主表头（保证价格始终留在同一批列中）。
     """
     final_name = _pick_quote_title(quote_title, fallback_stem)
     if not sheets:
@@ -293,21 +360,30 @@ def merge_sheets_into_single_quotation(
         single["name"] = final_name
         return single
 
-    # 多区块：构建统一主表头并集（首列为 分类/区块）
-    unified_headers: List[str] = ["分类/区块"]
-    unified_types: List[str] = ["text"]
-    header_to_col: Dict[str, int] = {}
+    # 选用列数最完整（同列数取最靠前）的子表作为主表头基准
+    master_sheet = max(sheets, key=lambda s: len(s.get("headers") or []))
+    master_headers = [
+        str(h or f"列{i + 1}").strip() or f"列{i + 1}"
+        for i, h in enumerate(master_sheet.get("headers") or [])
+    ]
+    master_types = master_sheet.get("col_types") or []
+    master_len = len(master_headers)
 
+    unified_headers: List[str] = ["分类/区块"] + master_headers
+    unified_types: List[str] = ["text"] + [
+        (master_types[i] if i < len(master_types) and master_types[i] in VALID_COL_TYPES else "text")
+        for i in range(master_len)
+    ]
+    header_to_col: Dict[str, int] = {h: 1 + i for i, h in enumerate(master_headers)}
+
+    # 预先计算每个子表的列映射（可能会在极端多列时扩展 unified_headers）
+    mappings: List[List[int]] = []
     for sh in sheets:
-        sh_headers = sh.get("headers") or []
+        sh_headers = [str(h or f"列{i + 1}").strip() or f"列{i + 1}" for i, h in enumerate(sh.get("headers") or [])]
         sh_types = sh.get("col_types") or []
-        for idx, h in enumerate(sh_headers):
-            h_clean = str(h or f"列{idx + 1}").strip() or f"列{idx + 1}"
-            if h_clean not in header_to_col:
-                header_to_col[h_clean] = len(unified_headers)
-                unified_headers.append(h_clean)
-                t = sh_types[idx] if idx < len(sh_types) else "text"
-                unified_types.append(t if t in VALID_COL_TYPES else "text")
+        mappings.append(
+            _map_subsheet_columns(sh_headers, sh_types, unified_headers, unified_types, header_to_col, master_len)
+        )
 
     total_cols = len(unified_headers)
     merged_rows: List[List[str]] = []
@@ -315,8 +391,7 @@ def merge_sheets_into_single_quotation(
 
     for s_idx, sh in enumerate(sheets):
         section_name = str(sh.get("name") or f"区块{s_idx + 1}").strip()
-        sh_headers = [str(h or f"列{i + 1}").strip() or f"列{i + 1}" for i, h in enumerate(sh.get("headers") or [])]
-        local_to_global = [header_to_col[h] for h in sh_headers]
+        local_to_global = mappings[s_idx]
 
         base_row_offset = len(merged_rows)
         for row in (sh.get("rows") or []):
@@ -443,6 +518,12 @@ def _row_signature(row: List[str]) -> str:
     return "|".join(re.sub(r"\s+", "", str(c or "")).lower() for c in row)
 
 
+def _row_key_signature(row: List[str]) -> str:
+    """用前两列（如 型号 + 容量）作为边界去重辅助键。"""
+    parts = [re.sub(r"\s+", "", str(c or "")).lower() for c in row[:2]]
+    return "|".join(parts)
+
+
 def _dedupe_boundary_overlap(prev_rows: List[List[str]], next_rows: List[List[str]], max_window: int = 8) -> int:
     """计算前后两段切片在重叠区域的重复行数，返回 next_rows 应跳过的起始下标。"""
     if not prev_rows or not next_rows:
@@ -453,11 +534,12 @@ def _dedupe_boundary_overlap(prev_rows: List[List[str]], next_rows: List[List[st
     for k in range(max_k, 0, -1):
         if prev_tail[-k:] == next_head[:k]:
             return k
-    # 单行逐一匹配（容忍首行切半只匹配到次行）
     tail_set = set(s for s in prev_tail if s.replace("|", ""))
+    tail_keys = set(_row_key_signature(r) for r in prev_rows[-max_window:] if any(r[:2]))
     skip = 0
-    for sig in next_head[:4]:
-        if sig in tail_set:
+    for idx, sig in enumerate(next_head[:4]):
+        key_sig = _row_key_signature(next_rows[idx])
+        if sig in tail_set or (key_sig.replace("|", "") and key_sig in tail_keys):
             skip += 1
         else:
             break
@@ -518,8 +600,8 @@ def merge_quotation_slices(
                             )
                     continue
                 sh_copy["rows"] = trimmed_next
-            elif same_headers:
-                # 不同品牌名但相邻切片边界可能有重叠行，仍做重叠去重但保留各自品牌名
+            else:
+                # 不同区块名或列数微差时，仍在相邻切片边界做 (型号+容量) 重叠去重
                 skip = _dedupe_boundary_overlap(prev.get("rows") or [], sh_copy.get("rows") or [])
                 sh_copy["rows"] = (sh_copy.get("rows") or [])[skip:]
             if sh_copy.get("rows"):
@@ -590,7 +672,8 @@ def extract_tables_from_image(
     instruction = (
         "You are an expert document and quotation-sheet OCR extraction engine. "
         "CRITICAL: Extract EVERY SINGLE ROW and EVERY table/block visible in this image from the very top to the very bottom. "
-        "NEVER omit rows, NEVER stop after the first section, and NEVER truncate the output. "
+        "NEVER omit rows, NEVER omit price cells, NEVER stop after the first section, and NEVER truncate the output. "
+        "If a sub-table has '-' or blank placeholder columns (for example no highest price tier), KEEP that column slot so all blocks preserve consistent column structure and alignment. "
         "Set `title` to the main quotation header visible in the image (e.g. vendor name + date like '新军强 靓机 11.24'). "
         "Put top/edge vendor rules, validity notices, or disclaimers outside data rows into `document_notes` (do NOT mix them into table rows). "
         "Preserve exact text, model names, capacities, numbers, currency symbols, range strings (e.g. '3200-3300'), '+50', and leading zeros (e.g. '001042'). "

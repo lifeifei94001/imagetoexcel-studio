@@ -94,7 +94,7 @@ export async function splitLongImageIntoSlices(file: File): Promise<File[]> {
       const targetH = Math.round(origH * scale);
 
       const maxSlices = 4;
-      const overlap = 180;
+      const overlap = 260;
       const step = Math.max(1050, Math.ceil((targetH - overlap) / maxSlices));
       const sliceCount = Math.min(maxSlices, Math.max(2, Math.ceil((targetH - overlap) / step)));
       const sliceHeight = Math.ceil((targetH + overlap * (sliceCount - 1)) / sliceCount);

@@ -796,8 +796,9 @@ async function startBatchExtraction() {
             progressItems.value[myIdx].quoteTitle = res.quotation.quote_title;
             progressItems.value[myIdx].message = `识别完成 (${res.quotation.merged_sheet.rows.length} 行 · 已存对象存储)`;
           } else {
-            // 超长报价单自动切片识别 + 后端去重合并（每张图仅扣 1 次额度）
+            // 超长报价单自动切片识别 + 将首段表头延续传递给后续分段，防止断层丢价格列
             const sliceResults: Record<string, unknown>[] = [];
+            let inheritedHeaderHint = customHint.value.trim();
             for (let sIdx = 0; sIdx < slices.length; sIdx++) {
               progressItems.value[myIdx].message = `检测到超长图，正在高清分段提取 (${sIdx + 1}/${slices.length} 段)...`;
               const sRes = await extractSlice({
@@ -805,10 +806,19 @@ async function startBatchExtraction() {
                 sliceIndex: sIdx,
                 mode: mode.value,
                 forceDemo: forceDemo.value,
-                customHint: customHint.value,
+                customHint: inheritedHeaderHint,
                 modelTier: modelTier.value,
               });
               sliceResults.push(sRes);
+              if (sIdx === 0) {
+                const rawList = (sRes.raw_sheets as Array<{ headers?: string[] }> | undefined) || [];
+                const firstHeaders = rawList[0]?.headers;
+                if (firstHeaders?.length) {
+                  const headerStr = firstHeaders.join(" | ");
+                  const contNote = `This slice continues the same quotation table. Keep the EXACT ${firstHeaders.length} columns in order: [${headerStr}]. Keep '-' or empty placeholder slots for missing tiers and do NOT shift prices left or omit price numbers.`;
+                  inheritedHeaderHint = inheritedHeaderHint ? `${inheritedHeaderHint}\n${contNote}` : contNote;
+                }
+              }
             }
             progressItems.value[myIdx].message = `正在去重拼接 ${slices.length} 段结果并归档 B2...`;
             const committed = await commitSlicedQuotation({
