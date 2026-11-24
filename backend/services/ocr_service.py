@@ -372,7 +372,13 @@ def extract_tables_from_image(
 
     mime_type = normalize_mime_type(filename, content_type)
     b64_data = base64.b64encode(image_bytes).decode("ascii")
-    model_name = get_active_model()
+    primary_model = get_active_model()
+    fallback_models = ["gemini-3.5-flash-lite", "gemini-4-argon", "gemini-3.1-flash-lite"]
+    candidate_models: List[str] = []
+    for m in [primary_model] + fallback_models:
+        if m and m not in candidate_models:
+            candidate_models.append(m)
+    candidate_models = candidate_models[:3]
 
     instruction = (
         "You are an expert document and table OCR extraction engine. "
@@ -388,39 +394,57 @@ def extract_tables_from_image(
     if custom_hint.strip():
         instruction += f"\nAdditional user hint: {custom_hint.strip()}"
 
-    payload = {
-        "model": model_name,
-        "store": False,
-        "input": [
-            {"type": "text", "text": instruction},
-            {"type": "image", "data": b64_data, "mime_type": mime_type},
-        ],
-        "response_format": {
-            "type": "text",
-            "mime_type": "application/json",
-            "schema": TABLE_EXTRACTION_SCHEMA,
-        },
-    }
-
     headers = {
         "Content-Type": "application/json",
         "x-goog-api-key": api_key,
         "Api-Revision": "2026-05-20",
     }
 
-    try:
-        resp = requests.post(GEMINI_INTERACTIONS_URL, json=payload, headers=headers, timeout=50)
-    except requests.RequestException as exc:
-        raise RuntimeError(f"连接 Gemini 视觉识别服务超时或网络异常：{type(exc).__name__}")
+    resp = None
+    used_model = primary_model
+    last_error = ""
+    for attempt_idx, candidate in enumerate(candidate_models):
+        payload = {
+            "model": candidate,
+            "store": False,
+            "input": [
+                {"type": "text", "text": instruction},
+                {"type": "image", "data": b64_data, "mime_type": mime_type},
+            ],
+            "response_format": {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": TABLE_EXTRACTION_SCHEMA,
+            },
+        }
+        try:
+            resp = requests.post(
+                GEMINI_INTERACTIONS_URL,
+                json=payload,
+                headers=headers,
+                timeout=24 if attempt_idx == 0 else 20,
+            )
+        except requests.RequestException as exc:
+            last_error = f"连接 Gemini 视觉识别服务超时或网络异常：{type(exc).__name__}"
+            resp = None
+            continue
 
-    if resp.status_code != 200:
-        # 严禁在任何错误信息中回显 GEMINI_API_KEY 字符
+        if resp.status_code == 200:
+            used_model = candidate
+            break
+
         err_preview = resp.text[:240].replace(api_key, "***")
         if resp.status_code in (401, 403):
             raise RuntimeError("GEMINI_API_KEY 鉴权失败，请检查 Vercel 或 .env 中的密钥配置是否正确。")
-        if resp.status_code == 429:
-            raise RuntimeError("Gemini API 触发速率限制，请稍等几秒后重试，或切换为演示模式预览。")
+        if resp.status_code in (429, 500, 502, 503, 504):
+            last_error = (
+                f"Gemini 模型 {candidate} 暂不可用 (HTTP {resp.status_code})：{err_preview}"
+            )
+            continue
         raise RuntimeError(f"Gemini 视觉识别接口返回异常 (HTTP {resp.status_code})：{err_preview}")
+
+    if resp is None or resp.status_code != 200:
+        raise RuntimeError(last_error or "Gemini 视觉识别服务暂时繁忙，请稍后重试。")
 
     raw_json = resp.json()
     text_out = _extract_text_from_interactions_response(raw_json).strip()
@@ -435,7 +459,10 @@ def extract_tables_from_image(
         parsed = json.loads(cleaned)
 
     normalized = normalize_table_grid(parsed, fallback_name=Path(filename or "extracted").stem)
-    normalized["engine"] = model_name
+    normalized["engine"] = used_model
     normalized["is_demo"] = False
-    normalized["notice"] = f"已通过 {model_name} 多模态引擎完成结构化表格识别"
+    if used_model != primary_model:
+        normalized["notice"] = f"主模型高峰限流，已自动切换 {used_model} 完成结构化表格识别"
+    else:
+        normalized["notice"] = f"已通过 {used_model} 多模态引擎完成结构化表格识别"
     return normalized
