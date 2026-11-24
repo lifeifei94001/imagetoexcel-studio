@@ -562,10 +562,14 @@ async function startExtraction() {
       files: preparedFiles,
       mode: mode.value,
       outputMode: outputMode.value,
-      forceDemo: forceDemo.value || !geminiConfigured.value,
+      forceDemo: forceDemo.value,
       customHint: customHint.value,
     });
     extractedResult.value = res;
+    if (!res.is_demo) {
+      geminiConfigured.value = true;
+      activeModel.value = res.engine;
+    }
     quotaRemaining.value = res.quota.remaining;
     quotaLimit.value = res.quota.daily_limit;
     ElMessage.success(res.is_demo ? "演示结构化表格已生成，可直接编辑与导出" : "表格识别提取成功！");

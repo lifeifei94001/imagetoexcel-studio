@@ -90,8 +90,12 @@ TABLE_EXTRACTION_SCHEMA: Dict[str, Any] = {
 }
 
 
+def _get_gemini_api_key() -> str:
+    return _get_clean_env("GEMINI_API_KEY") or _get_clean_env("GOOGLE_API_KEY")
+
+
 def has_gemini_key() -> bool:
-    return bool(_get_clean_env("GEMINI_API_KEY"))
+    return bool(_get_gemini_api_key())
 
 
 def get_active_model() -> str:
@@ -362,7 +366,7 @@ def extract_tables_from_image(
     - 配置了 GEMINI_API_KEY 且未开启 force_demo 时，调用 Gemini 4 Hydrogen Interactions API + Structured Outputs；
     - 否则自动平稳降级至本地结构化演示模式，确保零 Key 开箱可用。
     """
-    api_key = _get_clean_env("GEMINI_API_KEY")
+    api_key = _get_gemini_api_key()
     if force_demo or not api_key:
         return _build_demo_result(filename, mode)
 

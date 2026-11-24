@@ -354,26 +354,41 @@ _db_initialized = False
 
 
 def ensure_db_ready() -> None:
-    """幂等冷启动数据库自检：先查 sqlite_master，仅当表不存在时执行建表。"""
+    """幂等冷启动数据库自检：先查 sqlite_master，仅当缺表时增量建表（兼容 SQLAlchemy Row 与并发冷启动）。"""
     global _db_initialized
     if _db_initialized:
         return
+    table_names = list(SQLModel.metadata.tables.keys())
     try:
         with Session(engine) as session:
-            table_names = list(SQLModel.metadata.tables.keys())
             if table_names:
                 placeholders = ", ".join(f"'{name}'" for name in table_names)
-                cnt = session.exec(
-                    text(f"SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ({placeholders})")
-                ).one()
-                existing_count = cnt[0] if isinstance(cnt, tuple) else int(cnt)
-                if existing_count < len(table_names):
-                    SQLModel.metadata.create_all(engine)
+                rows = session.exec(
+                    text(f"SELECT name FROM sqlite_master WHERE type='table' AND name IN ({placeholders})")
+                ).all()
+                existing_names = {
+                    str(r[0] if hasattr(r, "__getitem__") and not isinstance(r, str) else r)
+                    for r in rows
+                }
+                missing_tables = [
+                    SQLModel.metadata.tables[name]
+                    for name in table_names
+                    if name not in existing_names
+                ]
+                if missing_tables:
+                    SQLModel.metadata.create_all(engine, tables=missing_tables, checkfirst=True)
             else:
-                SQLModel.metadata.create_all(engine)
+                SQLModel.metadata.create_all(engine, checkfirst=True)
         _db_initialized = True
-    except Exception:
-        SQLModel.metadata.create_all(engine)
+    except Exception as exc:
+        if "already exists" in str(exc).lower():
+            _db_initialized = True
+            return
+        try:
+            SQLModel.metadata.create_all(engine, checkfirst=True)
+        except Exception as inner_exc:
+            if "already exists" not in str(inner_exc).lower():
+                raise
         _db_initialized = True
 
 
