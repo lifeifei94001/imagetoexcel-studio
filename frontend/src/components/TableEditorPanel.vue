@@ -1,6 +1,6 @@
 <template>
   <section class="glass-strong" style="padding: 20px; margin-bottom: 24px">
-    <!-- 顶部公告与导出栏 -->
+    <!-- 顶部状态与多模式导出栏 -->
     <div
       style="
         display: flex;
@@ -8,46 +8,114 @@
         align-items: center;
         justify-content: space-between;
         gap: 12px;
-        margin-bottom: 16px;
+        margin-bottom: 14px;
       "
     >
       <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
-        <span class="gem-pill" :class="isDemo ? 'pill-gold' : 'pill-emerald'">
-          {{ isDemo ? "演示提取模式" : `AI 引擎：${engine}` }}
+        <span class="gem-pill" :class="activeQuotation?.is_demo ? 'pill-gold' : 'pill-emerald'">
+          {{ activeQuotation?.is_demo ? "演示提取模式" : `AI 引擎：${activeQuotation?.engine || "gemini"}` }}
         </span>
-        <span v-if="notice" class="glass-muted" style="font-size: 13px">{{ notice }}</span>
+        <span v-if="activeQuotation?.notice" class="glass-muted" style="font-size: 13px">
+          {{ activeQuotation.notice }}
+        </span>
       </div>
 
       <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap">
-        <el-radio-group v-model="localOutputMode" size="small">
-          <el-radio-button value="all_in_one">合并为单文件 (多 Sheet)</el-radio-button>
-          <el-radio-button value="per_image">每表独立导出</el-radio-button>
-        </el-radio-group>
-        <el-button size="small" @click="copyMarkdown">复制 Markdown</el-button>
-        <el-button size="small" :loading="exportingFormat === 'csv'" @click="triggerExport('csv')">
-          导出 .csv
-        </el-button>
         <el-button
           type="primary"
           size="small"
-          :loading="exportingFormat === 'xlsx'"
-          @click="triggerExport('xlsx')"
+          :loading="exportingKey === 'current_xlsx'"
+          @click="exportCurrentXlsx"
         >
-          导出 .xlsx
+          导出当前报价单 (.xlsx)
         </el-button>
+        <el-button
+          v-if="quotations.length > 1"
+          type="success"
+          size="small"
+          :loading="exportingKey === 'batch_zip'"
+          @click="exportAllZip"
+        >
+          批量打包全部 (.zip · {{ quotations.length }} 份)
+        </el-button>
+        <el-button
+          v-if="quotations.length > 1"
+          size="small"
+          :loading="exportingKey === 'all_in_one_xlsx'"
+          @click="exportAllInOneXlsx"
+        >
+          合并为多 Sheet (.xlsx)
+        </el-button>
+        <el-button size="small" :loading="exportingKey === 'csv'" @click="exportCsv">
+          导出 .csv
+        </el-button>
+        <el-button size="small" @click="copyMarkdown">复制 Markdown</el-button>
+      </div>
+    </div>
+
+    <!-- 多报价单图片切换栏（1 图 = 1 份报价单） -->
+    <div
+      style="
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        margin-bottom: 14px;
+        padding: 10px 12px;
+        border-radius: var(--glass-radius-sm);
+        background: var(--glass-bg-input);
+        border: 1px solid var(--glass-border);
+      "
+    >
+      <div v-auto-animate style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap">
+        <span class="glass-muted" style="font-size: 12.5px; font-weight: 600; margin-right: 4px">
+          报价单列表 ({{ quotations.length }})：
+        </span>
+        <button
+          v-for="(q, idx) in quotations"
+          :key="`${idx}-${q.source_filename}`"
+          type="button"
+          class="nav-pill-btn"
+          :class="{ 'is-active': activeQuoteIdx === idx }"
+          @click="selectQuotation(idx)"
+        >
+          {{ q.quote_title || q.source_filename }}
+        </button>
+      </div>
+
+      <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
+        <div style="display: flex; align-items: center; gap: 6px">
+          <span class="glass-muted" style="font-size: 12px">导出文件名:</span>
+          <el-input
+            v-if="activeQuotation"
+            :model-value="activeQuotation.quote_title"
+            size="small"
+            style="width: 190px"
+            placeholder="输入导出名称"
+            @update:model-value="updateQuoteTitle"
+          />
+        </div>
+        <el-switch
+          :model-value="mergePerImage"
+          active-text="合为单表"
+          inactive-text="拆分子表"
+          inline-prompt
+          @update:model-value="(val: boolean) => $emit('update:mergePerImage', val)"
+        />
       </div>
     </div>
 
     <!-- Bento KPI 概览 -->
     <div class="bento-grid">
       <SpotlightCard>
-        <div class="kpi-label">提取工作表</div>
-        <div class="kpi-value num-tabular">{{ sheets.length }}</div>
-        <span class="gem-pill pill-sky">可多表合并</span>
+        <div class="kpi-label">当前批次报价单</div>
+        <div class="kpi-value num-tabular">{{ quotations.length }}</div>
+        <span class="gem-pill pill-sky">1 图 = 1 完整报价单</span>
       </SpotlightCard>
       <SpotlightCard>
-        <div class="kpi-label">总数据行数</div>
-        <div class="kpi-value num-tabular">{{ totalRows }}</div>
+        <div class="kpi-label">当前报价单行数</div>
+        <div class="kpi-value num-tabular">{{ currentTotalRows }}</div>
         <span class="gem-pill pill-emerald">零丢行对齐</span>
       </SpotlightCard>
       <SpotlightCard>
@@ -64,7 +132,23 @@
       </SpotlightCard>
     </div>
 
-    <!-- Sheet 标签页与编辑工具栏 -->
+    <!-- 商家顶部规则备注提示条（Q5：独立展示，不掺入表格数据行） -->
+    <div
+      v-if="activeQuotation?.document_notes"
+      class="glass"
+      style="
+        padding: 10px 14px;
+        margin-bottom: 14px;
+        border-left: 3px solid var(--glass-accent);
+        font-size: 13px;
+        line-height: 1.6;
+      "
+    >
+      <span style="font-weight: 700; margin-right: 6px">商家规则 / 备注说明：</span>
+      <span class="glass-muted">{{ activeQuotation.document_notes }}</span>
+    </div>
+
+    <!-- 拆分子表选择器（仅在关闭合并单表且原图含多个区块时显示） + 表格编辑栏 -->
     <div
       style="
         display: flex;
@@ -76,16 +160,23 @@
       "
     >
       <div v-auto-animate style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap">
-        <button
-          v-for="(sh, idx) in sheets"
-          :key="`${idx}-${sh.name}`"
-          type="button"
-          class="nav-pill-btn"
-          :class="{ 'is-active': activeSheetIndex === idx }"
-          @click="activeSheetIndex = idx"
-        >
-          {{ sh.name || `Sheet${idx + 1}` }}
-        </button>
+        <template v-if="!mergePerImage && currentSheets.length > 1">
+          <button
+            v-for="(sh, idx) in currentSheets"
+            :key="`${idx}-${sh.name}`"
+            type="button"
+            class="nav-pill-btn"
+            :class="{ 'is-active': activeSubSheetIdx === idx }"
+            @click="activeSubSheetIdx = idx"
+          >
+            {{ sh.name || `区块${idx + 1}` }}
+          </button>
+        </template>
+        <span v-else class="gem-pill pill-violet">
+          {{ mergePerImage && (activeQuotation?.raw_sheets?.length || 0) > 1
+            ? `已自动合并 ${activeQuotation?.raw_sheets?.length} 个区块为单 Sheet`
+            : activeSheet?.name || "Sheet1" }}
+        </span>
       </div>
 
       <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap">
@@ -98,7 +189,7 @@
       </div>
     </div>
 
-    <!-- 分栏对照主区域：左原图 + 右可编辑表格 -->
+    <!-- 分栏对照主区域：左原图（支持最高 300% 放大看长报价单）+ 右可编辑表格 -->
     <div :class="showPreview ? 'editor-split' : ''" style="gap: 18px">
       <div v-if="showPreview" class="glass image-preview-pane">
         <div
@@ -110,15 +201,29 @@
             margin-bottom: 10px;
           "
         >
-          <span style="font-weight: 700; font-size: 13.5px; color: var(--glass-text)">
-            原图对照：{{ activeSheet?.source_filename || "当前表格" }}
+          <span
+            style="
+              font-weight: 700;
+              font-size: 13px;
+              color: var(--glass-text);
+              overflow: hidden;
+              text-overflow: ellipsis;
+              white-space: nowrap;
+            "
+          >
+            原图：{{ activeQuotation?.source_filename || "当前报价单" }}
           </span>
-          <div style="display: flex; align-items: center; gap: 4px">
+          <div style="display: flex; align-items: center; gap: 4px; flex-shrink: 0">
             <el-button size="small" @click="zoom = Math.max(50, zoom - 25)">-</el-button>
-            <span class="num-tabular" style="font-size: 12px; min-width: 44px; text-align: center">
+            <span
+              class="num-tabular"
+              style="font-size: 12px; min-width: 44px; text-align: center; cursor: pointer"
+              title="点击恢复 100%"
+              @click="zoom = 100"
+            >
               {{ zoom }}%
             </span>
-            <el-button size="small" @click="zoom = Math.min(200, zoom + 25)">+</el-button>
+            <el-button size="small" @click="zoom = Math.min(300, zoom + 25)">+</el-button>
           </div>
         </div>
 
@@ -126,14 +231,14 @@
           <img
             v-if="currentPreviewUrl"
             :src="currentPreviewUrl"
-            :alt="activeSheet?.source_filename || '原图预览'"
+            :alt="activeQuotation?.source_filename || '原图预览'"
             :style="{ width: `${zoom}%`, maxWidth: 'none', borderRadius: '8px' }"
           />
           <div v-else style="padding: 36px 16px; text-align: center">
-            <div style="font-weight: 600; margin-bottom: 6px">已从本地草稿恢复表格编辑状态</div>
+            <div style="font-weight: 600; margin-bottom: 6px">已从云端记录 / 草稿恢复表格</div>
             <div class="glass-muted" style="font-size: 12.5px; line-height: 1.6">
-              为保护隐私与内存，刷新后浏览器不会持久化原始图片文件流。<br />
-              你仍可直接编辑右侧表格并导出 .xlsx / .csv，或重新拖入原图对照。
+              为节约存储空间，云端存档与刷新草稿不留存原始图片文件。<br />
+              你可直接继续修改右侧表格并重新导出 .xlsx / .zip。
             </div>
           </div>
         </div>
@@ -141,7 +246,11 @@
 
       <!-- 右侧：结构化可编辑表格 + 文本模式预览 -->
       <div style="min-width: 0">
-        <div v-if="mode === 'text' && plainText" class="glass" style="padding: 14px; margin-bottom: 14px">
+        <div
+          v-if="mode === 'text' && activeQuotation?.plain_text"
+          class="glass"
+          style="padding: 14px; margin-bottom: 14px"
+        >
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px">
             <span style="font-weight: 700; font-size: 13.5px">文本 / Markdown 提取结果</span>
             <el-button size="small" @click="copyPlainText">复制纯文本</el-button>
@@ -157,7 +266,7 @@
               max-height: 200px;
               overflow: auto;
             "
-          >{{ plainText }}</pre>
+          >{{ activeQuotation.plain_text }}</pre>
         </div>
 
         <div v-if="activeSheet" class="spreadsheet-wrap">
@@ -257,56 +366,92 @@ import {
   extractApiError,
   type ColumnSemanticType,
   type ExtractedSheet,
+  type QuotationGroup,
 } from "../api/convertApi";
 
 const props = defineProps<{
-  sheets: ExtractedSheet[];
+  quotations: QuotationGroup[];
+  mergePerImage: boolean;
   previewMap: Record<string, string>;
-  outputMode: "all_in_one" | "per_image";
   mode: "excel" | "text";
-  engine: string;
-  isDemo: boolean;
-  notice: string;
-  plainText: string;
 }>();
 
 const emit = defineEmits<{
-  (e: "update:sheets", val: ExtractedSheet[]): void;
-  (e: "update:outputMode", val: "all_in_one" | "per_image"): void;
+  (e: "update:quotations", val: QuotationGroup[]): void;
+  (e: "update:mergePerImage", val: boolean): void;
   (e: "clear-draft"): void;
 }>();
 
-const activeSheetIndex = ref(0);
+const activeQuoteIdx = ref(0);
+const activeSubSheetIdx = ref(0);
 const showPreview = ref(true);
 const zoom = ref(100);
-const exportingFormat = ref<"" | "xlsx" | "csv">("");
-
-const localOutputMode = computed({
-  get: () => props.outputMode,
-  set: (val) => emit("update:outputMode", val),
-});
+const exportingKey = ref<"" | "current_xlsx" | "batch_zip" | "all_in_one_xlsx" | "csv">("");
 
 watch(
-  () => props.sheets.length,
+  () => props.quotations.length,
   (len) => {
-    if (activeSheetIndex.value >= len) {
-      activeSheetIndex.value = Math.max(0, len - 1);
+    if (activeQuoteIdx.value >= len) {
+      activeQuoteIdx.value = Math.max(0, len - 1);
+      activeSubSheetIdx.value = 0;
     }
   }
 );
 
-const activeSheet = computed(() => props.sheets[activeSheetIndex.value] || null);
-const totalRows = computed(() => props.sheets.reduce((acc, s) => acc + (s.rows?.length || 0), 0));
+watch(
+  () => props.mergePerImage,
+  () => {
+    activeSubSheetIdx.value = 0;
+  }
+);
 
-const currentPreviewUrl = computed(() => {
-  const fname = activeSheet.value?.source_filename;
-  if (fname && props.previewMap[fname]) return props.previewMap[fname];
-  const firstKey = Object.keys(props.previewMap)[0];
-  return firstKey ? props.previewMap[firstKey] : "";
+const activeQuotation = computed(() => props.quotations[activeQuoteIdx.value] || null);
+
+const currentSheets = computed<ExtractedSheet[]>(() => {
+  const q = activeQuotation.value;
+  if (!q) return [];
+  if (props.mergePerImage) return [q.merged_sheet];
+  return q.raw_sheets?.length ? q.raw_sheets : [q.merged_sheet];
 });
 
-function cloneSheets(): ExtractedSheet[] {
-  return JSON.parse(JSON.stringify(props.sheets));
+const activeSheet = computed<ExtractedSheet | null>(
+  () => currentSheets.value[activeSubSheetIdx.value] || currentSheets.value[0] || null
+);
+
+const currentTotalRows = computed(() =>
+  currentSheets.value.reduce((acc, sh) => acc + (sh.rows?.length || 0), 0)
+);
+
+const currentPreviewUrl = computed(() => {
+  const fname = activeQuotation.value?.source_filename;
+  if (fname && props.previewMap[fname]) return props.previewMap[fname];
+  return "";
+});
+
+function selectQuotation(idx: number) {
+  activeQuoteIdx.value = idx;
+  activeSubSheetIdx.value = 0;
+}
+
+function cloneQuotations(): QuotationGroup[] {
+  return JSON.parse(JSON.stringify(props.quotations));
+}
+
+function getMutableTargetSheet(next: QuotationGroup[]): ExtractedSheet | null {
+  const q = next[activeQuoteIdx.value];
+  if (!q) return null;
+  if (props.mergePerImage) return q.merged_sheet;
+  return q.raw_sheets?.[activeSubSheetIdx.value] || q.merged_sheet;
+}
+
+function updateQuoteTitle(val: string) {
+  const next = cloneQuotations();
+  const q = next[activeQuoteIdx.value];
+  if (!q) return;
+  q.quote_title = val;
+  q.merged_sheet.name = val.slice(0, 28) || "Sheet1";
+  q.merged_sheet.export_filename = val || q.source_filename;
+  emit("update:quotations", next);
 }
 
 function getWarning(rIdx: number, cIdx: number): string {
@@ -320,82 +465,159 @@ function isNumericCol(cIdx: number): boolean {
 }
 
 function updateHeader(cIdx: number, val: string) {
-  const next = cloneSheets();
-  next[activeSheetIndex.value].headers[cIdx] = val;
-  emit("update:sheets", next);
+  const next = cloneQuotations();
+  const sh = getMutableTargetSheet(next);
+  if (!sh) return;
+  sh.headers[cIdx] = val;
+  emit("update:quotations", next);
 }
 
 function updateColType(cIdx: number, val: ColumnSemanticType) {
-  const next = cloneSheets();
-  next[activeSheetIndex.value].col_types[cIdx] = val;
-  emit("update:sheets", next);
+  const next = cloneQuotations();
+  const sh = getMutableTargetSheet(next);
+  if (!sh) return;
+  sh.col_types[cIdx] = val;
+  emit("update:quotations", next);
 }
 
 function updateCell(rIdx: number, cIdx: number, val: string) {
-  const next = cloneSheets();
-  const sheet = next[activeSheetIndex.value];
-  sheet.rows[rIdx][cIdx] = val;
-  sheet.warnings = sheet.warnings.filter((w) => !(w.row === rIdx && w.col === cIdx));
-  emit("update:sheets", next);
+  const next = cloneQuotations();
+  const sh = getMutableTargetSheet(next);
+  if (!sh) return;
+  sh.rows[rIdx][cIdx] = val;
+  sh.warnings = sh.warnings.filter((w) => !(w.row === rIdx && w.col === cIdx));
+  emit("update:quotations", next);
 }
 
 function addRow() {
-  const next = cloneSheets();
-  const sheet = next[activeSheetIndex.value];
-  if (!sheet) return;
-  sheet.rows.push(new Array(sheet.headers.length).fill(""));
-  emit("update:sheets", next);
+  const next = cloneQuotations();
+  const sh = getMutableTargetSheet(next);
+  if (!sh) return;
+  sh.rows.push(new Array(sh.headers.length).fill(""));
+  emit("update:quotations", next);
 }
 
 function removeRow(rIdx: number) {
-  const next = cloneSheets();
-  const sheet = next[activeSheetIndex.value];
-  if (!sheet) return;
-  sheet.rows.splice(rIdx, 1);
-  sheet.warnings = sheet.warnings
+  const next = cloneQuotations();
+  const sh = getMutableTargetSheet(next);
+  if (!sh) return;
+  sh.rows.splice(rIdx, 1);
+  sh.warnings = sh.warnings
     .filter((w) => w.row !== rIdx)
     .map((w) => (w.row > rIdx ? { ...w, row: w.row - 1 } : w));
-  emit("update:sheets", next);
+  emit("update:quotations", next);
 }
 
 function addColumn() {
-  const next = cloneSheets();
-  const sheet = next[activeSheetIndex.value];
-  if (!sheet) return;
-  sheet.headers.push(`新增列${sheet.headers.length + 1}`);
-  sheet.col_types.push("text");
-  for (const r of sheet.rows) r.push("");
-  emit("update:sheets", next);
+  const next = cloneQuotations();
+  const sh = getMutableTargetSheet(next);
+  if (!sh) return;
+  sh.headers.push(`新增列${sh.headers.length + 1}`);
+  sh.col_types.push("text");
+  for (const r of sh.rows) r.push("");
+  emit("update:quotations", next);
 }
 
 function removeColumn(cIdx: number) {
-  const next = cloneSheets();
-  const sheet = next[activeSheetIndex.value];
-  if (!sheet || sheet.headers.length <= 1) return;
-  sheet.headers.splice(cIdx, 1);
-  sheet.col_types.splice(cIdx, 1);
-  for (const r of sheet.rows) r.splice(cIdx, 1);
-  sheet.warnings = sheet.warnings
+  const next = cloneQuotations();
+  const sh = getMutableTargetSheet(next);
+  if (!sh || sh.headers.length <= 1) return;
+  sh.headers.splice(cIdx, 1);
+  sh.col_types.splice(cIdx, 1);
+  for (const r of sh.rows) r.splice(cIdx, 1);
+  sh.warnings = sh.warnings
     .filter((w) => w.col !== cIdx)
     .map((w) => (w.col > cIdx ? { ...w, col: w.col - 1 } : w));
-  emit("update:sheets", next);
+  emit("update:quotations", next);
 }
 
-async function triggerExport(format: "xlsx" | "csv") {
-  exportingFormat.value = format;
+function buildExportSheetsForQuotation(q: QuotationGroup): ExtractedSheet[] {
+  if (props.mergePerImage) {
+    return [{ ...q.merged_sheet, name: (q.quote_title || q.merged_sheet.name).slice(0, 28), export_filename: q.quote_title }];
+  }
+  return (q.raw_sheets?.length ? q.raw_sheets : [q.merged_sheet]).map((s) => ({
+    ...s,
+    export_filename: `${q.quote_title}_${s.name}`,
+  }));
+}
+
+async function exportCurrentXlsx() {
+  const q = activeQuotation.value;
+  if (!q) return;
+  exportingKey.value = "current_xlsx";
   try {
-    const baseName = activeSheet.value?.name || "image-to-excel";
+    const sheets = buildExportSheetsForQuotation(q);
     const dlName = await downloadExportedTables({
-      sheets: props.sheets,
-      outputMode: props.outputMode,
-      format,
-      filename: baseName,
+      sheets,
+      outputMode: "all_in_one",
+      format: "xlsx",
+      filename: q.quote_title || q.source_filename.replace(/\.[^.]+$/, ""),
+    });
+    ElMessage.success(`已导出单份报价单：${dlName}`);
+  } catch (err) {
+    ElMessage.error(extractApiError(err));
+  } finally {
+    exportingKey.value = "";
+  }
+}
+
+async function exportAllZip() {
+  exportingKey.value = "batch_zip";
+  try {
+    const sheets = props.quotations.map((q) => ({
+      ...q.merged_sheet,
+      name: (q.quote_title || q.merged_sheet.name).slice(0, 28),
+      export_filename: q.quote_title || q.source_filename.replace(/\.[^.]+$/, ""),
+    }));
+    const dlName = await downloadExportedTables({
+      sheets,
+      outputMode: "per_image",
+      format: "xlsx",
+      filename: `报价单合集_${props.quotations.length}份`,
+    });
+    ElMessage.success(`已打包导出全部报价单：${dlName}`);
+  } catch (err) {
+    ElMessage.error(extractApiError(err));
+  } finally {
+    exportingKey.value = "";
+  }
+}
+
+async function exportAllInOneXlsx() {
+  exportingKey.value = "all_in_one_xlsx";
+  try {
+    const sheets = props.quotations.flatMap((q) => buildExportSheetsForQuotation(q));
+    const dlName = await downloadExportedTables({
+      sheets,
+      outputMode: "all_in_one",
+      format: "xlsx",
+      filename: `报价单合并总表_${props.quotations.length}份`,
+    });
+    ElMessage.success(`已导出合并多 Sheet 工作簿：${dlName}`);
+  } catch (err) {
+    ElMessage.error(extractApiError(err));
+  } finally {
+    exportingKey.value = "";
+  }
+}
+
+async function exportCsv() {
+  const q = activeQuotation.value;
+  if (!q) return;
+  exportingKey.value = "csv";
+  try {
+    const sheets = buildExportSheetsForQuotation(q);
+    const dlName = await downloadExportedTables({
+      sheets,
+      outputMode: "per_image",
+      format: "csv",
+      filename: q.quote_title || "报价单",
     });
     ElMessage.success(`已导出：${dlName}`);
   } catch (err) {
     ElMessage.error(extractApiError(err));
   } finally {
-    exportingFormat.value = "";
+    exportingKey.value = "";
   }
 }
 
@@ -406,11 +628,11 @@ async function copyMarkdown() {
   const sepLine = `| ${sh.headers.map(() => "---").join(" | ")} |`;
   const bodyLines = sh.rows.map((r) => `| ${r.join(" | ")} |`);
   await navigator.clipboard.writeText([headerLine, sepLine, ...bodyLines].join("\n"));
-  ElMessage.success("当前工作表 Markdown 已复制到剪贴板");
+  ElMessage.success("当前报价单 Markdown 已复制到剪贴板");
 }
 
 async function copyPlainText() {
-  await navigator.clipboard.writeText(props.plainText || "");
+  await navigator.clipboard.writeText(activeQuotation.value?.plain_text || "");
   ElMessage.success("纯文本结果已复制到剪贴板");
 }
 </script>

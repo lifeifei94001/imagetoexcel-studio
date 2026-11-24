@@ -69,6 +69,8 @@ def _parse_typed_cell(raw_val: str, col_type: str) -> Tuple[Any, str]:
             return text, "@"
 
     if col_type == "currency":
+        if text.startswith("+"):
+            return text, "@"
         currency_symbol = "¥"
         for sym in ("¥", "$", "€", "£"):
             if sym in text:
@@ -83,6 +85,8 @@ def _parse_typed_cell(raw_val: str, col_type: str) -> Tuple[Any, str]:
             return text, "@"
 
     if col_type == "number":
+        if text.startswith("+"):
+            return text, "@"
         cleaned = text.replace(",", "").strip()
         # 前导零编号保持文本
         if re.match(r"^0\d+$", cleaned):
@@ -188,6 +192,37 @@ def build_csv_bytes(sheet: Dict[str, Any]) -> bytes:
     return ("\ufeff" + out.getvalue()).encode("utf-8")
 
 
+def _safe_filename_stem(raw_name: str, used_names: set) -> str:
+    cleaned = re.sub(r"[\\/:*?\"<>|\[\]]+", "_", (raw_name or "报价单").strip()).strip("_.") or "报价单"
+    base = cleaned[:48]
+    candidate = base
+    idx = 2
+    while candidate.lower() in used_names:
+        suffix = f"_{idx}"
+        candidate = f"{base[: 56 - len(suffix)]}{suffix}"
+        idx += 1
+    used_names.add(candidate.lower())
+    return candidate
+
+
+def build_single_xlsx_bytes(sheet: Dict[str, Any]) -> bytes:
+    """将单份报价单写为独立 .xlsx 内存流。"""
+    return build_xlsx_bytes([sheet])
+
+
+def build_batch_zip_bytes(sheets: List[Dict[str, Any]]) -> bytes:
+    """将多份报价单分别生成独立 .xlsx，平铺打包为单个 .zip 压缩包。"""
+    zip_buf = io.BytesIO()
+    used_files: set = set()
+    with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for idx, sh in enumerate(sheets):
+            raw_title = str(sh.get("export_filename") or sh.get("name") or f"报价单_{idx + 1}")
+            fname = _safe_filename_stem(raw_title, used_files)
+            zf.writestr(f"{fname}.xlsx", build_xlsx_bytes([sh]))
+    zip_buf.seek(0)
+    return zip_buf.getvalue()
+
+
 def export_tables_package(
     sheets: List[Dict[str, Any]],
     output_mode: str = "all_in_one",
@@ -201,7 +236,7 @@ def export_tables_package(
     - format='xlsx' + output_mode='per_image'：单表直接 .xlsx，多表自动打包 .zip（每表独立工作簿）
     返回：(bytes_data, download_filename, media_type)
     """
-    safe_base = re.sub(r"[^\w\u4e00-\u9fff\-]+", "_", (base_filename or "image-to-excel")).strip("_") or "image-to-excel"
+    safe_base = re.sub(r"[\\/:*?\"<>|\[\]]+", "_", (base_filename or "报价单").strip()).strip("_.") or "报价单"
     if not sheets:
         sheets = [{"name": "Sheet1", "headers": ["内容"], "col_types": ["text"], "rows": [[""]]}]
 
@@ -216,20 +251,14 @@ def export_tables_package(
         used_files: set = set()
         with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for idx, sh in enumerate(sheets):
-                fname = _safe_sheet_title(str(sh.get("name") or f"table_{idx + 1}"), used_files)
+                raw_title = str(sh.get("export_filename") or sh.get("name") or f"table_{idx + 1}")
+                fname = _safe_filename_stem(raw_title, used_files)
                 zf.writestr(f"{fname}.csv", build_csv_bytes(sh))
         zip_buf.seek(0)
-        return (zip_buf.getvalue(), f"{safe_base}_csv_bundle.zip", "application/zip")
+        return (zip_buf.getvalue(), f"{safe_base}_csv打包.zip", "application/zip")
 
     if output_mode == "per_image" and len(sheets) > 1:
-        zip_buf = io.BytesIO()
-        used_files = set()
-        with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for idx, sh in enumerate(sheets):
-                fname = _safe_sheet_title(str(sh.get("name") or f"table_{idx + 1}"), used_files)
-                zf.writestr(f"{fname}.xlsx", build_xlsx_bytes([sh]))
-        zip_buf.seek(0)
-        return (zip_buf.getvalue(), f"{safe_base}_excel_bundle.zip", "application/zip")
+        return (build_batch_zip_bytes(sheets), f"{safe_base}_报价单批量打包.zip", "application/zip")
 
     return (
         build_xlsx_bytes(sheets),

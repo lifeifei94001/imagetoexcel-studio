@@ -1,12 +1,13 @@
 /**
- * 上传前智能缩放压缩（R3 避坑：规避 Vercel Serverless 4.5MB 请求体上限，同时保证表格文字锐利可读）
+ * 长图保真上传预处理：
+ * - 单图请求独享 Vercel 4.5MB 载荷上限，<= 3.6MB 原图 100% 原像素直传不压缩；
+ * - 超过 3.6MB 的超长报价截图采用「保宽不截长」(maxWidth=1800, maxHeight=7200)，避免压糊价格数字。
  */
-export async function prepareImageForUpload(file: File, maxBytes = 3.2 * 1024 * 1024): Promise<File> {
+export async function prepareImageForUpload(file: File, maxBytes = 3.6 * 1024 * 1024): Promise<File> {
   if (file.size <= maxBytes) {
     return file;
   }
   const lower = file.name.toLowerCase();
-  // HEIC 等浏览器原生 canvas 不一定能解码的格式直接原样透传（后端会校验 <=10MB）
   if (lower.endsWith(".heic") || lower.endsWith(".heif")) {
     return file;
   }
@@ -16,13 +17,12 @@ export async function prepareImageForUpload(file: File, maxBytes = 3.2 * 1024 * 
     const url = URL.createObjectURL(file);
     img.onload = () => {
       URL.revokeObjectURL(url);
-      const maxDim = 2400;
+      const maxWidth = 1800;
+      const maxHeight = 7200;
       let { width, height } = img;
-      if (width > maxDim || height > maxDim) {
-        const ratio = Math.min(maxDim / width, maxDim / height);
-        width = Math.round(width * ratio);
-        height = Math.round(height * ratio);
-      }
+      const ratio = Math.min(1, maxWidth / width, maxHeight / height);
+      width = Math.round(width * ratio);
+      height = Math.round(height * ratio);
 
       const canvas = document.createElement("canvas");
       canvas.width = width;
@@ -36,18 +36,29 @@ export async function prepareImageForUpload(file: File, maxBytes = 3.2 * 1024 * 
       ctx.fillRect(0, 0, width, height);
       ctx.drawImage(img, 0, 0, width, height);
 
-      canvas.toBlob(
-        (blob) => {
-          if (!blob || blob.size >= file.size) {
-            resolve(file);
-            return;
-          }
-          const outName = file.name.replace(/\.[^.]+$/, "") + ".jpg";
-          resolve(new File([blob], outName, { type: "image/jpeg" }));
-        },
-        "image/jpeg",
-        0.9
-      );
+      const tryEncode = (quality: number) => {
+        canvas.toBlob(
+          (blob) => {
+            if (!blob) {
+              resolve(file);
+              return;
+            }
+            if (blob.size > maxBytes && quality > 0.8) {
+              tryEncode(0.8);
+              return;
+            }
+            if (blob.size >= file.size) {
+              resolve(file);
+              return;
+            }
+            const outName = file.name.replace(/\.[^.]+$/, "") + ".jpg";
+            resolve(new File([blob], outName, { type: "image/jpeg" }));
+          },
+          "image/jpeg",
+          quality
+        );
+      };
+      tryEncode(0.92);
     };
     img.onerror = () => {
       URL.revokeObjectURL(url);

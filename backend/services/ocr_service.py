@@ -17,7 +17,11 @@ TABLE_EXTRACTION_SCHEMA: Dict[str, Any] = {
     "properties": {
         "title": {
             "type": "string",
-            "description": "Short descriptive title of the extracted document or table.",
+            "description": "Concise quotation or document header title visible in the image (e.g. '新军强 靓机 11.24').",
+        },
+        "document_notes": {
+            "type": "string",
+            "description": "Top/edge rules, validity notices, or vendor terms outside the table rows (empty string if none).",
         },
         "plain_text": {
             "type": "string",
@@ -267,8 +271,102 @@ def normalize_table_grid(payload: Dict[str, Any], fallback_name: str = "Sheet1")
 
     return {
         "title": str(payload.get("title") or fallback_name).strip(),
+        "document_notes": str(payload.get("document_notes") or "").strip(),
         "sheets": normalized_sheets,
         "plain_text": plain_text,
+    }
+
+
+def _pick_quote_title(raw_title: str, fallback_stem: str) -> str:
+    t = (raw_title or "").strip()
+    generic = {"table", "sheet", "sheet1", "extracted", "extracted table", "quotation", "未命名"}
+    if not t or t.lower() in generic:
+        return (fallback_stem or "报价单")[:28]
+    return t[:28]
+
+
+def merge_sheets_into_single_quotation(
+    sheets: List[Dict[str, Any]],
+    quote_title: str,
+    fallback_stem: str = "报价单",
+) -> Dict[str, Any]:
+    """
+    Q1 规格落地：将同一张报价单图片内的多个区块子表合并为单一 Sheet：
+    - 1 个子表时直接保留原列结构；
+    - 多个子表时首列增设「分类/区块」，统一对齐主表头（不同列按并集补齐空列，零丢行），并重映射 warnings 坐标。
+    """
+    final_name = _pick_quote_title(quote_title, fallback_stem)
+    if not sheets:
+        return {
+            "name": final_name,
+            "headers": ["内容"],
+            "col_types": ["text"],
+            "rows": [[""]],
+            "merges": [],
+            "warnings": [],
+        }
+
+    if len(sheets) == 1:
+        single = json.loads(json.dumps(sheets[0]))
+        single["name"] = final_name
+        return single
+
+    # 多区块：构建统一主表头并集（首列为 分类/区块）
+    unified_headers: List[str] = ["分类/区块"]
+    unified_types: List[str] = ["text"]
+    header_to_col: Dict[str, int] = {}
+
+    for sh in sheets:
+        sh_headers = sh.get("headers") or []
+        sh_types = sh.get("col_types") or []
+        for idx, h in enumerate(sh_headers):
+            h_clean = str(h or f"列{idx + 1}").strip() or f"列{idx + 1}"
+            if h_clean not in header_to_col:
+                header_to_col[h_clean] = len(unified_headers)
+                unified_headers.append(h_clean)
+                t = sh_types[idx] if idx < len(sh_types) else "text"
+                unified_types.append(t if t in VALID_COL_TYPES else "text")
+
+    total_cols = len(unified_headers)
+    merged_rows: List[List[str]] = []
+    merged_warnings: List[Dict[str, Any]] = []
+
+    for s_idx, sh in enumerate(sheets):
+        section_name = str(sh.get("name") or f"区块{s_idx + 1}").strip()
+        sh_headers = [str(h or f"列{i + 1}").strip() or f"列{i + 1}" for i, h in enumerate(sh.get("headers") or [])]
+        local_to_global = [header_to_col[h] for h in sh_headers]
+
+        base_row_offset = len(merged_rows)
+        for row in (sh.get("rows") or []):
+            new_row = [""] * total_cols
+            new_row[0] = section_name
+            for local_c, val in enumerate(row):
+                if local_c < len(local_to_global):
+                    new_row[local_to_global[local_c]] = str(val if val is not None else "")
+            merged_rows.append(new_row)
+
+        for w in (sh.get("warnings") or []):
+            try:
+                lr = int(w["row"])
+                lc = int(w["col"])
+                if 0 <= lc < len(local_to_global):
+                    merged_warnings.append(
+                        {
+                            "row": base_row_offset + lr,
+                            "col": local_to_global[lc],
+                            "reason": str(w.get("reason") or "模型提示需人工核对"),
+                        }
+                    )
+            except Exception:
+                continue
+
+    return {
+        "name": final_name,
+        "headers": unified_headers,
+        "col_types": unified_types,
+        "rows": merged_rows,
+        "merges": [],
+        "warnings": merged_warnings,
     }
 
 
@@ -323,11 +421,17 @@ def _build_demo_result(filename: str, mode: str) -> Dict[str, Any]:
             ],
         }
     normalized = normalize_table_grid(raw, fallback_name=Path(filename or "sample").stem)
+    raw_sheets = normalized["sheets"]
+    quote_title = _pick_quote_title(normalized["title"], Path(filename or "sample").stem)
+    merged_sheet = merge_sheets_into_single_quotation(raw_sheets, quote_title, Path(filename or "sample").stem)
+    normalized["quote_title"] = quote_title
+    normalized["document_notes"] = normalized.get("document_notes") or "演示规则备注：当前展示结构化示例报价单，可修改任意单元格后导出 .xlsx。"
+    normalized["raw_sheets"] = raw_sheets
+    normalized["merged_sheet"] = merged_sheet
+    normalized["sheets"] = [merged_sheet] if mode != "text" else raw_sheets[:1]
     normalized["engine"] = "demo"
     normalized["is_demo"] = True
     normalized["notice"] = "当前为演示提取模式（未配置 GEMINI_API_KEY）。你仍可完整体验在线校对编辑与真实 .xlsx / .csv 导出。"
-    if mode == "text":
-        normalized["sheets"] = normalized["sheets"][:1]
     return normalized
 
 
@@ -360,20 +464,26 @@ def extract_tables_from_image(
     mode: str = "excel",
     force_demo: bool = False,
     custom_hint: str = "",
+    merge_per_image: bool = True,
 ) -> Dict[str, Any]:
     """
     核心图像表格提取函数：
-    - 配置了 GEMINI_API_KEY 且未开启 force_demo 时，调用 Gemini 4 Hydrogen Interactions API + Structured Outputs；
-    - 否则自动平稳降级至本地结构化演示模式，确保零 Key 开箱可用。
+    - 配置了 GEMINI_API_KEY 且未开启 force_demo 时，调用 Gemini Interactions API + Structured Outputs；
+    - 针对长报价单设足 40s 主请求超时（503/429 瞬切备用模型），并将单图多子表按 Q1 规范合并为单一 Sheet；
+    - 未配置 Key 时自动平稳降级至本地结构化演示模式。
     """
     api_key = _get_gemini_api_key()
     if force_demo or not api_key:
-        return _build_demo_result(filename, mode)
+        demo_res = _build_demo_result(filename, mode)
+        if not merge_per_image:
+            demo_res["sheets"] = demo_res["raw_sheets"]
+        return demo_res
 
     mime_type = normalize_mime_type(filename, content_type)
     b64_data = base64.b64encode(image_bytes).decode("ascii")
     primary_model = get_active_model()
-    fallback_models = ["gemini-3.5-flash-lite", "gemini-4-argon", "gemini-3.1-flash-lite"]
+    # Free-Tier 友好容灾排序：主模型 -> 3.5-flash-lite -> 3.1-flash-lite -> 4-argon
+    fallback_models = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-4-argon"]
     candidate_models: List[str] = []
     for m in [primary_model] + fallback_models:
         if m and m not in candidate_models:
@@ -381,9 +491,11 @@ def extract_tables_from_image(
     candidate_models = candidate_models[:3]
 
     instruction = (
-        "You are an expert document and table OCR extraction engine. "
-        "Extract every table visible in the image accurately into structured JSON. "
-        "Preserve exact text, numbers, currency symbols, percentage signs, and leading zeros (e.g. '001042'). "
+        "You are an expert document and quotation-sheet OCR extraction engine. "
+        "Extract every table/block visible in the image accurately into structured JSON. "
+        "Set `title` to the main quotation header visible in the image (e.g. vendor name + date like '新军强 靓机 11.24'). "
+        "Put top/edge vendor rules, validity notices, or disclaimers outside data rows into `document_notes` (do NOT mix them into table rows). "
+        "Preserve exact text, model names, capacities, numbers, currency symbols, range strings (e.g. '3200-3300'), '+50', and leading zeros (e.g. '001042'). "
         "Every row in `rows` MUST have the exact same number of elements as `headers` (use empty string '' for blank cells). "
         "Set `col_types` accurately for each column (`text`, `number`, `currency`, `percent`, `date`). "
         "If any cell is blurry, occluded, or uncertain, still provide your best reading and record it in `warnings`. "
@@ -422,7 +534,7 @@ def extract_tables_from_image(
                 GEMINI_INTERACTIONS_URL,
                 json=payload,
                 headers=headers,
-                timeout=24 if attempt_idx == 0 else 20,
+                timeout=40 if attempt_idx == 0 else 18,
             )
         except requests.RequestException as exc:
             last_error = f"连接 Gemini 视觉识别服务超时或网络异常：{type(exc).__name__}"
@@ -454,11 +566,19 @@ def extract_tables_from_image(
     try:
         parsed = json.loads(text_out)
     except json.JSONDecodeError:
-        # 兼容极少数带 markdown fence 的响应
         cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text_out, flags=re.IGNORECASE | re.DOTALL).strip()
         parsed = json.loads(cleaned)
 
-    normalized = normalize_table_grid(parsed, fallback_name=Path(filename or "extracted").stem)
+    stem = Path(filename or "extracted").stem
+    normalized = normalize_table_grid(parsed, fallback_name=stem)
+    raw_sheets = normalized["sheets"]
+    quote_title = _pick_quote_title(normalized["title"], stem)
+    merged_sheet = merge_sheets_into_single_quotation(raw_sheets, quote_title, stem)
+
+    normalized["quote_title"] = quote_title
+    normalized["raw_sheets"] = raw_sheets
+    normalized["merged_sheet"] = merged_sheet
+    normalized["sheets"] = [merged_sheet] if merge_per_image else raw_sheets
     normalized["engine"] = used_model
     normalized["is_demo"] = False
     if used_model != primary_model:
