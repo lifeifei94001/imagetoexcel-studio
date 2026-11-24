@@ -3,6 +3,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple
@@ -254,25 +255,40 @@ class TursoHttpConnection:
         headers = {"Content-Type": "application/json"}
         if self.auth_token:
             headers["Authorization"] = f"Bearer {self.auth_token}"
-        resp = self.http_session.post(self.pipeline_url, json=payload, headers=headers, timeout=45)
-        if resp.status_code != 200:
-            err_body = resp.text[:300]
-            if "JWT" in err_body or resp.status_code in (400, 401, 403):
-                token_state = ("已填写且形如 JWT" if self.auth_token.startswith("eyJ") else "已填写但非 eyJ 开头") if self.auth_token else "为空"
-                raise sqlite3.OperationalError(
-                    f"Turso 认证令牌 (TURSO_AUTH_TOKEN) 校验未通过 (当前状态: {token_state}，长度 {len(self.auth_token)})。"
-                    f"请确认填入的是以 eyJ 开头的 Token（而非 libsql:// 数据库地址），修改后需点击 Redeploy！"
-                )
-            raise sqlite3.OperationalError(f"Turso 响应异常 (HTTP {resp.status_code}): {err_body}")
-        data = resp.json()
-        out: List[Dict[str, Any]] = []
-        for item in data.get("results", []):
-            if item.get("type") == "error":
-                raise sqlite3.DatabaseError(f"Turso SQL 错误: {(item.get('error') or {}).get('message')}")
-            resp_obj = item.get("response") or {}
-            if resp_obj.get("type") == "execute":
-                out.append(resp_obj.get("result") or {})
-        return out
+
+        for attempt in range(3):
+            resp = self.http_session.post(self.pipeline_url, json=payload, headers=headers, timeout=45)
+            if resp.status_code in (429, 502, 503, 504) and attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            if resp.status_code != 200:
+                err_body = resp.text[:300]
+                if "JWT" in err_body or resp.status_code in (400, 401, 403):
+                    token_state = ("已填写且形如 JWT" if self.auth_token.startswith("eyJ") else "已填写但非 eyJ 开头") if self.auth_token else "为空"
+                    raise sqlite3.OperationalError(
+                        f"Turso 认证令牌 (TURSO_AUTH_TOKEN) 校验未通过 (当前状态: {token_state}，长度 {len(self.auth_token)})。"
+                        f"请确认填入的是以 eyJ 开头的 Token（而非 libsql:// 数据库地址），修改后需点击 Redeploy！"
+                    )
+                raise sqlite3.OperationalError(f"Turso 响应异常 (HTTP {resp.status_code}): {err_body}")
+
+            data = resp.json()
+            out: List[Dict[str, Any]] = []
+            transient_err = ""
+            for item in data.get("results", []):
+                if item.get("type") == "error":
+                    msg = str((item.get("error") or {}).get("message") or "")
+                    if "temporarily exceeded" in msg.lower() and attempt < 2:
+                        transient_err = msg
+                        break
+                    raise sqlite3.DatabaseError(f"Turso SQL 错误: {msg}")
+                resp_obj = item.get("response") or {}
+                if resp_obj.get("type") == "execute":
+                    out.append(resp_obj.get("result") or {})
+            if transient_err:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            return out
+        raise sqlite3.DatabaseError("Turso 服务短暂扩容限流，请稍后重试")
 
     def flush_writes(self) -> None:
         if not self._pending_writes:
