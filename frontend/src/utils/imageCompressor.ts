@@ -1,12 +1,12 @@
 /**
- * 超长报价单智能找缝切图 + 顶部列头视觉锚定：
- * 1. 常规尺寸图片（height <= 1500 或高宽比 < 1.35）保宽原像素直传；
- * 2. 超长报价单（最高支持 10:1+，动态切分 2~14 段，每段约 1000px 保持高清）：
- *    - 在 Canvas 上扫描目标切点附近的像素行，优先寻找「贯穿左侧型号列与表体的完整深色水平边框线」下刀，
- *      彻底避免从跨多行合并的机型单元格（如 13 PRO 的 4 行）中间拦腰切断；
- *    - 若表格无明显横线边框，自动回退到带安全重叠区的切片策略；
- * 3. 自动截取原图表格主列头行，贴附到第 2..N 段切片顶部（红线分隔提示模型仅作列对齐参照），
- *    杜绝中后段列错位或漏掉最右侧扣费/备注列。
+ * 超长报价单 1:1 原像素智能找缝切图 + 精确单行表头视觉锚定：
+ * 1. 常规尺寸图片（height <= 1400 或高宽比 < 1.35）保宽原像素直传；
+ * 2. 超长报价单（最高支持 19:1+ 如 874×16675 的 OPPO/红米/华为报价单）：
+ *    - 顶部 1400px 内 1:1 精扫：精确定位「第一个白底数据行 firstDataY」及紧贴其上方的单行绿色列头 [hdrTop..hdrBottom]（通常 38~55px）；
+ *    - 第 1 段切片确保涵盖「标题 + 列头 + 首批 ~850px 机型数据」，避免顶部 750px 的成色说明公告独占第 1 段；
+ *    - 后续切片按 100% 原像素直切（单段理想高度 ~850px，动态最多 30 段），优先在「贯穿左侧型号列与表体的完整深色横线」处下刀，
+ *      彻底杜绝从合并机型单元格中间拦腰切断；
+ *    - 第 2..N 段切片顶部自动贴附精确截取的单行原图列头 + 6px 红线分隔条，杜绝列漂移与漏右侧列。
  */
 
 export interface SmartSlicePlan {
@@ -87,10 +87,117 @@ interface RowScanMetrics {
   bodyVariance: Float32Array;
 }
 
-/** 对整张长图做低成本灰度行扫描，用于检测跨左侧型号列的完整水平分隔线与表头位置。 */
+interface HeaderBandInfo {
+  topY: number;
+  bottomY: number;
+  firstDataY: number;
+}
+
+/** 1:1 扫描图片顶部 1400px，像素级锁定第一个白底数据行与紧贴其上方的单行表格列头 [topY..bottomY]。 */
+function detectExactHeaderBand(
+  img: HTMLImageElement,
+  scale: number,
+  targetW: number,
+  targetH: number
+): HeaderBandInfo | null {
+  const maxY = Math.min(targetH - 4, 1400);
+  if (maxY < 80) return null;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = targetW;
+  canvas.height = maxY;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return null;
+
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, targetW, maxY);
+  ctx.drawImage(img, 0, 0, img.width, maxY / scale, 0, 0, targetW, maxY);
+
+  let data: Uint8ClampedArray;
+  try {
+    data = ctx.getImageData(0, 0, targetW, maxY).data;
+  } catch {
+    return null;
+  }
+
+  const leftStart = Math.floor(targetW * 0.02);
+  const leftEnd = Math.max(leftStart + 4, Math.floor(targetW * 0.16));
+  const bodyStart = leftEnd;
+  const bodyEnd = Math.max(bodyStart + 8, Math.floor(targetW * 0.82));
+  const leftCount = leftEnd - leftStart;
+  const bodyCount = bodyEnd - bodyStart;
+
+  const lDark = new Float32Array(maxY);
+  const bDark = new Float32Array(maxY);
+  const bWhite = new Float32Array(maxY);
+
+  for (let y = 0; y < maxY; y++) {
+    const rowBase = y * targetW * 4;
+    let ld = 0;
+    for (let x = leftStart; x < leftEnd; x++) {
+      const idx = rowBase + x * 4;
+      if (0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2] < 155) ld++;
+    }
+    lDark[y] = ld / leftCount;
+
+    let bd = 0;
+    let bw = 0;
+    for (let x = bodyStart; x < bodyEnd; x++) {
+      const idx = rowBase + x * 4;
+      const lum = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
+      if (lum < 155) bd++;
+      if (lum > 238) bw++;
+    }
+    bDark[y] = bd / bodyCount;
+    bWhite[y] = bw / bodyCount;
+  }
+
+  // 找到第一个连续 18px 出现白底价格数据区的起始位置（绕开顶部纯绿/黄公告与成色说明）
+  let consec = 0;
+  let firstDataY = -1;
+  for (let y = 36; y < maxY; y++) {
+    if (bWhite[y] >= 0.5 && lDark[y] < 0.45) {
+      consec++;
+      if (consec >= 18) {
+        firstDataY = y - consec + 1;
+        break;
+      }
+    } else {
+      consec = 0;
+    }
+  }
+
+  if (firstDataY <= 24) return null;
+
+  // 在 firstDataY 上方 24px 内找表头底边框线
+  let hdrBottom = firstDataY;
+  for (let y = firstDataY; y >= Math.max(0, firstDataY - 24); y--) {
+    if (lDark[y] >= 0.45 && bDark[y] >= 0.45) {
+      hdrBottom = y;
+      break;
+    }
+  }
+
+  // 从表头底线再往上 24~115px 找表头顶边框线（精准截取单行绿色列头，如 38~52px）
+  let hdrTop = Math.max(0, hdrBottom - 64);
+  for (let y = hdrBottom - 24; y >= Math.max(0, hdrBottom - 115); y--) {
+    if (lDark[y] >= 0.45 && bDark[y] >= 0.45) {
+      hdrTop = y;
+      break;
+    }
+  }
+
+  const stripH = hdrBottom - hdrTop;
+  if (stripH < 20 || stripH > 130) return null;
+  return { topY: hdrTop, bottomY: hdrBottom + 1, firstDataY };
+}
+
+/** 对整张超长图做轻量缩略灰度行扫描（最大高度 <= 8000px，永不触碰浏览器 Canvas 尺寸上限）。 */
 function scanImageRows(img: HTMLImageElement, targetW: number, targetH: number): RowScanMetrics | null {
-  const scanW = Math.min(480, Math.max(160, Math.round(targetW / 3)));
-  const scanScale = scanW / targetW;
+  const widthScanScale = Math.min(1, 360 / Math.max(1, targetW));
+  const heightScanScale = Math.min(1, 8000 / Math.max(1, targetH));
+  const scanScale = Math.min(widthScanScale, heightScanScale);
+  const scanW = Math.max(120, Math.round(targetW * scanScale));
   const scanH = Math.max(1, Math.round(targetH * scanScale));
 
   const canvas = document.createElement("canvas");
@@ -153,42 +260,6 @@ function scanImageRows(img: HTMLImageElement, targetW: number, targetH: number):
   return { leftDarkRatio, bodyDarkRatio, bodyWhiteRatio, bodyVariance };
 }
 
-/** 侦测表格顶部列头条的纵坐标范围 [topY, bottomY]（目标分辨率坐标系）。 */
-function detectHeaderStripRange(
-  metrics: RowScanMetrics | null,
-  targetH: number
-): { topY: number; bottomY: number } | null {
-  if (!metrics) return null;
-  const scanH = metrics.bodyWhiteRatio.length;
-  const scaleBack = targetH / scanH;
-  const maxScanY = Math.min(scanH - 10, Math.round((Math.min(1400, targetH * 0.26)) / scaleBack));
-
-  // 找到第一个连续多行出现白底数据区的起始位置（即顶部表头正下方）
-  let firstDataScanY = -1;
-  let consecutiveWhite = 0;
-  for (let y = Math.round(scanH * 0.015); y < maxScanY; y++) {
-    if (metrics.bodyWhiteRatio[y] >= 0.45 && metrics.leftDarkRatio[y] < 0.5) {
-      consecutiveWhite++;
-      if (consecutiveWhite >= Math.max(4, Math.round(14 / scaleBack))) {
-        firstDataScanY = y - consecutiveWhite + 1;
-        break;
-      }
-    } else {
-      consecutiveWhite = 0;
-    }
-  }
-
-  if (firstDataScanY <= 0) return null;
-  const bottomY = Math.round(firstDataScanY * scaleBack);
-  // 向上截取 95~135px 覆盖完整列头行（如 型号/网络型号/容量/靓机/小花/大花/外爆/内爆可测/扣费说明）
-  const stripH = Math.min(130, Math.max(84, Math.round(bottomY * 0.42)));
-  const topY = Math.max(0, bottomY - stripH);
-  if (bottomY - topY < 48 || bottomY > targetH * 0.28) {
-    return null;
-  }
-  return { topY, bottomY };
-}
-
 /** 在理想切点附近寻找贯穿左侧型号列与表体的完整横线（机型区块分界线）。 */
 function findBestModelBoundaryCut(
   metrics: RowScanMetrics | null,
@@ -210,11 +281,9 @@ function findBestModelBoundaryCut(
   let bestScanY = -1;
 
   for (let y = lo; y <= hi; y++) {
-    // 兼顾 1~2px 缩放抗锯齿，取邻近 3 行最高横线强度
     const lDark = Math.max(metrics.leftDarkRatio[y - 1], metrics.leftDarkRatio[y], metrics.leftDarkRatio[y + 1]);
     const bDark = Math.max(metrics.bodyDarkRatio[y - 1], metrics.bodyDarkRatio[y], metrics.bodyDarkRatio[y + 1]);
 
-    // 必须同时贯穿左侧型号列与表体，才是真正位于两个机型大块之间的水平分割线！
     if (lDark >= 0.48 && bDark >= 0.48) {
       const distPenalty = Math.abs(y - idealScan) / Math.max(1, hi - lo);
       const score = lDark * 1.15 + bDark - distPenalty * 0.45;
@@ -229,7 +298,6 @@ function findBestModelBoundaryCut(
     return { cutY: Math.round(bestScanY * scaleBack), isCleanSeam: true };
   }
 
-  // 次优兜底：寻找近乎纯色无文字的水平空白缝（适用于无边框表格）
   let bestGapScore = -1;
   let bestGapY = -1;
   for (let y = lo; y <= hi; y++) {
@@ -264,7 +332,7 @@ export async function splitLongImageSmart(file: File): Promise<SmartSlicePlan> {
       const origH = img.height;
 
       // 常规尺寸图片无需切片
-      if (origH <= 1500 || origH / Math.max(1, origW) < 1.35) {
+      if (origH <= 1400 || origH / Math.max(1, origW) < 1.35) {
         resolve({
           files: [await prepareImageForUpload(file)],
           seamMode: "single",
@@ -273,53 +341,54 @@ export async function splitLongImageSmart(file: File): Promise<SmartSlicePlan> {
         return;
       }
 
-      // 限制单边尺寸防 Canvas 超限黑屏（10:1 超长图同样保宽清晰）
-      const maxCanvasH = 14500;
-      const widthScale = Math.min(1, 1800 / origW);
-      const heightScale = Math.min(1, maxCanvasH / origH);
-      const scale = Math.min(widthScale, heightScale);
+      // 1:1 原像素直切：仅在宽度超过 1800px 时按宽限幅，绝不因超长（如 16675px）而纵向压糊！
+      const scale = Math.min(1, 1800 / origW);
       const targetW = Math.max(1, Math.round(origW * scale));
       const targetH = Math.max(1, Math.round(origH * scale));
 
+      const headerBand = detectExactHeaderBand(img, scale, targetW, targetH);
       const metrics = scanImageRows(img, targetW, targetH);
-      const headerRange = detectHeaderStripRange(metrics, targetH);
 
-      const maxSlices = 14;
-      const desiredSliceH = Math.max(960, Math.ceil(targetH / maxSlices));
-      const fallbackOverlap = 180;
+      const maxSlices = 30;
+      const dataStartY = headerBand ? headerBand.firstDataY : 0;
+      const dataTotalH = Math.max(1, targetH - dataStartY);
+      const desiredSliceH = Math.max(850, Math.ceil(dataTotalH / maxSlices));
+      const fallbackOverlap = 160;
 
-      // 逐段智能寻缝计算每段 [startY, endY]
       const ranges: Array<{ startY: number; endY: number }> = [];
       let curY = 0;
       let cleanSeamHits = 0;
 
       while (curY < targetH && ranges.length < maxSlices) {
-        const remaining = targetH - curY;
+        const isFirst = ranges.length === 0;
+        // 第 1 段确保覆盖顶部标题/公告 + 首批 desiredSliceH 真实机型数据，杜绝第 1 段只含成色说明！
+        const effectiveStart = isFirst ? dataStartY : curY;
+        const remainingData = targetH - effectiveStart;
         const isLastAllowed = ranges.length === maxSlices - 1;
-        if (isLastAllowed || remaining <= desiredSliceH * 1.3) {
+
+        if (isLastAllowed || remainingData <= desiredSliceH * 1.28) {
           ranges.push({ startY: curY, endY: targetH });
           break;
         }
 
-        const idealY = curY + desiredSliceH;
-        const minSearchY = Math.max(curY + 520, idealY - 320);
-        const maxSearchY = Math.min(targetH - 260, idealY + 280);
+        const idealY = effectiveStart + desiredSliceH;
+        const minSearchY = Math.max(effectiveStart + 420, idealY - 280);
+        const maxSearchY = Math.min(targetH - 220, idealY + 260);
         const { cutY, isCleanSeam } = findBestModelBoundaryCut(metrics, targetH, idealY, minSearchY, maxSearchY);
 
         if (isCleanSeam) {
           cleanSeamHits++;
-          // 在机型边框线上精准下刀，仅留 4px 线条防截字，彻底不让上一个机型的末尾行漏入下一段
-          ranges.push({ startY: curY, endY: Math.min(targetH, cutY + 4) });
-          curY = Math.max(curY + 320, cutY - 4);
+          ranges.push({ startY: curY, endY: Math.min(targetH, cutY + 3) });
+          curY = Math.max(effectiveStart + 280, cutY - 3);
         } else {
           ranges.push({ startY: curY, endY: Math.min(targetH, cutY) });
-          curY = Math.max(curY + 320, cutY - fallbackOverlap);
+          curY = Math.max(effectiveStart + 280, cutY - fallbackOverlap);
         }
       }
 
       const slices: File[] = [];
       const stem = file.name.replace(/\.[^.]+$/, "");
-      const hasHeaderAnchor = Boolean(headerRange && ranges.length > 1);
+      const hasHeaderAnchor = Boolean(headerBand && ranges.length > 1);
       const sepBarH = 6;
 
       for (let i = 0; i < ranges.length; i++) {
@@ -327,8 +396,8 @@ export async function splitLongImageSmart(file: File): Promise<SmartSlicePlan> {
         const bodyH = Math.max(1, endY - startY);
         if (bodyH <= 80 && i > 0) continue;
 
-        const attachHeader = i > 0 && hasHeaderAnchor && headerRange !== null;
-        const headerH = attachHeader && headerRange ? headerRange.bottomY - headerRange.topY : 0;
+        const attachHeader = i > 0 && hasHeaderAnchor && headerBand !== null;
+        const headerH = attachHeader && headerBand ? headerBand.bottomY - headerBand.topY : 0;
         const canvasH = bodyH + (attachHeader ? headerH + sepBarH : 0);
 
         const canvas = document.createElement("canvas");
@@ -341,11 +410,10 @@ export async function splitLongImageSmart(file: File): Promise<SmartSlicePlan> {
         ctx.fillRect(0, 0, targetW, canvasH);
 
         let bodyDrawY = 0;
-        if (attachHeader && headerRange) {
-          const hSrcY = headerRange.topY / scale;
+        if (attachHeader && headerBand) {
+          const hSrcY = headerBand.topY / scale;
           const hSrcH = headerH / scale;
           ctx.drawImage(img, 0, hSrcY, origW, hSrcH, 0, 0, targetW, headerH);
-          // 绘制醒目红色横向分割线，明确区分顶部列头参照条与下方本段真实数据区
           ctx.fillStyle = "#e11d48";
           ctx.fillRect(0, headerH, targetW, sepBarH);
           bodyDrawY = headerH + sepBarH;
@@ -355,7 +423,7 @@ export async function splitLongImageSmart(file: File): Promise<SmartSlicePlan> {
         const srcH = bodyH / scale;
         ctx.drawImage(img, 0, srcY, origW, srcH, 0, bodyDrawY, targetW, bodyH);
 
-        const blob = await new Promise<Blob | null>((res) => canvas.toBlob(res, "image/jpeg", 0.92));
+        const blob = await new Promise<Blob | null>((res) => canvas.toBlob(res, "image/jpeg", 0.96));
         if (blob) {
           slices.push(new File([blob], `${stem}_part${i + 1}.jpg`, { type: "image/jpeg" }));
         }

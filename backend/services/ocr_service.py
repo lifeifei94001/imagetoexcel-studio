@@ -164,15 +164,15 @@ def normalize_table_grid(payload: Dict[str, Any], fallback_name: str = "Sheet1")
 
     normalized_sheets: List[Dict[str, Any]] = []
     for idx, sheet in enumerate(raw_sheets):
-        headers = [str(h if h is not None else "").strip() for h in (sheet.get("headers") or [])]
+        headers = [_sanitize_cell_text(h, is_header=True) for h in (sheet.get("headers") or [])]
         raw_rows = sheet.get("rows") or []
         str_rows: List[List[str]] = []
         max_cols = len(headers)
         for row in raw_rows:
             if isinstance(row, list):
-                cells = [str(c if c is not None else "").strip() for c in row]
+                cells = [str(c if c is not None else "") for c in row]
             else:
-                cells = [str(row if row is not None else "").strip()]
+                cells = [str(row if row is not None else "")]
             max_cols = max(max_cols, len(cells))
             str_rows.append(cells)
 
@@ -182,15 +182,40 @@ def normalize_table_grid(payload: Dict[str, Any], fallback_name: str = "Sheet1")
             headers.append(f"列{len(headers) + 1}")
         headers = [h or f"列{i + 1}" for i, h in enumerate(headers)]
 
-        for row in str_rows:
+        roles = _detect_column_roles(headers)
+        model_col = roles["model_col"]
+        cap_col = roles["cap_col"]
+        note_cols_set = set(roles["note_cols"])
+
+        # 按列语义清洗每个单元格（彻底消除 15 PRO\nMAX 字面量换行与全空行）
+        cleaned_str_rows: List[List[str]] = []
+        row_remap: Dict[int, int] = {}
+        for r_orig_i, row in enumerate(str_rows):
             while len(row) < max_cols:
                 row.append("")
+            clean_row = [
+                _sanitize_cell_text(
+                    cell,
+                    is_note=(c_i in note_cols_set),
+                    is_model=(c_i == model_col),
+                    is_cap=(c_i == cap_col),
+                )
+                for c_i, cell in enumerate(row[:max_cols])
+            ]
+            # 过滤全空行（如图 2 中第 30 行这类空白绿行）
+            if not any(clean_row):
+                continue
+            row_remap[r_orig_i] = len(cleaned_str_rows)
+            cleaned_str_rows.append(clean_row)
+        str_rows = cleaned_str_rows
 
         raw_types = [str(t).lower() for t in (sheet.get("col_types") or [])]
         col_types: List[str] = []
         for col_i in range(max_cols):
             t = raw_types[col_i] if col_i < len(raw_types) else ""
-            if t not in VALID_COL_TYPES:
+            if col_i == cap_col:
+                t = "text"
+            elif t not in VALID_COL_TYPES:
                 col_vals = [r[col_i] for r in str_rows]
                 t = _infer_col_type(col_vals)
             col_types.append(t)
@@ -200,9 +225,9 @@ def normalize_table_grid(payload: Dict[str, Any], fallback_name: str = "Sheet1")
         row_count = len(str_rows)
         for m in (sheet.get("merges") or []):
             try:
-                sr = int(m["start_row"])
+                sr = row_remap[int(m["start_row"])]
                 sc = int(m["start_col"])
-                er = int(m["end_row"])
+                er = row_remap[int(m["end_row"])]
                 ec = int(m["end_col"])
             except Exception:
                 continue
@@ -213,10 +238,10 @@ def normalize_table_grid(payload: Dict[str, Any], fallback_name: str = "Sheet1")
         warnings_map: Dict[tuple, str] = {}
         for w in (sheet.get("warnings") or []):
             try:
-                wr = int(w["row"])
+                orig_wr = int(w["row"])
                 wc = int(w["col"])
-                if 0 <= wr < row_count and 0 <= wc < max_cols:
-                    warnings_map[(wr, wc)] = str(w.get("reason") or "模型提示需人工核对")
+                if orig_wr in row_remap and 0 <= wc < max_cols:
+                    warnings_map[(row_remap[orig_wr], wc)] = str(w.get("reason") or "模型提示需人工核对")
             except Exception:
                 continue
 
@@ -272,7 +297,64 @@ def _norm_header(h: str) -> str:
     return re.sub(r"[\s\-_/（）()]+", "", str(h or "").strip()).lower()
 
 
-_CAP_VALUE_RE = re.compile(r"^(?:32|64|128|256|512|1024)(?:g|gb)?$|^(?:1|2)t(?:b)?$", re.IGNORECASE)
+_CAP_VALUE_RE = re.compile(
+    r"^(?:(?:4|6|8|12|16|18|20|24)(?:g|gb)?\+)?(?:(?:32|64|128|256|512|1024)(?:g|gb)?|(?:1|2)t(?:b)?)$",
+    re.IGNORECASE,
+)
+
+_MODEL_BRAND_FIXES = [
+    (re.compile(r"\biq00\b", re.IGNORECASE), "iQOO"),
+    (re.compile(r"\b1qoo\b", re.IGNORECASE), "iQOO"),
+    (re.compile(r"\biqoo\b", re.IGNORECASE), "iQOO"),
+    (re.compile(r"\br0g\b", re.IGNORECASE), "ROG"),
+    (re.compile(r"\b0pp0\b", re.IGNORECASE), "OPPO"),
+]
+
+
+def _sanitize_cell_text(
+    raw_val: Any,
+    is_note: bool = False,
+    is_model: bool = False,
+    is_cap: bool = False,
+    is_header: bool = False,
+) -> str:
+    """
+    统一清洗单元格文本：
+    - 彻底消除模型双转义产生的字面量 `\\n`（如 `15 PRO\\nMAX` -> `15 PRO MAX`）；
+    - 非备注列（型号/网络型号/容量/价格）折行规范为单空格，备注列保留真实换行；
+    - 常见品牌 OCR 形近纠偏（如 `IQ00` -> `iQOO`）与容量水印噪点清理（如 `256 C` -> `256`）。
+    """
+    s = str(raw_val if raw_val is not None else "")
+    if not s:
+        return ""
+    # 还原字面量 \r\n / \n / \t
+    s = s.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n").replace("\\t", " ")
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+
+    if is_note:
+        lines = [re.sub(r"[ \t]+", " ", line).strip() for line in s.split("\n")]
+        return "\n".join(line for line in lines if line)
+
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return ""
+
+    if is_header:
+        return s
+
+    if is_model:
+        for pat, repl in _MODEL_BRAND_FIXES:
+            s = pat.sub(repl, s)
+        return s
+
+    if is_cap:
+        # 剔除斜向水印混入容量的单字噪点（如 '256 C' -> '256'，不影响 '256G'/'1TB'/'12+256'）
+        m_noise = re.match(r"^((?:\d+\+)?(?:\d+(?:G|GB)?|[12]T(?:B)?))\s+[A-Za-z]$", s, re.IGNORECASE)
+        if m_noise:
+            s = m_noise.group(1)
+        return s
+
+    return s
 
 
 def _is_note_header(h: str) -> bool:
@@ -334,9 +416,23 @@ def _norm_cap_str(val: str) -> str:
 
 
 def _cap_to_gb(val: str) -> Optional[int]:
+    """
+    将苹果单容量（64/128/256/512/1T/2T）与安卓 RAM+ROM（12+256/12+512/16+256/16+1TB）
+    转为严格可比排序键，供全品牌容量回跳幽灵行检测使用。
+    """
     s = _norm_cap_str(val)
     if not s:
         return None
+    if "+" in s:
+        ram_s, _, rom_s = s.partition("+")
+        ram_m = re.match(r"^(\d+)g?$", ram_s)
+        if not ram_m:
+            return None
+        ram_num = int(ram_m.group(1))
+        rom_gb = _cap_to_gb(rom_s)
+        if rom_gb is None:
+            return None
+        return ram_num * 10000 + rom_gb
     m_t = re.match(r"^(\d+(?:\.\d+)?)t$", s)
     if m_t:
         return int(round(float(m_t.group(1)) * 1024))
@@ -475,6 +571,36 @@ def _map_subsheet_columns(
     return [int(c if c is not None else 0) for c in assigned]
 
 
+def _is_condition_legend_sheet(sheet: Dict[str, Any]) -> bool:
+    """
+    识别报价单顶部的「成色说明 / 等级说明」图例小表（如 成色 | 外屏 | 边框背板 | 内屏显示），
+    防止其混入正式报价数据表或抢占主表头。
+    """
+    headers = [str(h or "").strip() for h in (sheet.get("headers") or [])]
+    if not headers:
+        return False
+    joined_h = " ".join(headers)
+    name_s = str(sheet.get("name") or "")
+    roles = _detect_column_roles(headers)
+    if roles["model_col"] is not None or roles["cap_col"] is not None:
+        return False
+    legend_hits = sum(
+        1 for kw in ("成色说明", "等级说明", "成色等级", "外屏", "触摸外屏", "边框背板", "内屏显示")
+        if kw in joined_h or kw in name_s
+    )
+    if legend_hits >= 2:
+        return True
+    rows = sheet.get("rows") or []
+    if len(rows) <= 8:
+        has_any_price = any(
+            re.match(r"^\d{3,5}$", re.sub(r"[¥$€£,\s]", "", str(c or "")))
+            for r in rows for c in r
+        )
+        if not has_any_price and legend_hits >= 1:
+            return True
+    return False
+
+
 def merge_sheets_into_single_quotation(
     sheets: List[Dict[str, Any]],
     quote_title: str,
@@ -483,6 +609,7 @@ def merge_sheets_into_single_quotation(
     """
     忠实原图合表：
     - 彻底去掉人工「分类/区块」列，A 列直接为原图第 1 列（如 型号）；
+    - 自动过滤顶部「成色说明 / 等级说明」非价格图例表；
     - 当后续区块表头文字与上一区块不同时，在数据流中保留该区块原表头行并记入 section_header_rows，
       导出 Excel 时自动渲染为苹果绿区块表头，最大程度贴近原图与 WPS 效果。
     """
@@ -498,9 +625,13 @@ def merge_sheets_into_single_quotation(
             "section_header_rows": [],
         }
 
+    # 若同时存在正式报价表与顶部「成色说明」图例表，自动剔除图例表
+    non_legend = [sh for sh in sheets if not _is_condition_legend_sheet(sh)]
+    candidate_sheets = non_legend if non_legend else sheets
+
     # 先对每个区块独立清洗（防重复表头/残缺行/合并空型号），避免干扰后续区块小表头
     cleaned_sheets: List[Dict[str, Any]] = []
-    for sh in sheets:
+    for sh in candidate_sheets:
         sh_copy = json.loads(json.dumps(sh))
         c_rows, c_warns = _clean_quotation_rows(
             sh_copy.get("headers") or [], sh_copy.get("rows") or [], sh_copy.get("warnings") or []
@@ -1349,17 +1480,19 @@ def extract_tables_from_image(
     instruction = (
         "You are an expert document and quotation-sheet OCR extraction engine. "
         "CRITICAL: Extract EVERY SINGLE ROW and EVERY table/block visible in this image from the very top to the very bottom. "
-        "NEVER omit rows, NEVER omit price cells, NEVER stop after the first section, and NEVER truncate the output. "
+        "NEVER omit rows, NEVER omit price cells, NEVER output empty blank rows, NEVER stop after the first section, and NEVER truncate the output. "
         "VISUAL HEADER ANCHOR RULE: If there is a bright RED horizontal divider bar near the top of the image, the strip ABOVE the red bar is a copied visual column-header reference from the top of the sheet—use it ONLY to keep exact column names and left-to-right column alignment, and put ONLY the data rows BELOW the red bar into `rows`. "
-        "IMPORTANT: When a model name cell (or model code cell like '13 PRO' / 'A2639') spans multiple capacity rows (vertically merged cell over 128/256/512/1T), REPEAT the exact model name and code on EVERY row belonging to that horizontal grid box! "
+        "IMPORTANT: When a model name cell (or model code cell like '13 PRO' / 'A2639') spans multiple capacity rows (vertically merged cell over 128/256/512/1T or 12+256/16+512), REPEAT the exact model name and code on EVERY row belonging to that horizontal grid box! "
         "NEVER pull a model name UPWARD from a lower horizontal border box onto orphan rows above the border line! If a row at the very top edge has a blank model cell separated by a dark horizontal border from the model below, leave its model cell empty '' or omit the clipped orphan row rather than assigning the NEXT model's name to it. "
+        "SINGLE-LINE MODEL NAME RULE: NEVER put newline characters or literal '\\n' inside model names, network codes, capacities, or prices! If a model name wraps across two lines inside a narrow cell (for example '15 PRO' over 'MAX', or '荣耀Robot' over 'Phone', or 'MATE XT2' over '非凡大师'), ALWAYS join them on ONE line with a single space ('15 PRO MAX', '荣耀Robot Phone', 'MATE XT2 非凡大师'). "
+        "BRAND & WATERMARK PRECISION: Carefully distinguish English letters vs digits in brand names and network codes (e.g. 'iQOO' with letters OO NOT digits 00, 'OPPO', 'ROG', 'A3108', 'A2639', 'PMK110', 'LAP-AL10'). Completely IGNORE faint diagonal watermarks (such as '靓机汇报价单') overlapping numbers or capacities—never attach stray watermark letters to capacities or prices. "
         "Do NOT include repeated sub-table header rows (like '型号 | 容量 | 靓机...') inside `rows`; instead represent each sub-block as an item in `sheets` with its exact `headers`. "
         "If a sub-table has '-' or blank placeholder columns (for example no highest price tier), KEEP that column slot so all blocks preserve consistent column structure and alignment. "
         + right_col_rule
-        + "Preserve EVERY Chinese character verbatim with 100% precision (e.g. '高保充新-全套', '不看保修', '不需保修', '在保', '靓机', '小靓机', '小花', '大花', '外爆', '内爆可测', '网络型号', '蓝光/彩点', '扣费说明', '扣费项', '电芯'). NEVER substitute lookalike Chinese characters and NEVER translate titles or section names into English. "
+        + "Preserve EVERY Chinese character verbatim with 100% precision (e.g. '高保充新-全套', '不看保修', '不需保修', '在保', '充新', '靓机', '小靓机', '小花', '大花', '外爆', '内爆可测', '网络型号', '蓝光/彩点', '扣费说明', '扣费项', '备注扣费项', '电芯'). NEVER substitute lookalike Chinese characters and NEVER translate titles or section names into English. "
         "Set `title` to the main quotation header visible in the image (e.g. vendor name + date like '苹果行货 过保机 2026-11-25上午 回收报价'). "
-        "Put top/edge vendor rules, validity notices, or disclaimers outside data rows into `document_notes` (do NOT mix them into table rows). "
-        "Preserve exact text, model names, capacities, numbers, range strings (e.g. '3200-3300'), '+50', and leading zeros (e.g. '001042'). "
+        "Put top/edge vendor rules, validity notices, disclaimers, AND any top condition-definition legend table (like '成色说明 / 等级说明 / 外屏 / 边框背板 / 内屏显示') into `document_notes`—NEVER extract that condition-definition legend table as a sheet in `sheets` when phone model price rows exist! "
+        "Preserve exact text, model names, capacities (both Apple '128'/'256'/'512'/'1T' and Android '12+256'/'16+512'/'16+1TB'), numbers, range strings (e.g. '3200-3300'), '+50', and leading zeros (e.g. '001042'). "
         "Every row in `rows` MUST have the exact same number of elements as `headers` (use empty string '' for blank cells). "
         "Set `col_types` accurately for each column (`text`, `number`, `currency`, `percent`, `date`)."
     )
@@ -1372,7 +1505,7 @@ def extract_tables_from_image(
         "Api-Revision": "2026-05-20",
     }
 
-    target_resolution = "ultra_high" if model_tier == "accurate" else "high"
+    target_resolution = "ultra_high"
     used_model = primary_model
     parsed: Optional[Dict[str, Any]] = None
     last_error = ""
@@ -1407,15 +1540,23 @@ def extract_tables_from_image(
                 headers=headers,
                 timeout=req_timeout,
             )
-            # 若个别端点暂不支持 resolution 字段则返回 400，立即剥离后原模型重试
+            # 若个别模型端点暂不支持 ultra_high，自动降级为 high，若仍 400 则剥离 resolution 重试
             if resp.status_code == 400 and "resolution" in resp.text.lower():
-                image_block.pop("resolution", None)
+                image_block["resolution"] = "high"
                 resp = requests.post(
                     GEMINI_INTERACTIONS_URL,
                     json=payload,
                     headers=headers,
                     timeout=req_timeout,
                 )
+                if resp.status_code == 400 and "resolution" in resp.text.lower():
+                    image_block.pop("resolution", None)
+                    resp = requests.post(
+                        GEMINI_INTERACTIONS_URL,
+                        json=payload,
+                        headers=headers,
+                        timeout=req_timeout,
+                    )
         except requests.RequestException as exc:
             last_error = f"连接 Gemini 视觉识别服务超时或网络异常：{type(exc).__name__}"
             continue
@@ -1454,7 +1595,7 @@ def extract_tables_from_image(
 
     stem = Path(filename or "extracted").stem
     normalized = normalize_table_grid(parsed, fallback_name=stem)
-    raw_sheets = normalized["sheets"]
+    raw_sheets = [sh for sh in normalized["sheets"] if not _is_condition_legend_sheet(sh)] or normalized["sheets"]
     for rsh in raw_sheets:
         r_rows, r_warns = _clean_quotation_rows(
             rsh["headers"], rsh["rows"], rsh.get("warnings") or []
