@@ -114,10 +114,94 @@ export interface BatchJob {
   items: BatchJobItem[];
 }
 
+export interface AuthStatus {
+  auth_required: boolean;
+  auth_configured: boolean;
+  authenticated: boolean;
+  username: string;
+}
+
+export interface LoginResponse {
+  access_token: string;
+  token_type: string;
+  username: string;
+  expires_at: number;
+}
+
+export interface StorageStats {
+  backend: string;
+  bucket: string;
+  file_count: number;
+  total_bytes: number;
+}
+
+export interface ClearRecordsResponse {
+  cleared: boolean;
+  deleted_jobs: number;
+  deleted_records: number;
+  deleted_files: number;
+  freed_bytes: number;
+  storage_warning?: string;
+}
+
+const AUTH_TOKEN_STORAGE_KEY = "i2e_auth_token_v1";
+let unauthorizedCallback: (() => void) | null = null;
+
+export function getStoredAuthToken(): string {
+  try {
+    return localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+export function setStoredAuthToken(token: string): void {
+  try {
+    if (token) {
+      localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token);
+    } else {
+      localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+    }
+  } catch {
+    // 忽略浏览器隐私模式存储限制
+  }
+}
+
+export function clearStoredAuthToken(): void {
+  setStoredAuthToken("");
+}
+
+export function setUnauthorizedHandler(handler: () => void): void {
+  unauthorizedCallback = handler;
+}
+
 const http = axios.create({
   baseURL: "/api",
   timeout: 65000,
 });
+
+http.interceptors.request.use((config) => {
+  const token = getStoredAuthToken();
+  if (token) {
+    config.headers = config.headers || {};
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+http.interceptors.response.use(
+  (resp) => resp,
+  (err) => {
+    if (axios.isAxiosError(err) && err.response?.status === 401) {
+      const reqUrl = String(err.config?.url || "");
+      if (!reqUrl.includes("/auth/login")) {
+        clearStoredAuthToken();
+        unauthorizedCallback?.();
+      }
+    }
+    return Promise.reject(err);
+  }
+);
 
 export function extractApiError(err: unknown): string {
   if (axios.isAxiosError(err)) {
@@ -151,12 +235,26 @@ function triggerBlobDownload(blob: Blob, fallbackName: string, contentDispositio
   return dlName;
 }
 
+export async function fetchAuthStatus(): Promise<AuthStatus> {
+  const { data } = await http.get<AuthStatus>("/auth/status");
+  return data;
+}
+
+export async function loginWithPassword(username: string, password: string): Promise<LoginResponse> {
+  const { data } = await http.post<LoginResponse>("/auth/login", { username, password });
+  setStoredAuthToken(data.access_token);
+  return data;
+}
+
 export async function fetchHealth() {
   const { data } = await http.get<{
     status: string;
-    db_mode: string;
-    gemini_configured: boolean;
-    model: string;
+    auth_required?: boolean;
+    authenticated?: boolean;
+    username?: string;
+    db_mode?: string;
+    gemini_configured?: boolean;
+    model?: string;
     b2_configured?: boolean;
     b2_bucket?: string;
   }>("/health");
@@ -316,8 +414,34 @@ export async function loadJobIntoEditor(jobUid: string): Promise<{
   return data;
 }
 
-export async function deleteBatchJob(jobUid: string): Promise<void> {
-  await http.delete(`/jobs/${jobUid}`);
+export async function deleteBatchJob(jobUid: string): Promise<{
+  deleted: boolean;
+  job_uid: string;
+  deleted_files?: number;
+  freed_bytes?: number;
+  storage_warning?: string;
+}> {
+  const { data } = await http.delete(`/jobs/${jobUid}`);
+  return data;
+}
+
+export async function clearAllRecords(): Promise<ClearRecordsResponse> {
+  const { data } = await http.delete<ClearRecordsResponse>("/records/all");
+  return data;
+}
+
+export async function fetchStorageStats(): Promise<StorageStats> {
+  const { data } = await http.get<StorageStats>("/storage/stats");
+  return data;
+}
+
+export async function purgeB2Storage(): Promise<{
+  purged: boolean;
+  deleted_files: number;
+  freed_bytes: number;
+}> {
+  const { data } = await http.post("/storage/purge-b2");
+  return data;
 }
 
 export async function downloadExportedTables(params: {

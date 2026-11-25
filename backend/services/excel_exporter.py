@@ -122,7 +122,7 @@ def _populate_worksheet(ws: Any, sheet_data: Dict[str, Any]) -> None:
             max_line_w = max((_display_width(line) for line in raw_cell.splitlines()), default=0)
             col_widths[c_idx - 1] = max(col_widths[c_idx - 1], max_line_w + 3)
 
-    final_widths = [min(max(w, 10), 34 if _is_note_column(headers[i]) else 28) for i, w in enumerate(col_widths)]
+    final_widths = [min(max(w, 10), 40 if _is_note_column(headers[i]) else 28) for i, w in enumerate(col_widths)]
 
     section_header_rows = set(int(x) for x in (sheet_data.get("section_header_rows") or []))
 
@@ -165,7 +165,7 @@ def _populate_worksheet(ws: Any, sheet_data: Dict[str, Any]) -> None:
             if r_idx % 2 == 1:
                 cell.fill = zebra_fill
 
-        ws.row_dimensions[r_idx].height = 28 if is_section_header else max(22, min(140, max_lines * 16 + 6))
+        ws.row_dimensions[r_idx].height = 28 if is_section_header else max(22, min(78, max_lines * 15 + 6))
 
     # 合并单元格（跳过非锚点格，避免 openpyxl MergedCell 只读报错；数据行偏移 +2）
     for m in merges:

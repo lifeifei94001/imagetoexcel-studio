@@ -1,5 +1,106 @@
 <template>
   <div class="app-shell">
+    <!-- 登录态检测骨架屏 -->
+    <div
+      v-if="authChecking"
+      style="min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px"
+    >
+      <div class="glass-strong" style="padding: 28px 36px; text-align: center; max-width: 380px; width: 100%">
+        <div class="brand-icon" style="margin: 0 auto 14px">
+          <el-icon :size="20"><Grid /></el-icon>
+        </div>
+        <div style="font-weight: 700; font-size: 16px; margin-bottom: 6px">Image to Excel Studio</div>
+        <div class="glass-muted" style="font-size: 13px">正在校验访问权限...</div>
+      </div>
+    </div>
+
+    <!-- 全站登录门禁（未登录时拦截访问，防止他人盗刷额度与对象存储） -->
+    <div
+      v-else-if="authRequired && !authenticated"
+      style="min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px"
+    >
+      <div class="glass-strong" style="padding: 34px 32px; max-width: 420px; width: 100%">
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px">
+          <div style="display: flex; align-items: center; gap: 10px">
+            <span class="brand-icon">
+              <el-icon :size="18"><Lock /></el-icon>
+            </span>
+            <div>
+              <div style="font-weight: 800; font-size: 17px">Image to Excel Studio</div>
+              <div class="glass-muted" style="font-size: 12px">私有报价单 AI 提取工作台</div>
+            </div>
+          </div>
+          <el-select v-model="theme" size="small" style="width: 112px" aria-label="切换主题">
+            <el-option label="🌸 霞光" value="aurora" />
+            <el-option label="🌌 星云" value="nebula" />
+            <el-option label="🏛️ 杂志" value="editorial" />
+          </el-select>
+        </div>
+
+        <el-alert
+          v-if="!authConfigured"
+          type="warning"
+          show-icon
+          :closable="false"
+          title="服务端尚未配置 AUTH_USERNAME / AUTH_PASSWORD"
+          description="请在 Vercel 项目环境变量中配置登录账号与密码后重新部署。"
+          style="margin-bottom: 16px"
+        />
+
+        <el-alert
+          v-if="loginError"
+          type="error"
+          show-icon
+          :closable="false"
+          :title="loginError"
+          style="margin-bottom: 16px"
+        />
+
+        <form style="display: flex; flex-direction: column; gap: 14px" @submit.prevent="handleLogin">
+          <div>
+            <label style="display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px">账号</label>
+            <el-input
+              v-model="loginUsername"
+              size="large"
+              placeholder="请输入管理员用户名"
+              autocomplete="username"
+              clearable
+            />
+          </div>
+
+          <div>
+            <label style="display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px">密码</label>
+            <el-input
+              v-model="loginPassword"
+              type="password"
+              size="large"
+              show-password
+              placeholder="请输入登录密码"
+              autocomplete="current-password"
+              @keyup.enter="handleLogin"
+            />
+          </div>
+
+          <el-button
+            type="primary"
+            size="large"
+            native-type="submit"
+            :loading="loggingIn"
+            :disabled="!loginUsername.trim() || !loginPassword"
+            style="width: 100%; margin-top: 6px"
+          >
+            {{ loggingIn ? "正在验证..." : "登录工作台" }}
+          </el-button>
+        </form>
+
+        <div class="glass-muted" style="font-size: 12px; text-align: center; margin-top: 16px; line-height: 1.6">
+          登录成功后当前浏览器将保持 7 天免密状态，可随时在右上角退出登录。
+        </div>
+      </div>
+    </div>
+
+    <!-- 已认证主工作台 -->
+    <template v-else>
     <!-- 顶部毛玻璃导航栏 -->
     <header class="glass-strong top-nav">
       <div class="brand-mark" @click="activeTab = 'workspace'">
@@ -61,6 +162,11 @@
         </el-button>
 
         <el-button size="small" @click="paletteVisible = true">⌘K</el-button>
+
+        <template v-if="authRequired">
+          <span class="gem-pill pill-violet">{{ currentUsername || "admin" }}</span>
+          <el-button size="small" type="danger" plain @click="handleLogout">退出</el-button>
+        </template>
       </div>
     </header>
 
@@ -379,17 +485,43 @@
         </div>
       </section>
 
-      <!-- ==================== 转换记录视图（含 Backblaze B2 云端批次存档下载 + 载入复编） ==================== -->
+      <!-- ==================== 转换记录视图（含 Backblaze B2 云端批次存档下载 + 一键清空释放空间） ==================== -->
       <section v-else-if="activeTab === 'history'" style="display: flex; flex-direction: column; gap: 18px">
         <div class="glass-strong" style="padding: 22px">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; flex-wrap: wrap; gap: 10px">
             <div>
-              <h2 class="section-heading">批量任务与 Backblaze 对象存储存档</h2>
+              <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 4px">
+                <h2 class="section-heading" style="margin: 0">批量任务与 Backblaze 对象存储存档</h2>
+                <span v-if="storageStats" class="gem-pill pill-sky num-tabular">
+                  {{ storageStats.backend === "b2" ? "B2 存储桶" : "本地缓存" }}：{{ storageStats.file_count }} 个版本 ·
+                  {{ formatSize(storageStats.total_bytes) }}
+                </span>
+              </div>
               <p class="section-sub" style="margin-bottom: 0">
-                每次处理完的独立报价单 <code>.xlsx</code>、多图汇总 <code>.zip</code> 与结构化数据均持久化至 Backblaze B2，可随时下载或载入编辑器复改。
+                每次处理完的独立报价单 <code>.xlsx</code>、多图汇总 <code>.zip</code> 与结构化数据均持久化至 Backblaze B2；删除或一键清空将同步彻底清理云端文件及历史版本，释放 10GB 免费额度。
               </p>
             </div>
-            <el-button size="small" :loading="loadingHistory" @click="loadHistory">刷新全部记录</el-button>
+            <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap">
+              <el-button size="small" :loading="loadingHistory" @click="loadHistory">刷新记录</el-button>
+              <el-button
+                size="small"
+                type="warning"
+                plain
+                :loading="purgingB2"
+                @click="confirmPurgeB2"
+              >
+                一键释放 B2 空间
+              </el-button>
+              <el-button
+                size="small"
+                type="danger"
+                :loading="clearingAll"
+                :disabled="batchJobs.length === 0 && historyList.length === 0 && (storageStats?.file_count ?? 0) === 0"
+                @click="confirmClearAllRecords"
+              >
+                一键清空全部记录
+              </el-button>
+            </div>
           </div>
 
           <el-empty v-if="batchJobs.length === 0" description="暂无批次任务记录，去工作台上传报价单试试吧" :image-size="72" />
@@ -405,7 +537,7 @@
                   <span class="gem-pill" :class="job.status === 'completed' ? 'pill-emerald' : 'pill-gold'">
                     {{ job.completed_items }}/{{ job.total_items }} 份 · {{ job.status }}
                   </span>
-                  <span class="glass-muted num-tabular" style="font-size: 12px">{{ job.created_at }}</span>
+                  <span class="glass-muted num-tabular" style="font-size: 12px">{{ formatBeijingTime(job.created_at) }}</span>
                 </div>
 
                 <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap">
@@ -418,7 +550,7 @@
                     载入工作台编辑
                   </el-button>
                   <el-button
-                    v-if="job.zip_b2_key || job.items.length === 1"
+                    v-if="job.zip_b2_key || (job.items.length === 1 && job.items[0]?.xlsx_b2_key)"
                     size="small"
                     type="primary"
                     :loading="downloadingKey === job.job_uid"
@@ -426,7 +558,7 @@
                   >
                     {{ job.zip_b2_key ? "下载整批打包 (.zip)" : "下载报价单 (.xlsx)" }}
                   </el-button>
-                  <el-button size="small" type="danger" text @click="removeBatchJob(job.job_uid)">删除</el-button>
+                  <el-button size="small" type="danger" text @click="removeBatchJob(job.job_uid)">删除并释放</el-button>
                 </div>
               </div>
 
@@ -450,6 +582,7 @@
                   >
                     下载 .xlsx
                   </el-button>
+                  <span v-else-if="item.status === 'completed'" class="gem-pill pill-gold">云端已清理</span>
                   <span v-else class="gem-pill pill-coral">失败</span>
                 </div>
               </div>
@@ -459,7 +592,10 @@
 
         <!-- 单文件调用流水表 -->
         <div class="glass-strong" style="padding: 22px">
-          <h3 class="section-heading" style="font-size: 1.15rem">单张识别调用明细</h3>
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; flex-wrap: wrap; gap: 8px">
+            <h3 class="section-heading" style="font-size: 1.15rem; margin: 0">单张识别调用明细</h3>
+            <span class="glass-muted" style="font-size: 12.5px">共 {{ historyList.length }} 条记录（点击上方「一键清空全部记录」可一并删除）</span>
+          </div>
           <el-table :data="historyList" stripe style="width: 100%" empty-text="暂无转换记录">
             <el-table-column prop="id" label="ID" width="70" />
             <el-table-column prop="filename" label="源图片文件名" min-width="200" />
@@ -481,7 +617,11 @@
                 </span>
               </template>
             </el-table-column>
-            <el-table-column prop="created_at" label="时间 (UTC)" width="175" />
+            <el-table-column label="时间 (北京时间)" width="175">
+              <template #default="{ row }">
+                <span class="num-tabular">{{ formatBeijingTime(row.created_at) }}</span>
+              </template>
+            </el-table-column>
             <el-table-column label="操作" width="80">
               <template #default="{ row }">
                 <el-button size="small" type="danger" text @click="removeHistory(row.id)">删除</el-button>
@@ -513,14 +653,16 @@
     </footer>
 
     <CommandPalette v-model:visible="paletteVisible" :commands="commandItems" />
+    </template>
   </div>
 </template>
 
 <script setup lang="ts">
+import axios from "axios";
 import { computed, nextTick, onMounted, ref, watch } from "vue";
 import { useEventListener, useMagicKeys } from "@vueuse/core";
-import { ElMessage } from "element-plus";
-import { Grid, UploadFilled } from "@element-plus/icons-vue";
+import { ElMessage, ElMessageBox } from "element-plus";
+import { Grid, Lock, UploadFilled } from "@element-plus/icons-vue";
 
 import SpotlightCard from "./components/SpotlightCard.vue";
 import CommandPalette, { type CommandItem } from "./components/CommandPalette.vue";
@@ -528,6 +670,8 @@ import TableEditorPanel from "./components/TableEditorPanel.vue";
 import { useTheme } from "./composables/useTheme";
 import { splitLongImageIntoSlices } from "./utils/imageCompressor";
 import {
+  clearAllRecords,
+  clearStoredAuthToken,
   commitSlicedQuotation,
   createBatchJob,
   deleteBatchJob,
@@ -535,16 +679,22 @@ import {
   downloadJobArtifact,
   extractApiError,
   extractSlice,
+  fetchAuthStatus,
   fetchBatchJobs,
   fetchHealth,
   fetchHistory,
   fetchQuota,
+  fetchStorageStats,
   finalizeBatchJob,
   loadJobIntoEditor,
+  loginWithPassword,
   processBatchJobItem,
+  purgeB2Storage,
+  setUnauthorizedHandler,
   type BatchJob,
   type ConversionRecord,
   type QuotationGroup,
+  type StorageStats,
 } from "./api/convertApi";
 
 interface QueuedImage {
@@ -585,13 +735,27 @@ const lastBatchJobUid = ref("");
 
 const geminiConfigured = ref(false);
 const b2Configured = ref(false);
-const activeModel = ref("gemini-4-hydrogen");
+const activeModel = ref("gemini-3.5-flash-lite");
 const quotaRemaining = ref(50);
 const quotaLimit = ref(50);
 
+// 登录鉴权状态
+const authChecking = ref(true);
+const authRequired = ref(false);
+const authConfigured = ref(true);
+const authenticated = ref(false);
+const currentUsername = ref("");
+const loginUsername = ref("admin");
+const loginPassword = ref("");
+const loggingIn = ref(false);
+const loginError = ref("");
+
 const batchJobs = ref<BatchJob[]>([]);
 const historyList = ref<ConversionRecord[]>([]);
+const storageStats = ref<StorageStats | null>(null);
 const loadingHistory = ref(false);
+const clearingAll = ref(false);
+const purgingB2 = ref(false);
 const downloadingKey = ref("");
 const loadingJobUid = ref("");
 
@@ -660,6 +824,21 @@ function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function formatBeijingTime(utcStr?: string): string {
+  if (!utcStr) return "-";
+  const normalized = utcStr.includes("T") ? utcStr : utcStr.replace(" ", "T");
+  const iso = normalized.endsWith("Z") ? normalized : `${normalized}Z`;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return utcStr;
+  const bj = new Date(d.getTime() + 8 * 3600 * 1000);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${bj.getUTCFullYear()}-${pad(bj.getUTCMonth() + 1)}-${pad(bj.getUTCDate())} ${pad(bj.getUTCHours())}:${pad(bj.getUTCMinutes())}:${pad(bj.getUTCSeconds())}`;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function enqueueFiles(files: File[]) {
@@ -800,15 +979,38 @@ async function startBatchExtraction() {
             const sliceResults: Record<string, unknown>[] = [];
             let inheritedHeaderHint = customHint.value.trim();
             for (let sIdx = 0; sIdx < slices.length; sIdx++) {
-              progressItems.value[myIdx].message = `检测到超长图，正在高清分段提取 (${sIdx + 1}/${slices.length} 段)...`;
-              const sRes = await extractSlice({
-                file: slices[sIdx],
-                sliceIndex: sIdx,
-                mode: mode.value,
-                forceDemo: forceDemo.value,
-                customHint: inheritedHeaderHint,
-                modelTier: modelTier.value,
-              });
+              let sRes: Record<string, unknown> | null = null;
+              let lastSliceErr: unknown = null;
+              const maxAttempts = 3;
+              for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                progressItems.value[myIdx].message =
+                  attempt === 1
+                    ? `检测到超长图，正在高清分段提取 (${sIdx + 1}/${slices.length} 段)...`
+                    : `第 ${sIdx + 1}/${slices.length} 段遇网络或模型波动，正在自动重试 (${attempt}/${maxAttempts})...`;
+                try {
+                  sRes = await extractSlice({
+                    file: slices[sIdx],
+                    sliceIndex: sIdx,
+                    mode: mode.value,
+                    forceDemo: forceDemo.value,
+                    customHint: inheritedHeaderHint,
+                    modelTier: modelTier.value,
+                  });
+                  break;
+                } catch (err) {
+                  lastSliceErr = err;
+                  const status = axios.isAxiosError(err) ? err.response?.status : undefined;
+                  if (status === 400 || status === 401 || status === 403 || status === 429) {
+                    throw err;
+                  }
+                  if (attempt < maxAttempts) {
+                    await sleep(1200 * attempt);
+                  }
+                }
+              }
+              if (!sRes) {
+                throw lastSliceErr instanceof Error ? lastSliceErr : new Error(`第 ${sIdx + 1} 段识别失败`);
+              }
               sliceResults.push(sRes);
               if (sIdx === 0) {
                 const rawList = (sRes.raw_sheets as Array<{ headers?: string[] }> | undefined) || [];
@@ -907,9 +1109,14 @@ function clearDraft() {
 async function loadHistory() {
   loadingHistory.value = true;
   try {
-    const [jobs, records] = await Promise.all([fetchBatchJobs(), fetchHistory()]);
+    const [jobs, records, stats] = await Promise.all([
+      fetchBatchJobs(),
+      fetchHistory(),
+      fetchStorageStats().catch(() => null),
+    ]);
     batchJobs.value = jobs;
     historyList.value = records;
+    if (stats) storageStats.value = stats;
   } catch (err) {
     ElMessage.error(extractApiError(err));
   } finally {
@@ -950,11 +1157,82 @@ async function restoreJobToEditor(jobUid: string) {
 
 async function removeBatchJob(jobUid: string) {
   try {
-    await deleteBatchJob(jobUid);
+    const res = await deleteBatchJob(jobUid);
     batchJobs.value = batchJobs.value.filter((j) => j.job_uid !== jobUid);
-    ElMessage.success("批次记录已删除");
+    const freedInfo =
+      res.deleted_files && res.deleted_files > 0
+        ? `，已同步释放 ${res.deleted_files} 个云端文件 (${formatSize(res.freed_bytes || 0)})`
+        : "";
+    ElMessage.success(`批次记录已删除${freedInfo}`);
+    if (res.storage_warning) {
+      ElMessage.warning(`云端清理提醒：${res.storage_warning}`);
+    }
+    fetchStorageStats()
+      .then((s) => (storageStats.value = s))
+      .catch(() => {});
   } catch (err) {
     ElMessage.error(extractApiError(err));
+  }
+}
+
+async function confirmClearAllRecords() {
+  try {
+    await ElMessageBox.confirm(
+      "此操作将一次性删除全部批次任务、单张调用明细，并彻底物理删除 Backblaze B2 存储桶中的所有存档文件与历史版本（不可恢复），确认继续？",
+      "一键清空全部记录并释放空间",
+      {
+        confirmButtonText: "确认全部清空",
+        cancelButtonText: "取消",
+        type: "warning",
+      }
+    );
+  } catch {
+    return;
+  }
+
+  clearingAll.value = true;
+  try {
+    const res = await clearAllRecords();
+    batchJobs.value = [];
+    historyList.value = [];
+    ElMessage.success(
+      `已清空 ${res.deleted_jobs} 个批次、${res.deleted_records} 条明细，并释放 ${res.deleted_files} 个云端文件版本（${formatSize(res.freed_bytes)}）`
+    );
+    if (res.storage_warning) {
+      ElMessage.warning(`云端清理提醒：${res.storage_warning}`);
+    }
+    storageStats.value = await fetchStorageStats().catch(() => null);
+  } catch (err) {
+    ElMessage.error(extractApiError(err));
+  } finally {
+    clearingAll.value = false;
+  }
+}
+
+async function confirmPurgeB2() {
+  try {
+    await ElMessageBox.confirm(
+      "将扫描并彻底删除 Backblaze B2 存储桶中的所有文件及历史隐藏版本（用于清理残留占用、清零 10GB 免费空间），保留文字明细列表，确认执行？",
+      "一键释放 Backblaze B2 空间",
+      {
+        confirmButtonText: "立即释放空间",
+        cancelButtonText: "取消",
+        type: "warning",
+      }
+    );
+  } catch {
+    return;
+  }
+
+  purgingB2.value = true;
+  try {
+    const res = await purgeB2Storage();
+    ElMessage.success(`Backblaze B2 已清理完成：删除 ${res.deleted_files} 个文件版本，释放 ${formatSize(res.freed_bytes)}`);
+    await loadHistory();
+  } catch (err) {
+    ElMessage.error(extractApiError(err));
+  } finally {
+    purgingB2.value = false;
   }
 }
 
@@ -971,6 +1249,68 @@ async function removeHistory(id: number) {
 function openHistoryTab() {
   activeTab.value = "history";
   loadHistory();
+}
+
+async function loadWorkspaceBootstrap() {
+  const savedDraft = localStorage.getItem(DRAFT_STORAGE_KEY);
+  if (savedDraft) {
+    try {
+      const parsed = JSON.parse(savedDraft);
+      if (Array.isArray(parsed?.quotations) && parsed.quotations.length > 0) {
+        mergePerImage.value = Boolean(parsed.mergePerImage ?? true);
+        quotations.value = parsed.quotations;
+      }
+    } catch {
+      localStorage.removeItem(DRAFT_STORAGE_KEY);
+    }
+  }
+
+  try {
+    const [health, quota] = await Promise.all([fetchHealth(), fetchQuota()]);
+    geminiConfigured.value = Boolean(health.gemini_configured);
+    b2Configured.value = Boolean(health.b2_configured);
+    if (health.model) activeModel.value = health.model;
+    quotaRemaining.value = quota.remaining;
+    quotaLimit.value = quota.daily_limit;
+  } catch {
+    // 后端未启动或未授权时保持界面可用
+  }
+
+  if (activeTab.value === "history") {
+    loadHistory();
+  }
+}
+
+async function handleLogin() {
+  if (!loginUsername.value.trim() || !loginPassword.value || loggingIn.value) return;
+  loggingIn.value = true;
+  loginError.value = "";
+  try {
+    const res = await loginWithPassword(loginUsername.value.trim(), loginPassword.value);
+    authenticated.value = true;
+    currentUsername.value = res.username;
+    loginPassword.value = "";
+    ElMessage.success(`欢迎回来，${res.username}`);
+    await loadWorkspaceBootstrap();
+  } catch (err) {
+    loginError.value = extractApiError(err);
+  } finally {
+    loggingIn.value = false;
+  }
+}
+
+function handleLogout() {
+  clearStoredAuthToken();
+  authenticated.value = false;
+  currentUsername.value = "";
+  quotations.value = [];
+  batchJobs.value = [];
+  historyList.value = [];
+  storageStats.value = null;
+  progressItems.value = [];
+  clearQueue();
+  localStorage.removeItem(DRAFT_STORAGE_KEY);
+  ElMessage.info("已安全退出登录并清理本地草稿");
 }
 
 const commandItems = computed<CommandItem[]>(() => [
@@ -1022,29 +1362,29 @@ const commandItems = computed<CommandItem[]>(() => [
 ]);
 
 const guideSteps = [
-  { title: "批量拖入或粘贴报价单", desc: "支持一次选入多达 20 张长图报价单，<=3.6MB 原像素直传，超大图保宽不压糊。" },
-  { title: "单图多区块自动合为 1 表", desc: "同张图片内按品牌/系列拆开的区块，自动补充「分类/区块」列合并为统一主表头的单一 Sheet。" },
-  { title: "进度条运行 + 自动存 B2", desc: "分片调度避免长图超时，无需盯着等待；成品单表 .xlsx 与整批 .zip 自动上传至 Backblaze B2。" },
-  { title: "随取随下或单表/打包导出", desc: "工作台可导出单份 .xlsx 或全批 .zip，也可在「转换记录」随时下载或载入复改。" },
+  { title: "批量拖入或粘贴报价单", desc: "支持一次选入多达 20 张长图报价单，超长图自动高精度重叠切片并自动去重拼接。" },
+  { title: "忠实还原原表结构", desc: "A 列直接从原图型号列起步，不同成色区块自动保留原表分段表头并渲染 WPS 苹果绿样式。" },
+  { title: "分片容错 + 自动存 B2", desc: "单段切片失败自动重试并跨模型兜底，成品单表 .xlsx 与整批 .zip 自动上传至 Backblaze B2。" },
+  { title: "随时下载或一键释放空间", desc: "转换记录页支持下载、载入复改，也支持一键清空全部记录并物理删除 B2 历史版本释放额度。" },
 ];
 
 const useCases = [
-  { title: "1 图 = 1 完整报价单 Sheet", tag: "智能合表", pillClass: "pill-emerald", desc: "多系列区块自动合进同一 Sheet，首列带出系列名称，方便直接筛选与 VLOOKUP。" },
+  { title: "1 图 = 1 完整报价单 Sheet", tag: "忠实还原", pillClass: "pill-emerald", desc: "不强插多余列，A 列直接对应原图首列，自动保留各区块原生表头且每行带型号便于筛选与 VLOOKUP。" },
   { title: "单份导出与批量打包 .zip", tag: "多图批处理", pillClass: "pill-sky", desc: "支持单份报价单独立下载 .xlsx，多张报价单时一键打包成平铺 .zip 压缩包。" },
-  { title: "长图保宽清晰 + 300% 放大", tag: "长截图友好", pillClass: "pill-violet", desc: "保宽不截长策略保护竖屏长报价单数字锐利度，左侧对照窗支持最高 300% 缩放。" },
-  { title: "Backblaze B2 永久云端存档", tag: "对象存储", pillClass: "pill-gold", desc: "批量任务处理完自动持久化 .xlsx、.zip 与结构化数据到 B2，转换记录页随时回溯下载。" },
-  { title: "商家规则备注单独提取", tag: "纯净数据行", pillClass: "pill-coral", desc: "顶部时效与扣差说明单独展示在提示栏，不污染数据行，数值列保留真数字。" },
-  { title: "无损切换合表 / 拆分子表", tag: "零额外消耗", pillClass: "pill-sky", desc: "保留原始子表结构，工作台内随时切换合表或拆表视图，无需重新调用 AI。" },
+  { title: "长图保宽清晰 + 300% 放大", tag: "长截图友好", pillClass: "pill-violet", desc: "高清切片配合左侧 300% 缩放对照窗，长截图里的密集小字与价格格一目了然。" },
+  { title: "Backblaze B2 存档与一键清零", tag: "对象存储", pillClass: "pill-gold", desc: "自动存档 .xlsx / .zip 至 B2，并在转换记录页提供一键清空与 B2 历史版本物理删除，省心控空间。" },
+  { title: "商家规则备注单独提取", tag: "纯净数据行", pillClass: "pill-coral", desc: "顶部时效与扣差说明单独展示在提示栏，不污染数据行，价格列保留纯数字便于直接公式计算。" },
+  { title: "私有账号密码全站保护", tag: "安全鉴权", pillClass: "pill-sky", desc: "全站接口强制校验登录令牌，防止外部访客盗刷 AI 识别配额与对象存储空间。" },
 ];
 
 const faqs = [
   {
     q: "为什么多张报价单改用「分片进度调度」？",
-    a: "超长报价单识别往往需要 15~40 秒。若多张图挤在同一个 HTTP 请求里容易触发 Vercel 60 秒上限；改成单图分片（每图独享 40 秒 AI 预算）+ 进度条后，既稳定又不会因为某一张超时拖垮整批。",
+    a: "超长报价单识别往往需要 15~40 秒。改成单图高清分段 + 单段失败自动重试与跨模型兜底后，既规避 Vercel 60 秒超时，又能避免切缝截断多出错误机型。",
   },
   {
-    q: "Backblaze B2 存储桶里保存了哪些文件？",
-    a: "每个完成批次会在存储桶 image-to-execl 中保存每张报价单的独立 .xlsx、多图时的汇总 .zip 压缩包，以及供「载入工作台编辑」使用的轻量化 JSON；原始图片不长期占用你的存储空间。",
+    q: "怎么释放 Backblaze B2 免费 10GB 存储空间？",
+    a: "在「转换记录」页面点击单条记录的「删除并释放」，或直接点击右上角「一键清空全部记录 / 一键释放 B2 空间」，系统会彻底删除 B2 中的所有文件及历史隐藏版本。",
   },
   {
     q: "合并成一个 Sheet 后还能查看原来的分块吗？",
@@ -1052,37 +1392,34 @@ const faqs = [
   },
   {
     q: "报价单里的区间价或 +50 加减价会被当成公式吗？",
-    a: "不会。纯数字价格（如 3400、¥2,199.00）会转为真正的 Excel 数值格式方便求和；带有连字符区间（如 3200-3300）或显式加号（+50）的文本会自动保持文本原样。",
+    a: "不会。纯数字价格（如 3400、¥2,199.00）会转为真正的 Excel 整数格式方便核对与求和；带有连字符区间（如 3200-3300）或显式加号（+50）的文本会自动保持文本原样。",
   },
 ];
 
 onMounted(async () => {
-  const savedDraft = localStorage.getItem(DRAFT_STORAGE_KEY);
-  if (savedDraft) {
-    try {
-      const parsed = JSON.parse(savedDraft);
-      if (Array.isArray(parsed?.quotations) && parsed.quotations.length > 0) {
-        mergePerImage.value = Boolean(parsed.mergePerImage ?? true);
-        quotations.value = parsed.quotations;
-      }
-    } catch {
-      localStorage.removeItem(DRAFT_STORAGE_KEY);
+  setUnauthorizedHandler(() => {
+    if (authRequired.value) {
+      authenticated.value = false;
+      currentUsername.value = "";
+      ElMessage.warning("登录状态已失效，请重新登录");
     }
-  }
+  });
 
   try {
-    const [health, quota] = await Promise.all([fetchHealth(), fetchQuota()]);
-    geminiConfigured.value = health.gemini_configured;
-    b2Configured.value = Boolean(health.b2_configured);
-    activeModel.value = health.model;
-    quotaRemaining.value = quota.remaining;
-    quotaLimit.value = quota.daily_limit;
+    const status = await fetchAuthStatus();
+    authRequired.value = status.auth_required;
+    authConfigured.value = status.auth_configured;
+    authenticated.value = status.authenticated;
+    currentUsername.value = status.username || "";
   } catch {
-    // 后端未启动时保持界面可用
+    authRequired.value = false;
+    authenticated.value = true;
+  } finally {
+    authChecking.value = false;
   }
 
-  if (activeTab.value === "history") {
-    loadHistory();
+  if (!authRequired.value || authenticated.value) {
+    await loadWorkspaceBootstrap();
   }
 });
 </script>

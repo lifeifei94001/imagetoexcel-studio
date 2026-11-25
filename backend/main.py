@@ -11,7 +11,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from database import ensure_db_ready
-from routers import convert
+from routers import auth, convert
 
 
 @asynccontextmanager
@@ -42,4 +42,5 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
+app.include_router(auth.router)
 app.include_router(convert.router)

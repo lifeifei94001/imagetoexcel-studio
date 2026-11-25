@@ -12,7 +12,16 @@ from sqlmodel import Session, desc, select
 
 from database import DB_MODE, get_session
 from models import BatchJob, BatchJobItem, ConversionRecord, DailyQuota, utc_now_str, utc_today_str
-from services.b2_storage import b2_is_enabled, get_b2_bucket_name, load_object, save_object
+from services.auth_service import require_auth
+from services.b2_storage import (
+    b2_is_enabled,
+    delete_prefix_objects,
+    get_b2_bucket_name,
+    get_storage_stats,
+    load_object,
+    purge_bucket_files,
+    save_object,
+)
 from services.excel_exporter import (
     build_batch_zip_bytes,
     build_single_xlsx_bytes,
@@ -26,7 +35,7 @@ from services.ocr_service import (
     merge_quotation_slices,
 )
 
-router = APIRouter(prefix="/api", tags=["convert"])
+router = APIRouter(prefix="/api", tags=["convert"], dependencies=[Depends(require_auth)])
 
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".jfif", ".png", ".gif", ".webp", ".heic", ".heif"}
 MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MB
@@ -111,18 +120,6 @@ def _validate_upload_image(up_file: UploadFile, raw_bytes: bytes, idx: int) -> s
     if len(raw_bytes) > MAX_FILE_BYTES:
         raise HTTPException(status_code=400, detail=f"图片 {fname} 超过 10MB 上限，请压缩后重试")
     return fname
-
-
-@router.get("/health")
-def health_check() -> Dict[str, Any]:
-    return {
-        "status": "ok",
-        "db_mode": DB_MODE,
-        "gemini_configured": has_gemini_key(),
-        "model": get_active_model(),
-        "b2_configured": b2_is_enabled(),
-        "b2_bucket": get_b2_bucket_name(),
-    }
 
 
 @router.get("/quota")
@@ -450,7 +447,7 @@ def finalize_batch_job(
         raise HTTPException(status_code=404, detail="未找到对应的批处理任务")
 
     quotations_dicts = [q.model_dump() for q in req.quotations]
-    # 存储结构化 JSON 供「转换记录 -> 载入工作台继续编辑」
+    # 存储结构化 JSON 供「转换记录 -> 载入工作台继续编辑」（B2 瞬时抖动容错，不影响已完成的提取结果）
     if quotations_dicts:
         json_bytes = json.dumps(
             {
@@ -461,11 +458,14 @@ def finalize_batch_job(
             },
             ensure_ascii=False,
         ).encode("utf-8")
-        job.json_b2_key = save_object(
-            f"jobs/{job_uid}/payload.json",
-            json_bytes,
-            "application/json; charset=utf-8",
-        )
+        try:
+            job.json_b2_key = save_object(
+                f"jobs/{job_uid}/payload.json",
+                json_bytes,
+                "application/json; charset=utf-8",
+            )
+        except Exception:
+            job.json_b2_key = ""
 
         # 若包含多份报价单，额外生成一份打包 .zip 存入 Backblaze B2
         if len(quotations_dicts) > 1:
@@ -477,8 +477,11 @@ def finalize_batch_job(
                 export_sheets.append(sh)
             zip_bytes = build_batch_zip_bytes(export_sheets)
             zip_name = f"{_safe_filename(job.title, '报价单批量打包')}_{job_uid[:6]}.zip"
-            job.zip_b2_key = save_object(f"jobs/{job_uid}/{zip_name}", zip_bytes, "application/zip")
-            job.zip_filename = zip_name
+            try:
+                job.zip_b2_key = save_object(f"jobs/{job_uid}/{zip_name}", zip_bytes, "application/zip")
+                job.zip_filename = zip_name
+            except Exception:
+                job.zip_b2_key = ""
 
     if job.completed_items == 0 and job.failed_items > 0:
         job.status = "failed"
@@ -588,12 +591,99 @@ def delete_batch_job(job_uid: str, session: Session = Depends(get_session)) -> D
     job = session.exec(select(BatchJob).where(BatchJob.job_uid == job_uid)).first()
     if not job:
         raise HTTPException(status_code=404, detail="未找到对应的批处理任务")
+
+    storage_report = {"deleted_files": 0, "freed_bytes": 0}
+    storage_warning = ""
+    try:
+        storage_report = delete_prefix_objects(f"jobs/{job_uid}/")
+    except Exception as exc:
+        storage_warning = str(exc)
+
     items = session.exec(select(BatchJobItem).where(BatchJobItem.job_uid == job_uid)).all()
     for it in items:
         session.delete(it)
     session.delete(job)
     session.commit()
-    return {"deleted": True, "job_uid": job_uid}
+    return {
+        "deleted": True,
+        "job_uid": job_uid,
+        "deleted_files": storage_report["deleted_files"],
+        "freed_bytes": storage_report["freed_bytes"],
+        "storage_warning": storage_warning,
+    }
+
+
+@router.delete("/records/all")
+def clear_all_records(session: Session = Depends(get_session)) -> Dict[str, Any]:
+    """一键清空全部批处理记录、单张调用明细，并同步物理删除 Backblaze B2 中的全部存档文件及历史版本。"""
+    storage_report = {"deleted_files": 0, "freed_bytes": 0}
+    storage_warning = ""
+    try:
+        storage_report = purge_bucket_files()
+    except Exception as exc:
+        storage_warning = str(exc)
+
+    items = session.exec(select(BatchJobItem)).all()
+    jobs = session.exec(select(BatchJob)).all()
+    records = session.exec(select(ConversionRecord)).all()
+
+    deleted_jobs = len(jobs)
+    deleted_records = len(records)
+
+    for it in items:
+        session.delete(it)
+    for j in jobs:
+        session.delete(j)
+    for r in records:
+        session.delete(r)
+    session.commit()
+
+    return {
+        "cleared": True,
+        "deleted_jobs": deleted_jobs,
+        "deleted_records": deleted_records,
+        "deleted_files": storage_report["deleted_files"],
+        "freed_bytes": storage_report["freed_bytes"],
+        "storage_warning": storage_warning,
+    }
+
+
+@router.get("/storage/stats")
+def storage_stats() -> Dict[str, Any]:
+    """查询对象存储当前占用文件数与体积，便于随时监控免费空间。"""
+    try:
+        return get_storage_stats()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"查询对象存储空间失败：{exc}")
+
+
+@router.post("/storage/purge-b2")
+def purge_b2_storage(session: Session = Depends(get_session)) -> Dict[str, Any]:
+    """一键物理清空 Backblaze B2 桶内所有残留对象与历史隐藏版本，彻底释放 10GB 免费额度。"""
+    try:
+        report = purge_bucket_files()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"清理 Backblaze B2 存储桶失败：{exc}")
+
+    # 同步置空历史记录中已失效的对象键引用，避免点击下载报 404
+    jobs = session.exec(select(BatchJob)).all()
+    for j in jobs:
+        if j.zip_b2_key or j.json_b2_key:
+            j.zip_b2_key = ""
+            j.json_b2_key = ""
+            session.add(j)
+    items = session.exec(select(BatchJobItem)).all()
+    for it in items:
+        if it.xlsx_b2_key:
+            it.xlsx_b2_key = ""
+            session.add(it)
+    session.commit()
+
+    return {
+        "purged": True,
+        "deleted_files": report["deleted_files"],
+        "freed_bytes": report["freed_bytes"],
+    }
 
 
 @router.post("/extract")

@@ -521,8 +521,38 @@ def _clean_quotation_rows(
         step1_map[idx] = len(step1_rows)
         step1_rows.append(list(r))
 
+    def _norm_model_name(m: str) -> str:
+        return re.sub(r"[\s\-_/]+", "", str(m or "").strip()).lower()
+
+    def _models_compatible(m1: str, m2: str) -> bool:
+        n1, n2 = _norm_model_name(m1), _norm_model_name(m2)
+        if not n1 or not n2:
+            return True
+        if n1 == n2:
+            return True
+        return n1.startswith(n2) or n2.startswith(n1) or (len(n1) >= 2 and n1 in n2) or (len(n2) >= 2 and n2 in n1)
+
+    def _merge_dup_pair(row_a: List[str], row_b: List[str]) -> List[str]:
+        """合并相邻重复行：优先保留更长更完整的机型名，并补全任一方缺失的备注/扣费项。"""
+        na = _norm_model_name(row_a[model_col] if model_col < len(row_a) else "")
+        nb = _norm_model_name(row_b[model_col] if model_col < len(row_b) else "")
+        score_a = (len(na), sum(1 for c in row_a if str(c or "").strip()), sum(len(str(c or "")) for c in row_a))
+        score_b = (len(nb), sum(1 for c in row_b if str(c or "").strip()), sum(len(str(c or "")) for c in row_b))
+        primary, secondary = (list(row_a), row_b) if score_a >= score_b else (list(row_b), row_a)
+        max_len = max(len(primary), len(secondary))
+        while len(primary) < max_len:
+            primary.append("")
+        for ci in range(max_len):
+            p_val = str(primary[ci] if ci < len(primary) else "").strip()
+            s_val = str(secondary[ci] if ci < len(secondary) else "").strip()
+            if not p_val and s_val:
+                primary[ci] = s_val
+            elif ci != model_col and ci != cap_col and len(s_val) > len(p_val) and not re.match(r"^\d+(\.\d+)?$", s_val):
+                primary[ci] = s_val
+        return primary
+
     # 第二遍：去除切片交界处「缺型号但容量+价格与下一行完全相同」的残缺行 + 向下补全合并型号
-    cleaned_rows: List[List[str]] = []
+    step2_rows: List[List[str]] = []
     step2_map: Dict[int, int] = {}
     last_section = None
     last_model = ""
@@ -560,17 +590,46 @@ def _clean_quotation_rows(
         else:
             last_model = m_val
 
-        step2_map[idx] = len(cleaned_rows)
-        cleaned_rows.append(r)
+        step2_map[idx] = len(step2_rows)
+        step2_rows.append(r)
+
+    # 第三遍：智能消除相邻 1~2 行内的「同容量 + 同价格序列 + 截断/兼容机型名」重复行
+    # 典型案例：切片缝把 17pro 截断识别成 17，导致 `17 | 256G | 6700/6600/6350/6150` 紧挨 `17pro | 256G | 6700/6600/6350/6150`
+    cleaned_rows: List[List[str]] = []
+    step3_map: Dict[int, int] = {}
+    for idx, r in enumerate(step2_rows):
+        m_cur = r[model_col].strip() if model_col < len(r) else ""
+        c_cur = re.sub(r"\s+", "", r[cap_col].strip()).lower() if cap_col is not None and cap_col < len(r) else ""
+        p_cur = _price_sig(r)
+
+        merged_into: Optional[int] = None
+        if p_cur:
+            search_start = max(0, len(cleaned_rows) - 2)
+            for prev_i in range(len(cleaned_rows) - 1, search_start - 1, -1):
+                pr = cleaned_rows[prev_i]
+                m_prev = pr[model_col].strip() if model_col < len(pr) else ""
+                c_prev = re.sub(r"\s+", "", pr[cap_col].strip()).lower() if cap_col is not None and cap_col < len(pr) else ""
+                p_prev = _price_sig(pr)
+                same_cap = (cap_col is None) or (bool(c_cur) and c_cur == c_prev)
+                if same_cap and p_prev == p_cur and _models_compatible(m_prev, m_cur):
+                    cleaned_rows[prev_i] = _merge_dup_pair(pr, r)
+                    merged_into = prev_i
+                    break
+
+        if merged_into is not None:
+            step3_map[idx] = merged_into
+        else:
+            step3_map[idx] = len(cleaned_rows)
+            cleaned_rows.append(r)
 
     new_warnings: List[Dict[str, Any]] = []
     for w in (warnings or []):
         try:
             orig_r = int(w["row"])
-            if orig_r in step1_map and step1_map[orig_r] in step2_map:
+            if orig_r in step1_map and step1_map[orig_r] in step2_map and step2_map[step1_map[orig_r]] in step3_map:
                 new_warnings.append(
                     {
-                        "row": step2_map[step1_map[orig_r]],
+                        "row": step3_map[step2_map[step1_map[orig_r]]],
                         "col": int(w["col"]),
                         "reason": str(w.get("reason") or ""),
                     }
@@ -678,22 +737,86 @@ def _row_key_signature(row: List[str]) -> str:
     return "|".join(parts)
 
 
-def _dedupe_boundary_overlap(prev_rows: List[List[str]], next_rows: List[List[str]], max_window: int = 8) -> int:
-    """计算前后两段切片在重叠区域的重复行数，返回 next_rows 应跳过的起始下标。"""
+def _row_price_values(row: List[str]) -> tuple:
+    """提取行内从第 3 列起的数值价格序列，用于跨切片容错去重（抗机型名截断）。"""
+    vals: List[str] = []
+    for val in row[2:]:
+        v = re.sub(r"[¥$€£,\s]", "", str(val or ""))
+        if re.match(r"^\d+(\.\d+)?$", v):
+            vals.append(v)
+    return tuple(vals)
+
+
+def _rows_overlap_equivalent(prev_row: List[str], next_row: List[str]) -> bool:
+    """判断两段切片重叠处的两行是否为同一条数据（兼容切缝导致的短机型截断如 17 vs 17pro）。"""
+    if _row_signature(prev_row) == _row_signature(next_row):
+        return True
+    p_key = _row_key_signature(prev_row)
+    n_key = _row_key_signature(next_row)
+    if p_key.replace("|", "") and p_key == n_key:
+        p_prices = _row_price_values(prev_row)
+        n_prices = _row_price_values(next_row)
+        if not p_prices or not n_prices or p_prices == n_prices:
+            return True
+    # 容量一致 + 价格序列完全一致 + 机型名为兼容前缀/子串（如 17 vs 17pro）
+    cap_a = re.sub(r"\s+", "", str(prev_row[1] if len(prev_row) > 1 else "")).lower()
+    cap_b = re.sub(r"\s+", "", str(next_row[1] if len(next_row) > 1 else "")).lower()
+    p_prices = _row_price_values(prev_row)
+    n_prices = _row_price_values(next_row)
+    if cap_a and cap_a == cap_b and p_prices and p_prices == n_prices:
+        m_a = re.sub(r"[\s\-_/]+", "", str(prev_row[0] if prev_row else "")).lower()
+        m_b = re.sub(r"[\s\-_/]+", "", str(next_row[0] if next_row else "")).lower()
+        if not m_a or not m_b or m_a == m_b or m_a.startswith(m_b) or m_b.startswith(m_a) or m_a in m_b or m_b in m_a:
+            return True
+    return False
+
+
+def _merge_overlap_row(prev_row: List[str], next_row: List[str]) -> List[str]:
+    """重叠行合并：保留更完整的机型名，并补齐因切片裁剪丢失的右侧单元格内容。"""
+    m_a = re.sub(r"[\s\-_/]+", "", str(prev_row[0] if prev_row else "")).lower()
+    m_b = re.sub(r"[\s\-_/]+", "", str(next_row[0] if next_row else "")).lower()
+    score_a = (len(m_a), sum(1 for c in prev_row if str(c or "").strip()), sum(len(str(c or "")) for c in prev_row))
+    score_b = (len(m_b), sum(1 for c in next_row if str(c or "").strip()), sum(len(str(c or "")) for c in next_row))
+    primary, secondary = (list(prev_row), next_row) if score_a >= score_b else (list(next_row), prev_row)
+    max_len = max(len(primary), len(secondary))
+    while len(primary) < max_len:
+        primary.append("")
+    for i in range(max_len):
+        pv = str(primary[i] if i < len(primary) else "").strip()
+        sv = str(secondary[i] if i < len(secondary) else "").strip()
+        if not pv and sv:
+            primary[i] = sv
+    return primary
+
+
+def _dedupe_boundary_overlap(prev_rows: List[List[str]], next_rows: List[List[str]], max_window: int = 10) -> int:
+    """
+    计算前后两段切片在重叠区域的重复行数：
+    - 若匹配到切缝残缺行（如上段末行是 17、下段首行是 17pro 且容量与价格一致），
+      直接就地把上段末行升级为更完整的新行，再返回 next_rows 应跳过的起始下标。
+    """
     if not prev_rows or not next_rows:
         return 0
-    prev_tail = [_row_signature(r) for r in prev_rows[-max_window:]]
-    next_head = [_row_signature(r) for r in next_rows[:max_window]]
+    prev_tail_start = max(0, len(prev_rows) - max_window)
+    prev_tail = prev_rows[prev_tail_start:]
+    next_head = next_rows[:max_window]
     max_k = min(len(prev_tail), len(next_head))
     for k in range(max_k, 0, -1):
-        if prev_tail[-k:] == next_head[:k]:
+        if all(_rows_overlap_equivalent(prev_tail[-k + i], next_head[i]) for i in range(k)):
+            for i in range(k):
+                target_idx = len(prev_rows) - k + i
+                prev_rows[target_idx] = _merge_overlap_row(prev_rows[target_idx], next_head[i])
             return k
-    tail_set = set(s for s in prev_tail if s.replace("|", ""))
-    tail_keys = set(_row_key_signature(r) for r in prev_rows[-max_window:] if any(r[:2]))
+
     skip = 0
-    for idx, sig in enumerate(next_head[:4]):
-        key_sig = _row_key_signature(next_rows[idx])
-        if sig in tail_set or (key_sig.replace("|", "") and key_sig in tail_keys):
+    for idx in range(min(5, len(next_head))):
+        matched_prev: Optional[int] = None
+        for p_offset in range(len(prev_tail) - 1, -1, -1):
+            if _rows_overlap_equivalent(prev_tail[p_offset], next_head[idx]):
+                matched_prev = prev_tail_start + p_offset
+                break
+        if matched_prev is not None:
+            prev_rows[matched_prev] = _merge_overlap_row(prev_rows[matched_prev], next_head[idx])
             skip += 1
         else:
             break
@@ -792,6 +915,26 @@ def merge_quotation_slices(
     }
 
 
+def _parse_model_json(text_out: str) -> Dict[str, Any]:
+    """容错解析模型 JSON：自动剥离 Markdown 代码块、外围说明文字与尾随逗号。"""
+    raw = (text_out or "").strip()
+    if not raw:
+        raise ValueError("模型返回空响应")
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE | re.DOTALL).strip()
+    try:
+        return json.loads(cleaned, strict=False)
+    except json.JSONDecodeError:
+        pass
+    first_brace = cleaned.find("{")
+    last_brace = cleaned.rfind("}")
+    if first_brace != -1 and last_brace > first_brace:
+        candidate = cleaned[first_brace : last_brace + 1]
+        repaired = re.sub(r",\s*([}\]])", r"\1", candidate)
+        return json.loads(repaired, strict=False)
+    repaired = re.sub(r",\s*([}\]])", r"\1", cleaned)
+    return json.loads(repaired, strict=False)
+
+
 def extract_tables_from_image(
     image_bytes: bytes,
     filename: str,
@@ -803,10 +946,10 @@ def extract_tables_from_image(
     model_tier: str = "fast",
 ) -> Dict[str, Any]:
     """
-    核心图像表格提取函数：
-    - 默认采用极速高可靠模型 gemini-3.5-flash-lite（不输出重复 plain_text 节省 50% token，彻底告别 ReadTimeout 与半途截断）；
-    - 支持 model_tier='accurate' 切换旗舰模型 gemini-4-hydrogen；
-    - 遇 503/429/超时 自动切换备用模型。
+    核心图像表格提取函数（高可靠加固版）：
+    - 默认锁定极速稳定模型 gemini-3.5-flash-lite / gemini-3.1-flash-lite（绝不擅自切换易 503 的 Hydrogen）；
+    - 超时预算严格控制在 Vercel 60s 函数上限内（22s + 16s + 12s <= 52s）；
+    - 除 429/5xx/超时自动切换外，对空输出、畸形 JSON 或 0 行结果同样触发自动跨模型兜底重试。
     """
     api_key = _get_gemini_api_key()
     if force_demo or not api_key:
@@ -820,13 +963,16 @@ def extract_tables_from_image(
     env_model = _get_clean_env("GEMINI_MODEL")
 
     if model_tier == "accurate":
-        ordered = ["gemini-4-hydrogen", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+        raw_candidates = ["gemini-4-hydrogen", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+        timeout_budget = [24, 16, 12]
     else:
-        # 严格锁定极速稳定档：绝不擅自切换到容易 503/超时的 gemini-4-hydrogen
+        # 严格锁定极速稳定档：主备交替重试（去重后形成 主 -> 备 -> 主 的 3 次高可靠尝试）
         fast_primary = env_model if (env_model and "flash" in env_model.lower()) else DEFAULT_GEMINI_MODEL
-        ordered = [fast_primary, "gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]
+        fast_backup = "gemini-3.1-flash-lite" if fast_primary != "gemini-3.1-flash-lite" else "gemini-3.5-flash-lite"
+        raw_candidates = [fast_primary, fast_backup, fast_primary]
+        timeout_budget = [22, 16, 12]
 
-    candidate_models: List[str] = ordered[:3]
+    candidate_models: List[str] = raw_candidates[:3]
     primary_model = candidate_models[0]
 
     instruction = (
@@ -834,9 +980,10 @@ def extract_tables_from_image(
         "CRITICAL: Extract EVERY SINGLE ROW and EVERY table/block visible in this image from the very top to the very bottom. "
         "NEVER omit rows, NEVER omit price cells, NEVER stop after the first section, and NEVER truncate the output. "
         "IMPORTANT: When a model name cell spans multiple capacity rows (vertically merged cell like '17pro max' over 256G/512G/1TB), REPEAT the exact model name on EVERY row! "
+        "If a row at the very top or bottom border of a sliced image has its model name partially cut off or unreadable, DO NOT guess a truncated model name (for example do NOT turn '17pro' into '17'); either read the full exact model name clearly or omit the half-clipped edge row so the adjacent slice provides it cleanly. "
         "Do NOT include repeated sub-table header rows (like '型号 | 容量 | 靓机...') inside `rows`; instead represent each sub-block as an item in `sheets` with its exact `headers`. "
         "If a sub-table has '-' or blank placeholder columns (for example no highest price tier), KEEP that column slot so all blocks preserve consistent column structure and alignment. "
-        "Preserve EVERY Chinese character verbatim with 100% precision (e.g. '全套', '不需保修', '在保', '高保充新', '靓机', '小靓机', '小花', '蓝光/彩点', '扣费项', '电芯'). NEVER substitute lookalike Chinese characters and NEVER translate titles or section names into English. "
+        "Preserve EVERY Chinese character verbatim with 100% precision (e.g. '高保充新-全套', '不看保修', '不需保修', '在保', '靓机', '小靓机', '小花', '蓝光/彩点', '扣费项', '电芯'). NEVER substitute lookalike Chinese characters (e.g. never write '不有保修' for '不看保修', never write '一全套' for '-全套') and NEVER translate titles or section names into English. "
         "Set `title` to the main quotation header visible in the image (e.g. vendor name + date like '萧军强 靓机 11.24'). "
         "Put top/edge vendor rules, validity notices, or disclaimers outside data rows into `document_notes` (do NOT mix them into table rows). "
         "Preserve exact text, model names, capacities, numbers, range strings (e.g. '3200-3300'), '+50', and leading zeros (e.g. '001042'). "
@@ -853,12 +1000,14 @@ def extract_tables_from_image(
     }
 
     target_resolution = "ultra_high" if model_tier == "accurate" else "high"
-    resp = None
     used_model = primary_model
+    parsed: Optional[Dict[str, Any]] = None
     last_error = ""
+
     for attempt_idx, candidate in enumerate(candidate_models):
-        if attempt_idx == 2:
-            time.sleep(0.8)
+        if attempt_idx > 0:
+            time.sleep(0.5 * attempt_idx)
+        req_timeout = timeout_budget[min(attempt_idx, len(timeout_budget) - 1)]
         image_block: Dict[str, Any] = {
             "type": "image",
             "data": b64_data,
@@ -883,7 +1032,7 @@ def extract_tables_from_image(
                 GEMINI_INTERACTIONS_URL,
                 json=payload,
                 headers=headers,
-                timeout=36 if attempt_idx == 0 else 20,
+                timeout=req_timeout,
             )
             # 若个别端点暂不支持 resolution 字段则返回 400，立即剥离后原模型重试
             if resp.status_code == 400 and "resolution" in resp.text.lower():
@@ -892,40 +1041,43 @@ def extract_tables_from_image(
                     GEMINI_INTERACTIONS_URL,
                     json=payload,
                     headers=headers,
-                    timeout=36 if attempt_idx == 0 else 20,
+                    timeout=req_timeout,
                 )
         except requests.RequestException as exc:
             last_error = f"连接 Gemini 视觉识别服务超时或网络异常：{type(exc).__name__}"
-            resp = None
             continue
 
-        if resp.status_code == 200:
-            used_model = candidate
-            break
-
-        err_preview = resp.text[:240].replace(api_key, "***")
         if resp.status_code in (401, 403):
             raise RuntimeError("GEMINI_API_KEY 鉴权失败，请检查 Vercel 或 .env 中的密钥配置是否正确。")
         if resp.status_code in (429, 500, 502, 503, 504):
-            last_error = (
-                f"Gemini 模型 {candidate} 暂不可用 (HTTP {resp.status_code})：{err_preview}"
-            )
+            err_preview = resp.text[:240].replace(api_key, "***")
+            last_error = f"Gemini 模型 {candidate} 暂不可用 (HTTP {resp.status_code})：{err_preview}"
             continue
-        raise RuntimeError(f"Gemini 视觉识别接口返回异常 (HTTP {resp.status_code})：{err_preview}")
+        if resp.status_code != 200:
+            err_preview = resp.text[:240].replace(api_key, "***")
+            raise RuntimeError(f"Gemini 视觉识别接口返回异常 (HTTP {resp.status_code})：{err_preview}")
 
-    if resp is None or resp.status_code != 200:
+        try:
+            raw_json = resp.json()
+            text_out = _extract_text_from_interactions_response(raw_json).strip()
+            candidate_parsed = _parse_model_json(text_out)
+            sheets_val = candidate_parsed.get("sheets")
+            has_rows = isinstance(sheets_val, list) and any(
+                isinstance(s, dict) and isinstance(s.get("rows"), list) and len(s["rows"]) > 0
+                for s in sheets_val
+            )
+            if not has_rows:
+                last_error = f"Gemini 模型 {candidate} 返回空表格，正在切换模型重试"
+                continue
+            parsed = candidate_parsed
+            used_model = candidate
+            break
+        except Exception as exc:
+            last_error = f"Gemini 模型 {candidate} 返回结构解析异常（{type(exc).__name__}），正在自动重试"
+            continue
+
+    if parsed is None:
         raise RuntimeError(last_error or "Gemini 视觉识别服务暂时繁忙，请稍后重试。")
-
-    raw_json = resp.json()
-    text_out = _extract_text_from_interactions_response(raw_json).strip()
-    if not text_out:
-        raise RuntimeError("Gemini 模型未返回可解析的表格内容，请换一张更清晰的图片重试。")
-
-    try:
-        parsed = json.loads(text_out)
-    except json.JSONDecodeError:
-        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text_out, flags=re.IGNORECASE | re.DOTALL).strip()
-        parsed = json.loads(cleaned)
 
     stem = Path(filename or "extracted").stem
     normalized = normalize_table_grid(parsed, fallback_name=stem)

@@ -163,3 +163,145 @@ def load_object(storage_ref: str) -> Optional[bytes]:
             return alt.read_bytes()
         return None
     return local_path.read_bytes()
+
+
+def _parse_b2_object_key(storage_ref: str) -> str:
+    if not storage_ref:
+        return ""
+    if storage_ref.startswith("b2://"):
+        rest = storage_ref[len("b2://") :]
+        _, _, object_key = rest.partition("/")
+        return object_key.lstrip("/")
+    return storage_ref.lstrip("/")
+
+
+def _b2_post_with_retry(endpoint_path: str, payload: Dict[str, Any], timeout: int = 25) -> Dict[str, Any]:
+    auth = _authorize_b2()
+    url = f"{auth['api_url']}{endpoint_path}"
+    resp = requests.post(url, headers={"Authorization": auth["token"]}, json=payload, timeout=timeout)
+    if resp.status_code == 401:
+        auth = _authorize_b2(force_refresh=True)
+        url = f"{auth['api_url']}{endpoint_path}"
+        resp = requests.post(url, headers={"Authorization": auth["token"]}, json=payload, timeout=timeout)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Backblaze B2 接口 {endpoint_path} 调用失败 (HTTP {resp.status_code})：{resp.text[:180]}")
+    return resp.json()
+
+
+def _list_b2_file_versions(prefix: str = "", max_pages: int = 20) -> list[Dict[str, Any]]:
+    auth = _authorize_b2()
+    files: list[Dict[str, Any]] = []
+    start_name: Optional[str] = None
+    start_id: Optional[str] = None
+    for _ in range(max_pages):
+        body: Dict[str, Any] = {
+            "bucketId": auth["bucket_id"],
+            "maxFileCount": 1000,
+        }
+        if prefix:
+            body["prefix"] = prefix
+        if start_name:
+            body["startFileName"] = start_name
+        if start_id:
+            body["startFileId"] = start_id
+        data = _b2_post_with_retry("/b2api/v2/b2_list_file_versions", body)
+        batch = data.get("files") or []
+        files.extend(batch)
+        start_name = data.get("nextFileName")
+        start_id = data.get("nextFileId")
+        if not start_name:
+            break
+    return files
+
+
+def delete_object_versions(storage_ref: str) -> Dict[str, int]:
+    """物理删除单个对象在 Backblaze B2（含全部历史隐藏版本）或本地降级目录中的文件。"""
+    if not storage_ref:
+        return {"deleted_files": 0, "freed_bytes": 0}
+
+    deleted_files = 0
+    freed_bytes = 0
+
+    if storage_ref.startswith("b2://") and b2_is_enabled():
+        object_key = _parse_b2_object_key(storage_ref)
+        if not object_key:
+            return {"deleted_files": 0, "freed_bytes": 0}
+        versions = _list_b2_file_versions(prefix=object_key, max_pages=5)
+        for f in versions:
+            if f.get("fileName") != object_key:
+                continue
+            _b2_post_with_retry(
+                "/b2api/v2/b2_delete_file_version",
+                {"fileName": f["fileName"], "fileId": f["fileId"]},
+            )
+            deleted_files += 1
+            freed_bytes += int(f.get("contentLength") or 0)
+        return {"deleted_files": deleted_files, "freed_bytes": freed_bytes}
+
+    local_path = STORAGE_DIR / storage_ref.lstrip("/")
+    if local_path.exists() and local_path.is_file():
+        freed_bytes += local_path.stat().st_size
+        local_path.unlink(missing_ok=True)
+        deleted_files += 1
+    return {"deleted_files": deleted_files, "freed_bytes": freed_bytes}
+
+
+def delete_prefix_objects(prefix: str) -> Dict[str, int]:
+    """按前缀（例如 jobs/<job_uid>/）物理清空 B2 中所有文件及历史版本，或清理本地对应子目录。"""
+    clean_prefix = prefix.lstrip("/")
+    deleted_files = 0
+    freed_bytes = 0
+
+    if b2_is_enabled():
+        versions = _list_b2_file_versions(prefix=clean_prefix, max_pages=20)
+        for f in versions:
+            fname = f.get("fileName") or ""
+            if clean_prefix and not fname.startswith(clean_prefix):
+                continue
+            _b2_post_with_retry(
+                "/b2api/v2/b2_delete_file_version",
+                {"fileName": fname, "fileId": f["fileId"]},
+            )
+            deleted_files += 1
+            freed_bytes += int(f.get("contentLength") or 0)
+        return {"deleted_files": deleted_files, "freed_bytes": freed_bytes}
+
+    target_dir = STORAGE_DIR / clean_prefix if clean_prefix else STORAGE_DIR
+    if target_dir.exists():
+        for p in list(target_dir.rglob("*")):
+            if p.is_file():
+                freed_bytes += p.stat().st_size
+                p.unlink(missing_ok=True)
+                deleted_files += 1
+    return {"deleted_files": deleted_files, "freed_bytes": freed_bytes}
+
+
+def purge_bucket_files() -> Dict[str, int]:
+    """彻底清零 Backblaze B2 存储桶（或本地存储目录）内的全部文件及历史隐藏版本。"""
+    return delete_prefix_objects("")
+
+
+def get_storage_stats() -> Dict[str, Any]:
+    """查询当前 Backblaze B2 存储桶（或本地缓存）占用文件数与总字节数。"""
+    if b2_is_enabled():
+        versions = _list_b2_file_versions(prefix="", max_pages=20)
+        total_bytes = sum(int(f.get("contentLength") or 0) for f in versions)
+        return {
+            "backend": "b2",
+            "bucket": get_b2_bucket_name(),
+            "file_count": len(versions),
+            "total_bytes": total_bytes,
+        }
+    total_files = 0
+    total_bytes = 0
+    if STORAGE_DIR.exists():
+        for p in STORAGE_DIR.rglob("*"):
+            if p.is_file():
+                total_files += 1
+                total_bytes += p.stat().st_size
+    return {
+        "backend": "local",
+        "bucket": "",
+        "file_count": total_files,
+        "total_bytes": total_bytes,
+    }
