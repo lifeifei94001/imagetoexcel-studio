@@ -192,12 +192,12 @@ function detectExactHeaderBand(
   return { topY: hdrTop, bottomY: hdrBottom + 1, firstDataY };
 }
 
-/** 对整张超长图做轻量缩略灰度行扫描（最大高度 <= 8000px，永不触碰浏览器 Canvas 尺寸上限）。 */
+/** 对整张超长图做轻量灰度行扫描（兼顾 1px 细实线清晰度且不触碰浏览器 Canvas 尺寸上限）。 */
 function scanImageRows(img: HTMLImageElement, targetW: number, targetH: number): RowScanMetrics | null {
-  const widthScanScale = Math.min(1, 360 / Math.max(1, targetW));
-  const heightScanScale = Math.min(1, 8000 / Math.max(1, targetH));
+  const widthScanScale = Math.min(1, 560 / Math.max(1, targetW));
+  const heightScanScale = Math.min(1, 10000 / Math.max(1, targetH));
   const scanScale = Math.min(widthScanScale, heightScanScale);
-  const scanW = Math.max(120, Math.round(targetW * scanScale));
+  const scanW = Math.max(160, Math.round(targetW * scanScale));
   const scanH = Math.max(1, Math.round(targetH * scanScale));
 
   const canvas = document.createElement("canvas");
@@ -273,23 +273,29 @@ function findBestModelBoundaryCut(
   }
   const scanH = metrics.leftDarkRatio.length;
   const scaleBack = targetH / scanH;
-  const lo = Math.max(2, Math.floor(minY / scaleBack));
-  const hi = Math.min(scanH - 3, Math.ceil(maxY / scaleBack));
+  const lo = Math.max(4, Math.floor(minY / scaleBack));
+  const hi = Math.min(scanH - 5, Math.ceil(maxY / scaleBack));
   const idealScan = idealY / scaleBack;
 
   let bestScore = -1;
   let bestScanY = -1;
 
   for (let y = lo; y <= hi; y++) {
-    const lDark = Math.max(metrics.leftDarkRatio[y - 1], metrics.leftDarkRatio[y], metrics.leftDarkRatio[y + 1]);
-    const bDark = Math.max(metrics.bodyDarkRatio[y - 1], metrics.bodyDarkRatio[y], metrics.bodyDarkRatio[y + 1]);
+    const lDark = metrics.leftDarkRatio[y];
+    const bDark = metrics.bodyDarkRatio[y];
 
-    if (lDark >= 0.48 && bDark >= 0.48) {
-      const distPenalty = Math.abs(y - idealScan) / Math.max(1, hi - lo);
-      const score = lDark * 1.15 + bDark - distPenalty * 0.45;
-      if (score > bestScore) {
-        bestScore = score;
-        bestScanY = y;
+    // 必须为贯穿左侧型号列与表体的高覆盖实线（>= 0.76），且上下 3~4px 并非大片粗字体像素，
+    // 彻底杜绝把「15 PRO」等居大型号文字像素误判成横线而拦腰切开合并单元格！
+    if (lDark >= 0.76 && bDark >= 0.72) {
+      const aboveLeft = (metrics.leftDarkRatio[y - 3] + metrics.leftDarkRatio[y - 4]) * 0.5;
+      const belowLeft = (metrics.leftDarkRatio[y + 3] + metrics.leftDarkRatio[y + 4]) * 0.5;
+      if (aboveLeft < 0.35 && belowLeft < 0.35) {
+        const distPenalty = Math.abs(y - idealScan) / Math.max(1, hi - lo);
+        const score = lDark * 1.2 + bDark - distPenalty * 0.45;
+        if (score > bestScore) {
+          bestScore = score;
+          bestScanY = y;
+        }
       }
     }
   }

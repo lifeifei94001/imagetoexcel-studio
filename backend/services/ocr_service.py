@@ -837,6 +837,49 @@ def _global_post_clean_and_audit(sheet: Dict[str, Any]) -> Dict[str, Any]:
             new_rows.append(list(r))
             new_sems.append((m_cur, c_cur, p_cur))
 
+    # 1.5 网络型号分组一致性自动纠偏：
+    # 典型案例：过保 R63 把 A2639 第一行误延用上个机型名 '13 PRO MAX'，但同一 A2639 组后续 3 行均为 '13 PRO'
+    # 且容量严格递增（128 < 256 < 512 < 1T）且该误延用机型在前序已出现相同容量 -> 100% 确定性纠准为 '13 PRO'！
+    if code_col is not None:
+        sec_set_mid = set(new_sec_headers)
+        i_run = 0
+        while i_run < len(new_rows):
+            if i_run in sec_set_mid:
+                i_run += 1
+                continue
+            code_val = re.sub(r"\s+", "", str(new_rows[i_run][code_col] if code_col < len(new_rows[i_run]) else "")).lower()
+            if not code_val:
+                i_run += 1
+                continue
+            j_run = i_run + 1
+            while j_run < len(new_rows) and j_run not in sec_set_mid:
+                c_next = re.sub(r"\s+", "", str(new_rows[j_run][code_col] if code_col < len(new_rows[j_run]) else "")).lower()
+                if c_next != code_val:
+                    break
+                j_run += 1
+
+            run_len = j_run - i_run
+            if run_len >= 2:
+                # 检查该网络型号连续段内是否容量严格递增（无重启，排除如 华为 MATE XT2 灵盾防窥屏 2 行 + 普通版重启的情况）
+                gbs = [_cap_to_gb(new_sems[k][1]) for k in range(i_run, j_run)]
+                strictly_inc = all(g is not None for g in gbs) and all(gbs[t] < gbs[t + 1] for t in range(len(gbs) - 1))
+                if strictly_inc:
+                    models_in_run = [str(new_rows[k][model_col]).strip() for k in range(i_run, j_run)]
+                    norm_models = [new_sems[k][0] for k in range(i_run, j_run)]
+                    # 仅当边界第 1 行机型名与同组其余全部行不同，且与紧邻前一行机型名相同 -> 判定为上行多延 1 行
+                    if len(set(norm_models[1:])) == 1 and norm_models[0] != norm_models[1]:
+                        prev_m_norm = new_sems[i_run - 1][0] if (i_run > 0 and (i_run - 1) not in sec_set_mid) else ""
+                        if prev_m_norm and norm_models[0] == prev_m_norm:
+                            new_rows[i_run][model_col] = models_in_run[1]
+                            new_sems[i_run] = _extract_row_semantics(new_rows[i_run], roles)
+                    # 对称检查：仅当边界最后 1 行机型名与同组前面全部行不同，且与紧邻下一行机型名相同 -> 判定为下行提前拉 1 行
+                    elif len(set(norm_models[:-1])) == 1 and norm_models[-1] != norm_models[0]:
+                        next_m_norm = new_sems[j_run][0] if (j_run < len(new_rows) and j_run not in sec_set_mid) else ""
+                        if next_m_norm and norm_models[-1] == next_m_norm:
+                            new_rows[j_run - 1][model_col] = models_in_run[0]
+                            new_sems[j_run - 1] = _extract_row_semantics(new_rows[j_run - 1], roles)
+            i_run = j_run
+
     # 映射原有 warnings
     new_warnings: List[Dict[str, Any]] = []
     warn_keys: set = set()
@@ -895,13 +938,18 @@ def _global_post_clean_and_audit(sheet: Dict[str, Any]) -> Dict[str, Any]:
 
         is_descending_section = total_pairs >= 6 and (dec_pairs / total_pairs) >= 0.85
 
-        # 2. 逐行检查：同机型重复容量 / 全价位空缺 / 价格档位严重倒挂
-        seen_model_cap: Dict[Tuple[str, str], int] = {}
+        # 2. 逐行检查：同机型(同硬件编码)重复容量 / 容量列疑似错位成价格 / 全价位空缺 / 价格档位严重倒挂
+        seen_model_cap: Dict[Tuple[str, str, str], int] = {}
         for r_idx in seg:
             m_norm, c_norm, _ = new_sems[r_idx]
             nums = row_nums[r_idx]
+            code_norm = (
+                re.sub(r"\s+", "", str(new_rows[r_idx][code_col])).lower()
+                if code_col is not None and code_col < len(new_rows[r_idx])
+                else ""
+            )
             if m_norm and c_norm:
-                key = (m_norm, c_norm)
+                key = (m_norm, code_norm, c_norm)
                 if key in seen_model_cap:
                     target_c = cap_col if cap_col is not None else model_col
                     raw_m = str(new_rows[r_idx][model_col]).strip()
@@ -913,6 +961,16 @@ def _global_post_clean_and_audit(sheet: Dict[str, Any]) -> Dict[str, Any]:
                     )
                 else:
                     seen_model_cap[key] = r_idx
+
+            # 检查容量列是否误入非容量的大额价格数字（例如 2650 左移进了容量列）
+            if cap_col is not None and cap_col < len(new_rows[r_idx]):
+                raw_cap = str(new_rows[r_idx][cap_col]).strip()
+                if re.match(r"^\d{3,5}$", raw_cap) and _cap_to_gb(raw_cap) is None:
+                    _add_warn(
+                        r_idx,
+                        cap_col,
+                        f"自检提示：容量列数值「{raw_cap}」疑似价格左移错位，请对照原图核对",
+                    )
 
             if seg_has_prices and m_norm and (cap_col is None or c_norm) and not nums and price_cols:
                 _add_warn(r_idx, price_cols[0], "自检提示：该行未识别到价格数值，请对照原图补录")
@@ -1596,6 +1654,24 @@ def extract_tables_from_image(
     stem = Path(filename or "extracted").stem
     normalized = normalize_table_grid(parsed, fallback_name=stem)
     raw_sheets = [sh for sh in normalized["sheets"] if not _is_condition_legend_sheet(sh)] or normalized["sheets"]
+
+    # 若启用「仅提机型+价格列」，后处理兜底剥离模型因顶部列头锚定带出的右侧备注/扣费列
+    if prices_only:
+        for rsh in raw_sheets:
+            sh_hdrs = rsh.get("headers") or []
+            keep_cols = [i for i, h in enumerate(sh_hdrs) if not _is_note_header(h)]
+            if keep_cols and len(keep_cols) < len(sh_hdrs):
+                col_remap = {old_i: new_i for new_i, old_i in enumerate(keep_cols)}
+                rsh["headers"] = [sh_hdrs[i] for i in keep_cols]
+                old_types = rsh.get("col_types") or []
+                rsh["col_types"] = [old_types[i] if i < len(old_types) else "text" for i in keep_cols]
+                rsh["rows"] = [[r[i] if i < len(r) else "" for i in keep_cols] for r in (rsh.get("rows") or [])]
+                rsh["warnings"] = [
+                    {"row": w["row"], "col": col_remap[int(w["col"])], "reason": w.get("reason", "")}
+                    for w in (rsh.get("warnings") or [])
+                    if int(w.get("col", -1)) in col_remap
+                ]
+
     for rsh in raw_sheets:
         r_rows, r_warns = _clean_quotation_rows(
             rsh["headers"], rsh["rows"], rsh.get("warnings") or []
