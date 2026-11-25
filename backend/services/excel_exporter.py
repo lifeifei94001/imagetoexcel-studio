@@ -105,6 +105,9 @@ def _populate_worksheet(ws: Any, sheet_data: Dict[str, Any]) -> None:
     def _is_note_column(header_text: str) -> bool:
         return any(k in header_text for k in ("备注", "蓝光", "彩点", "面容", "拆修", "扣费", "说明"))
 
+    def _is_capacity_column(header_text: str) -> bool:
+        return any(k in header_text for k in ("容量", "内存", "配置", "规格"))
+
     # 写入第 1 行苹果绿表头
     for c_idx, h_text in enumerate(headers, start=1):
         cell = ws.cell(row=1, column=c_idx, value=h_text)
@@ -142,7 +145,8 @@ def _populate_worksheet(ws: Any, sheet_data: Dict[str, Any]) -> None:
                 cell.border = cell_border
                 continue
 
-            typed_val, num_fmt = _parse_typed_cell(raw_cell, c_type)
+            effective_type = "text" if _is_capacity_column(h_name) else c_type
+            typed_val, num_fmt = _parse_typed_cell(raw_cell, effective_type)
             cell = ws.cell(row=r_idx, column=c_idx, value=typed_val)
             cell.border = cell_border
 

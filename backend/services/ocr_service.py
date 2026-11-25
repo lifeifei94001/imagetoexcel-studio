@@ -3,7 +3,7 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -272,6 +272,128 @@ def _norm_header(h: str) -> str:
     return re.sub(r"[\s\-_/（）()]+", "", str(h or "").strip()).lower()
 
 
+_CAP_VALUE_RE = re.compile(r"^(?:32|64|128|256|512|1024)(?:g|gb)?$|^(?:1|2)t(?:b)?$", re.IGNORECASE)
+
+
+def _is_note_header(h: str) -> bool:
+    hn = _norm_header(h)
+    return any(k in hn for k in ("备注", "蓝光", "彩点", "面容", "拆修", "扣费", "说明", "规则", "note", "remark"))
+
+
+def _detect_column_roles(headers: List[str]) -> Dict[str, Any]:
+    """
+    动态识别报价单各列语义角色（彻底告别硬编码 row[1] 为容量）：
+    兼容 `型号 | 容量 | 价格...` 与 `型号 | 网络型号 | 容量 | 价格... | 扣费说明...` 等任意列布局。
+    """
+    sec_col: Optional[int] = None
+    model_col: Optional[int] = None
+    code_col: Optional[int] = None
+    cap_col: Optional[int] = None
+    note_cols: List[int] = []
+
+    normed = [_norm_header(h) for h in (headers or [])]
+
+    # 先精确匹配主型号列（避免被「网络型号」抢占）
+    for i, hn in enumerate(normed):
+        if hn == "分类区块":
+            sec_col = i
+        elif hn in {"型号", "机型", "model", "设备名称", "手机型号"} and model_col is None:
+            model_col = i
+
+    for i, hn in enumerate(normed):
+        if i in (sec_col, model_col):
+            continue
+        if code_col is None and any(k in hn for k in ("网络型号", "型号编码", "机器编码", "代号", "sku", "编码")):
+            code_col = i
+        elif model_col is None and any(k in hn for k in ("型号", "机型", "model", "设备")):
+            model_col = i
+        elif cap_col is None and any(k in hn for k in ("容量", "内存", "配置", "规格", "storage", "gb")):
+            cap_col = i
+        elif _is_note_header(headers[i]):
+            note_cols.append(i)
+
+    excluded = {c for c in (sec_col, model_col, code_col, cap_col) if c is not None} | set(note_cols)
+    price_cols = [i for i in range(len(normed)) if i not in excluded]
+    return {
+        "sec_col": sec_col,
+        "model_col": model_col,
+        "code_col": code_col,
+        "cap_col": cap_col,
+        "note_cols": note_cols,
+        "price_cols": price_cols,
+    }
+
+
+def _norm_cap_str(val: str) -> str:
+    s = re.sub(r"\s+", "", str(val or "").strip()).lower()
+    if s.endswith("gb"):
+        s = s[:-2] + "g"
+    elif s.endswith("tb"):
+        s = s[:-2] + "t"
+    return s
+
+
+def _cap_to_gb(val: str) -> Optional[int]:
+    s = _norm_cap_str(val)
+    if not s:
+        return None
+    m_t = re.match(r"^(\d+(?:\.\d+)?)t$", s)
+    if m_t:
+        return int(round(float(m_t.group(1)) * 1024))
+    m_g = re.match(r"^(\d+)g?$", s)
+    if m_g:
+        num = int(m_g.group(1))
+        if num in {16, 32, 64, 128, 256, 512, 1024, 2048}:
+            return num
+    return None
+
+
+def _extract_row_semantics(row: List[str], roles: Optional[Dict[str, Any]] = None) -> tuple[str, str, tuple]:
+    """按列语义提取 (normalized_model, normalized_capacity, price_tuple)。"""
+    r = row or []
+    model_col = roles.get("model_col") if roles else None
+    cap_col = roles.get("cap_col") if roles else None
+    code_col = roles.get("code_col") if roles else None
+    note_cols = set(roles.get("note_cols") or []) if roles else set()
+
+    if model_col is None and r:
+        model_col = 0
+    if cap_col is None:
+        # 动态兜底：在前 4 列中自动寻找形如 128/256G/512/1T 的容量单元格
+        for ci in range(1, min(4, len(r))):
+            if ci == code_col:
+                continue
+            cell_s = re.sub(r"\s+", "", str(r[ci] or ""))
+            if _CAP_VALUE_RE.match(cell_s):
+                cap_col = ci
+                break
+        if cap_col is None and len(r) > 1:
+            cap_col = 1
+
+    m_raw = str(r[model_col] if model_col is not None and model_col < len(r) else "").strip()
+    c_raw = str(r[cap_col] if cap_col is not None and cap_col < len(r) else "").strip()
+    m_norm = re.sub(r"[\s\-_/]+", "", m_raw).lower()
+    c_norm = _norm_cap_str(c_raw)
+
+    skip_set = {c for c in (model_col, cap_col, code_col, roles.get("sec_col") if roles else None) if c is not None} | note_cols
+    prices: List[str] = []
+    for ci, val in enumerate(r):
+        if ci in skip_set:
+            continue
+        v = re.sub(r"[¥$€£,\s]", "", str(val or ""))
+        if re.match(r"^\d+(\.\d+)?$", v):
+            prices.append(v)
+    return m_norm, c_norm, tuple(prices)
+
+
+def _models_compatible_norm(n1: str, n2: str) -> bool:
+    if not n1 or not n2:
+        return True
+    if n1 == n2:
+        return True
+    return n1.startswith(n2) or n2.startswith(n1) or (len(n1) >= 2 and n1 in n2) or (len(n2) >= 2 and n2 in n1)
+
+
 def _map_subsheet_columns(
     sh_headers: List[str],
     sh_types: List[str],
@@ -282,8 +404,9 @@ def _map_subsheet_columns(
 ) -> List[int]:
     """
     智能对齐同一报价单内各子表的列映射（0-indexed，直接对应原图真实列序，不增设分类列）：
-    1. 列数与主表相同时，直接按位置 1:1 对齐（型号/容量/各价位/面容/备注/扣费项全部留在原位）；
-    2. 列数少于主表时（如某区块省略了 '-' 占位列），先匹配已知锚点列名，剩余价位列自动右对齐填入空余价格槽位。
+    1. 列数与主表相同时，直接按位置 1:1 对齐；
+    2. 列数少于主表时，先按列名精确/规范化锚点对齐；剩余未匹配的价格列只落入空闲的价格槽位，
+       绝不会漂移挤进最右侧的「备注/扣费说明」槽位。
     """
     n = len(sh_headers)
     if n == master_len:
@@ -307,17 +430,23 @@ def _map_subsheet_columns(
             used_targets.add(t_col)
 
     unmatched_indices = [i for i, v in enumerate(assigned) if v is None]
-    free_slots = [c for c in range(master_len) if c not in used_targets]
+    unmatched_notes = [i for i in unmatched_indices if _is_note_header(sh_headers[i])]
+    unmatched_non_notes = [i for i in unmatched_indices if i not in unmatched_notes]
 
-    if unmatched_indices and len(free_slots) >= len(unmatched_indices):
-        offset = len(free_slots) - len(unmatched_indices)
-        for k, local_idx in enumerate(unmatched_indices):
-            assigned[local_idx] = free_slots[offset + k]
-            used_targets.add(free_slots[offset + k])
+    free_note_slots = [c for c in range(master_len) if c not in used_targets and _is_note_header(unified_headers[c])]
+    free_non_note_slots = [c for c in range(master_len) if c not in used_targets and not _is_note_header(unified_headers[c])]
+
+    # 1. 非备注列（如价格档位列）优先右对齐填入空闲的非备注槽位
+    if unmatched_non_notes and len(free_non_note_slots) >= len(unmatched_non_notes):
+        offset = len(free_non_note_slots) - len(unmatched_non_notes)
+        for k, local_idx in enumerate(unmatched_non_notes):
+            slot = free_non_note_slots[offset + k]
+            assigned[local_idx] = slot
+            used_targets.add(slot)
     else:
-        for local_idx in unmatched_indices:
-            if free_slots:
-                slot = free_slots.pop(0)
+        for local_idx in unmatched_non_notes:
+            if free_non_note_slots:
+                slot = free_non_note_slots.pop(0)
                 assigned[local_idx] = slot
                 used_targets.add(slot)
             else:
@@ -328,6 +457,20 @@ def _map_subsheet_columns(
                 unified_types.append(t if t in VALID_COL_TYPES else "text")
                 header_to_col[h_clean] = new_col
                 assigned[local_idx] = new_col
+
+    # 2. 备注/扣费说明列填入空闲备注槽位，不足时追加到最右侧
+    for local_idx in unmatched_notes:
+        if free_note_slots:
+            slot = free_note_slots.pop(0)
+            assigned[local_idx] = slot
+            used_targets.add(slot)
+        else:
+            h_clean = str(sh_headers[local_idx] or f"备注{local_idx + 1}").strip()
+            new_col = len(unified_headers)
+            unified_headers.append(h_clean)
+            unified_types.append("text")
+            header_to_col[h_clean] = new_col
+            assigned[local_idx] = new_col
 
     return [int(c if c is not None else 0) for c in assigned]
 
@@ -374,7 +517,7 @@ def merge_sheets_into_single_quotation(
         single = cleaned_sheets[0]
         single["name"] = final_name
         single.setdefault("section_header_rows", [])
-        return single
+        return _global_post_clean_and_audit(single)
 
     # 选用列数最完整（同列数取第 1 个）的子表作为顶部主表头
     master_sheet = max(cleaned_sheets, key=lambda s: len(s.get("headers") or []))
@@ -449,7 +592,7 @@ def merge_sheets_into_single_quotation(
             except Exception:
                 continue
 
-    return {
+    result_sheet = {
         "name": final_name,
         "headers": unified_headers,
         "col_types": unified_types,
@@ -458,6 +601,206 @@ def merge_sheets_into_single_quotation(
         "warnings": merged_warnings,
         "section_header_rows": section_header_rows,
     }
+    return _global_post_clean_and_audit(result_sheet)
+
+
+def _global_post_clean_and_audit(sheet: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    合表后全局二次精洗与异常逻辑自检（核心攻克超长图 13 混入 13 PRO 尾两行等跨块幽灵行）：
+    1. 严格保留 section_header_rows 不动，并在每个连续数据段内做 6 行回看窗口去重：
+       - 若本行与前 1~6 行中某行「容量一致 + 价格序列（>=2 列）完全一致」，且满足以下任一条件：
+         a) 机型名兼容（如 13 PRO vs 13、17pro vs 17 或同机型），或
+         b) 属于「容量回跳幽灵行」（当前行刚切入新机型且容量偏大如 512/1T，后续同机型行又从更小容量 128/256 重新起排），
+         则判定为切缝幽灵行并剔除，保留前序完整机型行与编码，同步平移 section_header_rows 和 warnings 索引。
+    2. 全局自检标黄（写入 warnings 供前端高亮复核）：
+       - 同区块同机型出现重复容量；
+       - 有效机型+容量行全价位缺失；
+       - 同行档位价格严重违背该区块主导的从左到右递减规律（跳升超 15%）。
+    """
+    headers: List[str] = sheet.get("headers") or []
+    rows: List[List[str]] = sheet.get("rows") or []
+    warnings: List[Dict[str, Any]] = list(sheet.get("warnings") or [])
+    sec_headers_set = set(int(x) for x in (sheet.get("section_header_rows") or []))
+
+    if not headers or not rows:
+        return sheet
+
+    roles = _detect_column_roles(headers)
+    model_col = roles["model_col"]
+    cap_col = roles["cap_col"]
+    code_col = roles["code_col"]
+    price_cols: List[int] = roles["price_cols"]
+
+    if model_col is None:
+        return sheet
+
+    # 预计算每行语义（型号/容量/容量GB/价格序列）
+    sem_list = [_extract_row_semantics(r, roles) for r in rows]
+
+    # 检测每行之后同机型是否出现容量明显回跳（例如 13 先出现 512/1T，后面又从 128 重新起排）
+    has_later_smaller_cap: List[bool] = [False] * len(rows)
+    for i in range(len(rows)):
+        if i in sec_headers_set:
+            continue
+        m_i, c_i, _ = sem_list[i]
+        gb_i = _cap_to_gb(c_i)
+        if not m_i or gb_i is None:
+            continue
+        for j in range(i + 1, min(len(rows), i + 6)):
+            if j in sec_headers_set:
+                break
+            m_j, c_j, _ = sem_list[j]
+            if m_j != m_i:
+                break
+            gb_j = _cap_to_gb(c_j)
+            if gb_j is not None and gb_j < gb_i:
+                has_later_smaller_cap[i] = True
+                break
+
+    new_rows: List[List[str]] = []
+    new_sec_headers: List[int] = []
+    idx_map: Dict[int, int] = {}
+    new_sems: List[tuple[str, str, tuple]] = []
+    segment_start = 0
+
+    for orig_i, r in enumerate(rows):
+        if orig_i in sec_headers_set:
+            idx_map[orig_i] = len(new_rows)
+            new_sec_headers.append(len(new_rows))
+            new_rows.append(list(r))
+            new_sems.append(("", "", ()))
+            segment_start = len(new_rows)
+            continue
+
+        m_cur, c_cur, p_cur = sem_list[orig_i]
+        matched_prev: Optional[int] = None
+
+        if len(p_cur) >= 2:
+            lookback_start = max(segment_start, len(new_rows) - 6)
+            for prev_i in range(len(new_rows) - 1, lookback_start - 1, -1):
+                m_prev, c_prev, p_prev = new_sems[prev_i]
+                same_cap = (cap_col is None) or (bool(c_cur) and c_cur == c_prev)
+                if same_cap and p_prev == p_cur:
+                    if _models_compatible_norm(m_prev, m_cur) or has_later_smaller_cap[orig_i]:
+                        matched_prev = prev_i
+                        break
+
+        if matched_prev is not None:
+            # 保留前序更完整机型（如 13 PRO + A2639），只补全空白的备注/非编码列，绝不用幽灵行的网络型号覆盖
+            pr = new_rows[matched_prev]
+            m_prev = new_sems[matched_prev][0]
+            prefer_cur_model = len(m_cur) > len(m_prev) and not has_later_smaller_cap[orig_i]
+            if prefer_cur_model and model_col < len(pr) and model_col < len(r):
+                pr[model_col] = r[model_col]
+                if code_col is not None and code_col < len(pr) and code_col < len(r) and str(r[code_col]).strip():
+                    pr[code_col] = r[code_col]
+                new_sems[matched_prev] = _extract_row_semantics(pr, roles)
+            for ci in range(min(len(pr), len(r))):
+                if ci in (model_col, code_col, cap_col):
+                    continue
+                if not str(pr[ci]).strip() and str(r[ci]).strip():
+                    pr[ci] = r[ci]
+            idx_map[orig_i] = matched_prev
+        else:
+            idx_map[orig_i] = len(new_rows)
+            new_rows.append(list(r))
+            new_sems.append((m_cur, c_cur, p_cur))
+
+    # 映射原有 warnings
+    new_warnings: List[Dict[str, Any]] = []
+    warn_keys: set = set()
+    for w in warnings:
+        try:
+            orig_r = int(w["row"])
+            col_c = int(w["col"])
+            if orig_r in idx_map:
+                nr = idx_map[orig_r]
+                if (nr, col_c) not in warn_keys:
+                    warn_keys.add((nr, col_c))
+                    new_warnings.append({"row": nr, "col": col_c, "reason": str(w.get("reason") or "")})
+        except Exception:
+            continue
+
+    # 全局逻辑自检（按区块段检查重复容量、缺价、价格档位倒挂）
+    sec_set_new = set(new_sec_headers)
+    segments: List[List[int]] = []
+    cur_seg: List[int] = []
+    for i in range(len(new_rows)):
+        if i in sec_set_new:
+            if cur_seg:
+                segments.append(cur_seg)
+                cur_seg = []
+        else:
+            cur_seg.append(i)
+    if cur_seg:
+        segments.append(cur_seg)
+
+    def _add_warn(r_idx: int, c_idx: int, reason: str) -> None:
+        if 0 <= c_idx < len(headers) and (r_idx, c_idx) not in warn_keys:
+            warn_keys.add((r_idx, c_idx))
+            new_warnings.append({"row": r_idx, "col": c_idx, "reason": reason})
+
+    for seg in segments:
+        # 1. 检测该段是否具备明显的「从左到右价格递减」主导趋势
+        dec_pairs = 0
+        total_pairs = 0
+        seg_has_prices = False
+        row_nums: Dict[int, List[Tuple[int, float]]] = {}
+        for r_idx in seg:
+            r = new_rows[r_idx]
+            nums: List[Tuple[int, float]] = []
+            for pc in price_cols:
+                if pc < len(r):
+                    v = re.sub(r"[¥$€£,\s]", "", str(r[pc] or ""))
+                    if re.match(r"^\d+(\.\d+)?$", v):
+                        nums.append((pc, float(v)))
+            row_nums[r_idx] = nums
+            if nums:
+                seg_has_prices = True
+            for k in range(len(nums) - 1):
+                total_pairs += 1
+                if nums[k][1] >= nums[k + 1][1]:
+                    dec_pairs += 1
+
+        is_descending_section = total_pairs >= 6 and (dec_pairs / total_pairs) >= 0.85
+
+        # 2. 逐行检查：同机型重复容量 / 全价位空缺 / 价格档位严重倒挂
+        seen_model_cap: Dict[Tuple[str, str], int] = {}
+        for r_idx in seg:
+            m_norm, c_norm, _ = new_sems[r_idx]
+            nums = row_nums[r_idx]
+            if m_norm and c_norm:
+                key = (m_norm, c_norm)
+                if key in seen_model_cap:
+                    target_c = cap_col if cap_col is not None else model_col
+                    raw_m = str(new_rows[r_idx][model_col]).strip()
+                    raw_c = str(new_rows[r_idx][cap_col]).strip() if cap_col is not None else c_norm
+                    _add_warn(
+                        r_idx,
+                        target_c,
+                        f"自检提示：同机型「{raw_m}」出现重复容量「{raw_c}」，请对照原图确认是否多识别行",
+                    )
+                else:
+                    seen_model_cap[key] = r_idx
+
+            if seg_has_prices and m_norm and (cap_col is None or c_norm) and not nums and price_cols:
+                _add_warn(r_idx, price_cols[0], "自检提示：该行未识别到价格数值，请对照原图补录")
+
+            if is_descending_section and len(nums) >= 2:
+                for k in range(len(nums) - 1):
+                    left_val = nums[k][1]
+                    right_col, right_val = nums[k + 1]
+                    if left_val > 0 and right_val > left_val * 1.15:
+                        _add_warn(
+                            r_idx,
+                            right_col,
+                            f"自检提示：该格价格 ({int(right_val)}) 高于左侧更高成色档位 ({int(left_val)})，疑似错位请核对",
+                        )
+
+    sheet["rows"] = new_rows
+    sheet["section_header_rows"] = new_sec_headers
+    sheet["warnings"] = new_warnings
+    return sheet
 
 
 def _clean_quotation_rows(
@@ -474,17 +817,12 @@ def _clean_quotation_rows(
     if not rows or not headers:
         return rows, warnings
 
-    model_col: Optional[int] = None
-    cap_col: Optional[int] = None
-    sec_col: Optional[int] = None
-    for i, h in enumerate(headers):
-        hn = _norm_header(h)
-        if hn == "分类区块":
-            sec_col = i
-        elif model_col is None and any(k in hn for k in ("型号", "机型", "model", "设备名称")):
-            model_col = i
-        elif cap_col is None and any(k in hn for k in ("容量", "内存", "配置", "规格")):
-            cap_col = i
+    roles = _detect_column_roles(headers)
+    model_col: Optional[int] = roles["model_col"]
+    cap_col: Optional[int] = roles["cap_col"]
+    sec_col: Optional[int] = roles["sec_col"]
+    code_col: Optional[int] = roles["code_col"]
+    note_cols_set = set(roles["note_cols"])
 
     if model_col is None:
         return rows, warnings
@@ -505,7 +843,7 @@ def _clean_quotation_rows(
     def _price_sig(r: List[str]) -> tuple:
         vals = []
         for idx, val in enumerate(r):
-            if idx in (model_col, cap_col, sec_col):
+            if idx in (model_col, cap_col, sec_col, code_col) or idx in note_cols_set:
                 continue
             v = re.sub(r"[¥$€£,\s]", "", str(val or ""))
             if re.match(r"^\d+(\.\d+)?$", v):
@@ -593,22 +931,22 @@ def _clean_quotation_rows(
         step2_map[idx] = len(step2_rows)
         step2_rows.append(r)
 
-    # 第三遍：智能消除相邻 1~2 行内的「同容量 + 同价格序列 + 截断/兼容机型名」重复行
-    # 典型案例：切片缝把 17pro 截断识别成 17，导致 `17 | 256G | 6700/6600/6350/6150` 紧挨 `17pro | 256G | 6700/6600/6350/6150`
+    # 第三遍：智能消除相邻 1~6 行内的「同容量 + 同价格序列 + 截断/兼容机型名」重复行
+    # 典型案例：切片缝把 17pro 截断成 17，或把 13 PRO 的 512/1T 错标成 13 / A2634
     cleaned_rows: List[List[str]] = []
     step3_map: Dict[int, int] = {}
     for idx, r in enumerate(step2_rows):
         m_cur = r[model_col].strip() if model_col < len(r) else ""
-        c_cur = re.sub(r"\s+", "", r[cap_col].strip()).lower() if cap_col is not None and cap_col < len(r) else ""
+        c_cur = _norm_cap_str(r[cap_col]) if cap_col is not None and cap_col < len(r) else ""
         p_cur = _price_sig(r)
 
         merged_into: Optional[int] = None
         if p_cur:
-            search_start = max(0, len(cleaned_rows) - 2)
+            search_start = max(0, len(cleaned_rows) - 6)
             for prev_i in range(len(cleaned_rows) - 1, search_start - 1, -1):
                 pr = cleaned_rows[prev_i]
                 m_prev = pr[model_col].strip() if model_col < len(pr) else ""
-                c_prev = re.sub(r"\s+", "", pr[cap_col].strip()).lower() if cap_col is not None and cap_col < len(pr) else ""
+                c_prev = _norm_cap_str(pr[cap_col]) if cap_col is not None and cap_col < len(pr) else ""
                 p_prev = _price_sig(pr)
                 same_cap = (cap_col is None) or (bool(c_cur) and c_cur == c_prev)
                 if same_cap and p_prev == p_cur and _models_compatible(m_prev, m_cur):
@@ -747,34 +1085,48 @@ def _row_price_values(row: List[str]) -> tuple:
     return tuple(vals)
 
 
-def _rows_overlap_equivalent(prev_row: List[str], next_row: List[str]) -> bool:
-    """判断两段切片重叠处的两行是否为同一条数据（兼容切缝导致的短机型截断如 17 vs 17pro）。"""
+def _rows_overlap_equivalent(
+    prev_row: List[str],
+    next_row: List[str],
+    prev_roles: Optional[Dict[str, Any]] = None,
+    next_roles: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """
+    动态列感知判断两段切片重叠处的两行是否为同一条数据：
+    - 兼容 `型号 | 容量 | 价格...` 与 `型号 | 网络型号 | 容量 | 价格...` 等多前置列结构；
+    - 兼容切缝导致的短机型截断（17 vs 17pro）或错标邻近机型（13 PRO 尾行被错套 13 / A2634）。
+    """
     if _row_signature(prev_row) == _row_signature(next_row):
         return True
-    p_key = _row_key_signature(prev_row)
-    n_key = _row_key_signature(next_row)
-    if p_key.replace("|", "") and p_key == n_key:
-        p_prices = _row_price_values(prev_row)
-        n_prices = _row_price_values(next_row)
+    m_a, cap_a, p_prices = _extract_row_semantics(prev_row, prev_roles)
+    m_b, cap_b, n_prices = _extract_row_semantics(next_row, next_roles)
+
+    if m_a and m_a == m_b and cap_a and cap_a == cap_b:
         if not p_prices or not n_prices or p_prices == n_prices:
             return True
-    # 容量一致 + 价格序列完全一致 + 机型名为兼容前缀/子串（如 17 vs 17pro）
-    cap_a = re.sub(r"\s+", "", str(prev_row[1] if len(prev_row) > 1 else "")).lower()
-    cap_b = re.sub(r"\s+", "", str(next_row[1] if len(next_row) > 1 else "")).lower()
-    p_prices = _row_price_values(prev_row)
-    n_prices = _row_price_values(next_row)
-    if cap_a and cap_a == cap_b and p_prices and p_prices == n_prices:
-        m_a = re.sub(r"[\s\-_/]+", "", str(prev_row[0] if prev_row else "")).lower()
-        m_b = re.sub(r"[\s\-_/]+", "", str(next_row[0] if next_row else "")).lower()
-        if not m_a or not m_b or m_a == m_b or m_a.startswith(m_b) or m_b.startswith(m_a) or m_a in m_b or m_b in m_a:
+
+    # 切缝处容量一致 + 价格序列（>=2 列）完全一致：
+    # 即使切片顶部漏掉合并单元格型号（导致错套成 13 / A2634 或截断成 17），也能精准识别为重复行
+    if cap_a and cap_a == cap_b and len(p_prices) >= 2 and p_prices == n_prices:
+        if _models_compatible_norm(m_a, m_b):
             return True
+        # 切缝边界强信号：>=3 个价位数字一字不差且容量相同，几乎必然是同一行重叠
+        if len(p_prices) >= 3:
+            return True
+    elif cap_a and cap_a == cap_b and p_prices and p_prices == n_prices and _models_compatible_norm(m_a, m_b):
+        return True
     return False
 
 
-def _merge_overlap_row(prev_row: List[str], next_row: List[str]) -> List[str]:
-    """重叠行合并：保留更完整的机型名，并补齐因切片裁剪丢失的右侧单元格内容。"""
-    m_a = re.sub(r"[\s\-_/]+", "", str(prev_row[0] if prev_row else "")).lower()
-    m_b = re.sub(r"[\s\-_/]+", "", str(next_row[0] if next_row else "")).lower()
+def _merge_overlap_row(
+    prev_row: List[str],
+    next_row: List[str],
+    prev_roles: Optional[Dict[str, Any]] = None,
+    next_roles: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """重叠行合并：保留更完整的机型名与对应编码，并补齐因切片裁剪丢失的右侧单元格内容。"""
+    m_a, _, _ = _extract_row_semantics(prev_row, prev_roles)
+    m_b, _, _ = _extract_row_semantics(next_row, next_roles)
     score_a = (len(m_a), sum(1 for c in prev_row if str(c or "").strip()), sum(len(str(c or "")) for c in prev_row))
     score_b = (len(m_b), sum(1 for c in next_row if str(c or "").strip()), sum(len(str(c or "")) for c in next_row))
     primary, secondary = (list(prev_row), next_row) if score_a >= score_b else (list(next_row), prev_row)
@@ -789,34 +1141,42 @@ def _merge_overlap_row(prev_row: List[str], next_row: List[str]) -> List[str]:
     return primary
 
 
-def _dedupe_boundary_overlap(prev_rows: List[List[str]], next_rows: List[List[str]], max_window: int = 10) -> int:
+def _dedupe_boundary_overlap(
+    prev_rows: List[List[str]],
+    next_rows: List[List[str]],
+    prev_headers: Optional[List[str]] = None,
+    next_headers: Optional[List[str]] = None,
+    max_window: int = 10,
+) -> int:
     """
-    计算前后两段切片在重叠区域的重复行数：
-    - 若匹配到切缝残缺行（如上段末行是 17、下段首行是 17pro 且容量与价格一致），
-      直接就地把上段末行升级为更完整的新行，再返回 next_rows 应跳过的起始下标。
+    计算前后两段切片在重叠区域的重复行数（动态适配任意前置列布局）：
+    - 若匹配到切缝残缺行或跨机型幽灵行，自动保留更完整的一方并跳过 next_rows 起始重复行。
     """
     if not prev_rows or not next_rows:
         return 0
+    prev_roles = _detect_column_roles(prev_headers) if prev_headers else None
+    next_roles = _detect_column_roles(next_headers) if next_headers else prev_roles
+
     prev_tail_start = max(0, len(prev_rows) - max_window)
     prev_tail = prev_rows[prev_tail_start:]
     next_head = next_rows[:max_window]
     max_k = min(len(prev_tail), len(next_head))
     for k in range(max_k, 0, -1):
-        if all(_rows_overlap_equivalent(prev_tail[-k + i], next_head[i]) for i in range(k)):
+        if all(_rows_overlap_equivalent(prev_tail[-k + i], next_head[i], prev_roles, next_roles) for i in range(k)):
             for i in range(k):
                 target_idx = len(prev_rows) - k + i
-                prev_rows[target_idx] = _merge_overlap_row(prev_rows[target_idx], next_head[i])
+                prev_rows[target_idx] = _merge_overlap_row(prev_rows[target_idx], next_head[i], prev_roles, next_roles)
             return k
 
     skip = 0
-    for idx in range(min(5, len(next_head))):
+    for idx in range(min(6, len(next_head))):
         matched_prev: Optional[int] = None
         for p_offset in range(len(prev_tail) - 1, -1, -1):
-            if _rows_overlap_equivalent(prev_tail[p_offset], next_head[idx]):
+            if _rows_overlap_equivalent(prev_tail[p_offset], next_head[idx], prev_roles, next_roles):
                 matched_prev = prev_tail_start + p_offset
                 break
         if matched_prev is not None:
-            prev_rows[matched_prev] = _merge_overlap_row(prev_rows[matched_prev], next_head[idx])
+            prev_rows[matched_prev] = _merge_overlap_row(prev_rows[matched_prev], next_head[idx], prev_roles, next_roles)
             skip += 1
         else:
             break
@@ -864,7 +1224,9 @@ def merge_quotation_slices(
             if same_name or (same_headers and is_continuation):
                 prev_rows = prev.get("rows") or []
                 next_rows = sh_copy.get("rows") or []
-                skip = _dedupe_boundary_overlap(prev_rows, next_rows)
+                skip = _dedupe_boundary_overlap(
+                    prev_rows, next_rows, prev.get("headers"), sh_copy.get("headers")
+                )
                 trimmed_next = next_rows[skip:]
                 if same_headers:
                     offset = len(prev_rows)
@@ -878,8 +1240,10 @@ def merge_quotation_slices(
                     continue
                 sh_copy["rows"] = trimmed_next
             else:
-                # 不同区块名或列数微差时，仍在相邻切片边界做 (型号+容量) 重叠去重
-                skip = _dedupe_boundary_overlap(prev.get("rows") or [], sh_copy.get("rows") or [])
+                # 不同区块名或列数微差时，仍在相邻切片边界做动态列感知去重
+                skip = _dedupe_boundary_overlap(
+                    prev.get("rows") or [], sh_copy.get("rows") or [], prev.get("headers"), sh_copy.get("headers")
+                )
                 sh_copy["rows"] = (sh_copy.get("rows") or [])[skip:]
             if sh_copy.get("rows"):
                 combined_raw_sheets.append(sh_copy)
@@ -944,6 +1308,7 @@ def extract_tables_from_image(
     custom_hint: str = "",
     merge_per_image: bool = True,
     model_tier: str = "fast",
+    prices_only: bool = False,
 ) -> Dict[str, Any]:
     """
     核心图像表格提取函数（高可靠加固版）：
@@ -975,16 +1340,24 @@ def extract_tables_from_image(
     candidate_models: List[str] = raw_candidates[:3]
     primary_model = candidate_models[0]
 
+    right_col_rule = (
+        "PRICES-ONLY MODE ENABLED: Extract ONLY the left identification columns (e.g. '型号', '网络型号', '容量/内存') and all numeric price tier columns (e.g. '靓机', '小花', '大花', '外爆', '内爆可测'). COMPLETELY SKIP long rightmost deduction/remark text columns ('备注', '扣费说明', '扣费项', '蓝光/彩点') to maximize speed and numeric precision. "
+        if prices_only
+        else "NEVER omit rightmost remark or deduction columns! Even if the rightmost columns contain dense multi-line Chinese rules (like '绿色-50 / 港澳版-150 / 像头水印-100 / 弹屏-450') or share a merged header ('扣费说明' / '备注'), ALWAYS include them faithfully as dedicated rightmost column(s). "
+    )
+
     instruction = (
         "You are an expert document and quotation-sheet OCR extraction engine. "
         "CRITICAL: Extract EVERY SINGLE ROW and EVERY table/block visible in this image from the very top to the very bottom. "
         "NEVER omit rows, NEVER omit price cells, NEVER stop after the first section, and NEVER truncate the output. "
-        "IMPORTANT: When a model name cell spans multiple capacity rows (vertically merged cell like '17pro max' over 256G/512G/1TB), REPEAT the exact model name on EVERY row! "
-        "If a row at the very top or bottom border of a sliced image has its model name partially cut off or unreadable, DO NOT guess a truncated model name (for example do NOT turn '17pro' into '17'); either read the full exact model name clearly or omit the half-clipped edge row so the adjacent slice provides it cleanly. "
+        "VISUAL HEADER ANCHOR RULE: If there is a bright RED horizontal divider bar near the top of the image, the strip ABOVE the red bar is a copied visual column-header reference from the top of the sheet—use it ONLY to keep exact column names and left-to-right column alignment, and put ONLY the data rows BELOW the red bar into `rows`. "
+        "IMPORTANT: When a model name cell (or model code cell like '13 PRO' / 'A2639') spans multiple capacity rows (vertically merged cell over 128/256/512/1T), REPEAT the exact model name and code on EVERY row belonging to that horizontal grid box! "
+        "NEVER pull a model name UPWARD from a lower horizontal border box onto orphan rows above the border line! If a row at the very top edge has a blank model cell separated by a dark horizontal border from the model below, leave its model cell empty '' or omit the clipped orphan row rather than assigning the NEXT model's name to it. "
         "Do NOT include repeated sub-table header rows (like '型号 | 容量 | 靓机...') inside `rows`; instead represent each sub-block as an item in `sheets` with its exact `headers`. "
         "If a sub-table has '-' or blank placeholder columns (for example no highest price tier), KEEP that column slot so all blocks preserve consistent column structure and alignment. "
-        "Preserve EVERY Chinese character verbatim with 100% precision (e.g. '高保充新-全套', '不看保修', '不需保修', '在保', '靓机', '小靓机', '小花', '蓝光/彩点', '扣费项', '电芯'). NEVER substitute lookalike Chinese characters (e.g. never write '不有保修' for '不看保修', never write '一全套' for '-全套') and NEVER translate titles or section names into English. "
-        "Set `title` to the main quotation header visible in the image (e.g. vendor name + date like '萧军强 靓机 11.24'). "
+        + right_col_rule
+        + "Preserve EVERY Chinese character verbatim with 100% precision (e.g. '高保充新-全套', '不看保修', '不需保修', '在保', '靓机', '小靓机', '小花', '大花', '外爆', '内爆可测', '网络型号', '蓝光/彩点', '扣费说明', '扣费项', '电芯'). NEVER substitute lookalike Chinese characters and NEVER translate titles or section names into English. "
+        "Set `title` to the main quotation header visible in the image (e.g. vendor name + date like '苹果行货 过保机 2026-11-25上午 回收报价'). "
         "Put top/edge vendor rules, validity notices, or disclaimers outside data rows into `document_notes` (do NOT mix them into table rows). "
         "Preserve exact text, model names, capacities, numbers, range strings (e.g. '3200-3300'), '+50', and leading zeros (e.g. '001042'). "
         "Every row in `rows` MUST have the exact same number of elements as `headers` (use empty string '' for blank cells). "

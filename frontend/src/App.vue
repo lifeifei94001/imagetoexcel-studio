@@ -333,6 +333,15 @@
                 </div>
 
                 <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px">
+                  <span style="font-size: 12.5px; font-weight: 600">右侧扣费备注列：</span>
+                  <el-switch
+                    v-model="pricesOnly"
+                    active-text="仅提机型+价格(更快)"
+                    inactive-text="完整保留扣费备注"
+                  />
+                </div>
+
+                <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px">
                   <span style="font-size: 12.5px; font-weight: 600">识别模型档位：</span>
                   <el-radio-group v-model="modelTier" size="small">
                     <el-radio value="fast">极速稳定 (Flash Lite)</el-radio>
@@ -668,7 +677,7 @@ import SpotlightCard from "./components/SpotlightCard.vue";
 import CommandPalette, { type CommandItem } from "./components/CommandPalette.vue";
 import TableEditorPanel from "./components/TableEditorPanel.vue";
 import { useTheme } from "./composables/useTheme";
-import { splitLongImageIntoSlices } from "./utils/imageCompressor";
+import { splitLongImageSmart } from "./utils/imageCompressor";
 import {
   clearAllRecords,
   clearStoredAuthToken,
@@ -718,6 +727,7 @@ const { theme, glass, activeTab } = useTheme();
 const mode = ref<"excel" | "text">("excel");
 const outputMode = ref<"all_in_one" | "per_image">("per_image");
 const mergePerImage = ref(true);
+const pricesOnly = ref(false);
 const modelTier = ref<"fast" | "accurate">("fast");
 const forceDemo = ref(false);
 const customHint = ref("");
@@ -950,7 +960,8 @@ async function startBatchExtraction() {
         progressItems.value[myIdx].status = "processing";
         progressItems.value[myIdx].message = "正在进行长图 AI 结构识别并归档 B2...";
         try {
-          const slices = await splitLongImageIntoSlices(qItem.file);
+          const slicePlan = await splitLongImageSmart(qItem.file);
+          const slices = slicePlan.files;
           if (slices.length <= 1) {
             const targetFile = slices[0] || qItem.file;
             const res = await processBatchJobItem({
@@ -962,6 +973,7 @@ async function startBatchExtraction() {
               customHint: customHint.value,
               mergePerImage: mergePerImage.value,
               modelTier: modelTier.value,
+              pricesOnly: pricesOnly.value,
             });
             collected[myIdx] = res.quotation;
             if (!res.quotation.is_demo) {
@@ -975,28 +987,33 @@ async function startBatchExtraction() {
             progressItems.value[myIdx].quoteTitle = res.quotation.quote_title;
             progressItems.value[myIdx].message = `识别完成 (${res.quotation.merged_sheet.rows.length} 行 · 已存对象存储)`;
           } else {
-            // 超长报价单自动切片识别 + 将首段表头延续传递给后续分段，防止断层丢价格列
-            const sliceResults: Record<string, unknown>[] = [];
-            let inheritedHeaderHint = customHint.value.trim();
-            for (let sIdx = 0; sIdx < slices.length; sIdx++) {
-              let sRes: Record<string, unknown> | null = null;
+            // 超长报价单智能找缝切片 + 第 1 段先提取精准列头，第 2..N 段双并发提取并带红线列头视觉锚定
+            const seamTag = slicePlan.seamMode === "smart_seam" ? "智能找缝" : "重叠防漏";
+            const anchorTag = slicePlan.hasHeaderAnchor ? "·列头锚定" : "";
+            const sliceResults: Array<Record<string, unknown> | null> = new Array(slices.length).fill(null);
+            let completedSlices = 0;
+
+            const runOneSlice = async (sIdx: number, hintStr: string): Promise<Record<string, unknown>> => {
               let lastSliceErr: unknown = null;
               const maxAttempts = 3;
               for (let attempt = 1; attempt <= maxAttempts; attempt++) {
                 progressItems.value[myIdx].message =
                   attempt === 1
-                    ? `检测到超长图，正在高清分段提取 (${sIdx + 1}/${slices.length} 段)...`
+                    ? `${seamTag}分 ${slices.length} 段${anchorTag}，并发提取 (${completedSlices}/${slices.length} 段已完成)...`
                     : `第 ${sIdx + 1}/${slices.length} 段遇网络或模型波动，正在自动重试 (${attempt}/${maxAttempts})...`;
                 try {
-                  sRes = await extractSlice({
+                  const res = await extractSlice({
                     file: slices[sIdx],
                     sliceIndex: sIdx,
                     mode: mode.value,
                     forceDemo: forceDemo.value,
-                    customHint: inheritedHeaderHint,
+                    customHint: hintStr,
                     modelTier: modelTier.value,
+                    pricesOnly: pricesOnly.value,
                   });
-                  break;
+                  completedSlices++;
+                  progressItems.value[myIdx].message = `${seamTag}分 ${slices.length} 段${anchorTag}，提取进度 (${completedSlices}/${slices.length})...`;
+                  return res;
                 } catch (err) {
                   lastSliceErr = err;
                   const status = axios.isAxiosError(err) ? err.response?.status : undefined;
@@ -1008,21 +1025,41 @@ async function startBatchExtraction() {
                   }
                 }
               }
-              if (!sRes) {
-                throw lastSliceErr instanceof Error ? lastSliceErr : new Error(`第 ${sIdx + 1} 段识别失败`);
-              }
-              sliceResults.push(sRes);
-              if (sIdx === 0) {
-                const rawList = (sRes.raw_sheets as Array<{ headers?: string[] }> | undefined) || [];
-                const firstHeaders = rawList[0]?.headers;
-                if (firstHeaders?.length) {
-                  const headerStr = firstHeaders.join(" | ");
-                  const contNote = `This slice continues the same quotation table. Keep the EXACT ${firstHeaders.length} columns in order: [${headerStr}]. Keep '-' or empty placeholder slots for missing tiers and do NOT shift prices left or omit price numbers.`;
-                  inheritedHeaderHint = inheritedHeaderHint ? `${inheritedHeaderHint}\n${contNote}` : contNote;
-                }
-              }
+              throw lastSliceErr instanceof Error ? lastSliceErr : new Error(`第 ${sIdx + 1} 段识别失败`);
+            };
+
+            // 1. 先提取第 1 段以获得最准确的列头结构
+            const baseHint = customHint.value.trim();
+            const firstRes = await runOneSlice(0, baseHint);
+            sliceResults[0] = firstRes;
+
+            let inheritedHeaderHint = baseHint;
+            const rawList = (firstRes.raw_sheets as Array<{ headers?: string[] }> | undefined) || [];
+            const firstHeaders = rawList[0]?.headers;
+            if (firstHeaders?.length) {
+              const headerStr = firstHeaders.join(" | ");
+              const contNote =
+                `This slice continues the same quotation table. Keep the EXACT ${firstHeaders.length} columns in order: [${headerStr}]. ` +
+                (slicePlan.hasHeaderAnchor
+                  ? "The top strip above the red horizontal bar is ONLY a visual header reference—extract ONLY data rows below the red bar. "
+                  : "") +
+                "Keep '-' or empty placeholder slots for missing tiers and do NOT shift prices left or omit rightmost columns.";
+              inheritedHeaderHint = inheritedHeaderHint ? `${inheritedHeaderHint}\n${contNote}` : contNote;
             }
-            progressItems.value[myIdx].message = `正在去重拼接 ${slices.length} 段结果并归档 B2...`;
+
+            // 2. 第 2..N 段采用 2 并发加速提取
+            let nextSliceIdx = 1;
+            const sliceWorker = async () => {
+              while (nextSliceIdx < slices.length) {
+                const curS = nextSliceIdx++;
+                sliceResults[curS] = await runOneSlice(curS, inheritedHeaderHint);
+              }
+            };
+            await Promise.all(
+              Array.from({ length: Math.min(2, slices.length - 1) }, () => sliceWorker())
+            );
+
+            progressItems.value[myIdx].message = `正在全局去重拼接 ${slices.length} 段并做异常自检...`;
             const committed = await commitSlicedQuotation({
               jobUid: createdJob.job_uid,
               itemIndex: myIdx,
@@ -1030,7 +1067,7 @@ async function startBatchExtraction() {
               fileSizeBytes: qItem.file.size,
               mode: mode.value,
               mergePerImage: mergePerImage.value,
-              sliceResults,
+              sliceResults: sliceResults.filter((x): x is Record<string, unknown> => x !== null),
             });
             if (!committed.quotation) {
               throw new Error("长图合并归档失败");
@@ -1044,9 +1081,13 @@ async function startBatchExtraction() {
               quotaRemaining.value = committed.quota.remaining;
               quotaLimit.value = committed.quota.daily_limit;
             }
+            const warnCnt = committed.quotation.merged_sheet.warnings?.length || 0;
             progressItems.value[myIdx].status = "completed";
             progressItems.value[myIdx].quoteTitle = committed.quotation.quote_title;
-            progressItems.value[myIdx].message = `长图 ${slices.length} 段拼接完成 (${committed.quotation.merged_sheet.rows.length} 行 · 已存 B2)`;
+            progressItems.value[myIdx].message =
+              warnCnt > 0
+                ? `${seamTag} ${slices.length} 段完成 (${committed.quotation.merged_sheet.rows.length} 行 · ${warnCnt} 处自检提醒)`
+                : `${seamTag} ${slices.length} 段完成 (${committed.quotation.merged_sheet.rows.length} 行 · 已存 B2)`;
           }
 
           // 实时把已完成报价单展示进工作台

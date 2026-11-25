@@ -301,6 +301,7 @@ export async function processBatchJobItem(params: {
   customHint?: string;
   mergePerImage: boolean;
   modelTier?: "fast" | "accurate";
+  pricesOnly?: boolean;
 }): Promise<{
   job_uid: string;
   item: BatchJobItem;
@@ -314,6 +315,7 @@ export async function processBatchJobItem(params: {
   formData.append("force_demo", String(params.forceDemo));
   formData.append("merge_per_image", String(params.mergePerImage));
   formData.append("model_tier", params.modelTier || "fast");
+  formData.append("prices_only", String(Boolean(params.pricesOnly)));
   if (params.customHint?.trim()) {
     formData.append("custom_hint", params.customHint.trim());
   }
@@ -330,6 +332,7 @@ export async function extractSlice(params: {
   forceDemo: boolean;
   customHint?: string;
   modelTier?: "fast" | "accurate";
+  pricesOnly?: boolean;
 }): Promise<Record<string, unknown>> {
   const formData = new FormData();
   formData.append("file", params.file);
@@ -337,6 +340,7 @@ export async function extractSlice(params: {
   formData.append("mode", params.mode);
   formData.append("force_demo", String(params.forceDemo));
   formData.append("model_tier", params.modelTier || "fast");
+  formData.append("prices_only", String(Boolean(params.pricesOnly)));
   if (params.customHint?.trim()) {
     formData.append("custom_hint", params.customHint.trim());
   }
