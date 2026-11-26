@@ -47,6 +47,7 @@ export interface QuotaInfo {
   quota_date: string;
   used_count: number;
   daily_limit: number;
+  unlimited?: boolean;
   remaining: number;
   gemini_configured?: boolean;
   model?: string;
@@ -267,6 +268,19 @@ export async function fetchHealth() {
 
 export async function fetchQuota(): Promise<QuotaInfo> {
   const { data } = await http.get<QuotaInfo>("/quota");
+  return data;
+}
+
+export async function updateQuotaConfig(params: {
+  dailyLimit?: number;
+  unlimited?: boolean;
+  resetUsed?: boolean;
+}): Promise<QuotaInfo> {
+  const payload: Record<string, unknown> = {};
+  if (params.dailyLimit !== undefined) payload.daily_limit = params.dailyLimit;
+  if (params.unlimited !== undefined) payload.unlimited = params.unlimited;
+  if (params.resetUsed !== undefined) payload.reset_used = params.resetUsed;
+  const { data } = await http.put<QuotaInfo>("/quota", payload);
   return data;
 }
 

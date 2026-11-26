@@ -146,20 +146,16 @@
       </nav>
 
       <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap">
-        <span v-if="b2Configured" class="gem-pill pill-sky">Backblaze B2 已挂载</span>
         <span class="gem-pill" :class="geminiConfigured ? 'pill-emerald' : 'pill-gold'">
-          {{ geminiConfigured ? `AI 就绪 · ${activeModel}` : "免 Key 演示就绪" }}
+          {{ geminiConfigured ? activeModel : "演示模式" }}
         </span>
+        <span v-if="b2Configured" class="gem-pill pill-sky">B2 云存档</span>
 
-        <el-select v-model="theme" size="small" style="width: 122px" aria-label="切换主题">
-          <el-option label="🌸 霞光毛玻璃" value="aurora" />
-          <el-option label="🌌 星云毛玻璃" value="nebula" />
-          <el-option label="🏛️ 先锋杂志风" value="editorial" />
+        <el-select v-model="theme" size="small" style="width: 112px" aria-label="切换主题">
+          <el-option label="🌸 霞光" value="aurora" />
+          <el-option label="🌌 星云" value="nebula" />
+          <el-option label="🏛️ 杂志" value="editorial" />
         </el-select>
-
-        <el-button size="small" @click="glass = !glass">
-          {{ glass ? "毛玻璃: 开" : "毛玻璃: 关" }}
-        </el-button>
 
         <el-button size="small" @click="paletteVisible = true">⌘K</el-button>
 
@@ -173,10 +169,12 @@
     <main class="main-container">
       <!-- ==================== 工作台主视图 ==================== -->
       <template v-if="activeTab === 'workspace'">
-        <section class="hero-section">
-          <h1 class="hero-title">将报价单与多场景表格图片转为可编辑 Excel</h1>
-          <p class="hero-subtitle">
-            支持手机/平板超长报价单、财务报表、发票明细、库存单、排班考勤等各类表格图片。自动识别文档场景并匹配对应排版风格，支持批量 20 张长图切片提取与 <code>.xlsx</code> / <code>.zip</code> 一键导出。
+        <section class="hero-section" style="padding: 16px 0 18px">
+          <h1 class="hero-title" style="font-size: clamp(1.45rem, 2.6vw, 2rem); margin-bottom: 6px">
+            图片智能转 Excel 工作台
+          </h1>
+          <p class="hero-subtitle" style="margin-bottom: 14px">
+            支持手机/平板超长报价单、财务报表、发票明细与各类办公表格，智能找缝切片并自动归档至 Backblaze B2。
           </p>
 
           <div class="mode-switch-wrap" role="tablist" aria-label="转换模式">
@@ -202,7 +200,7 @@
         <!-- 双栏队列式上传工作台 -->
         <section class="glass-strong uploader-shell">
           <div class="uploader-grid">
-            <!-- 左栏：拖拽 / 粘贴 / 浏览 / 示例试用 -->
+            <!-- 左栏：拖拽 / 粘贴 / 浏览 -->
             <div
               class="dropzone-box"
               :class="{ 'is-dragover': isDragging }"
@@ -227,35 +225,24 @@
                 <UploadFilled />
               </el-icon>
               <div style="font-weight: 700; font-size: 16px; color: var(--glass-text)">
-                拖拽多张报价单图片到此处、点击浏览，或 <kbd>Ctrl+V</kbd> 粘贴截图
+                拖拽表格图片到此处、点击浏览，或 <kbd>Ctrl+V</kbd> 粘贴截图
               </div>
               <div class="glass-muted" style="font-size: 13px">
-                支持 JPG, PNG, GIF, WEBP, JFIF, HEIC · 单张上限 10MB（单批最多 20 张长图，保宽高清直传）
+                支持 JPG, PNG, WEBP, GIF, HEIC · 单张上限 10MB · 单批最多 20 张长图
               </div>
-              <div style="display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; margin-top: 6px" @click.stop>
+              <div style="display: flex; gap: 10px; justify-content: center; margin-top: 6px" @click.stop>
                 <el-button type="primary" @click="fileInputRef?.click()">选择图片文件</el-button>
-                <el-button @click="loadSampleImages(['sample-inventory-table.png'])">
-                  试玩：单张库存表
-                </el-button>
-                <el-button @click="loadSampleImages(['sample-inventory-table.png', 'sample-finance-report.png'])">
-                  试玩：多图批量打包
-                </el-button>
               </div>
             </div>
 
-            <!-- 右栏：待转换队列 + 报价单模式配置 + 转换按钮 -->
+            <!-- 右栏：待转换队列 + 核心参数 + 自定义额度 + 转换按钮 -->
             <div class="queue-panel">
               <div>
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px">
                   <span style="font-weight: 700; font-size: 14px">
                     待处理队列 (<span class="num-tabular">{{ queue.length }}</span>/20)
                   </span>
-                  <el-checkbox v-if="!geminiConfigured" v-model="forceDemo" size="small" disabled>
-                    演示提取模式
-                  </el-checkbox>
-                  <el-checkbox v-else v-model="forceDemo" size="small">
-                    演示模式试玩
-                  </el-checkbox>
+                  <span v-if="!geminiConfigured" class="gem-pill pill-gold">未配置 Key · 演示模式</span>
                 </div>
 
                 <div
@@ -315,65 +302,112 @@
               </div>
 
               <div style="display: flex; flex-direction: column; gap: 10px; margin-top: 10px">
-                <el-input
-                  v-model="customHint"
-                  size="small"
-                  clearable
-                  placeholder="可选识别提示（如：保留前导零、价格按列对齐、备注放提示栏）"
-                />
-
-                <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px">
-                  <span style="font-size: 12.5px; font-weight: 600">场景识别模式：</span>
-                  <el-radio-group v-model="docType" size="small">
-                    <el-radio value="auto">✨ 智能自动</el-radio>
-                    <el-radio value="quotation">📱 报价单专精</el-radio>
-                    <el-radio value="general">📊 通用表格</el-radio>
-                  </el-radio-group>
-                </div>
-
-                <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px">
-                  <span style="font-size: 12.5px; font-weight: 600">单图多表处理：</span>
-                  <el-switch
-                    v-model="mergePerImage"
-                    active-text="1图合为1个Sheet"
-                    inactive-text="保留多子表"
-                  />
-                </div>
-
+                <!-- 高频核心参数直出 -->
                 <div
-                  v-if="docType !== 'general'"
-                  style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px"
+                  class="glass"
+                  style="padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; border-radius: var(--glass-radius-sm)"
                 >
-                  <span style="font-size: 12.5px; font-weight: 600">报价单右侧备注列：</span>
-                  <el-switch
-                    v-model="pricesOnly"
-                    active-text="仅提机型+价格(更快)"
-                    inactive-text="完整保留扣费备注"
-                  />
+                  <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px">
+                    <span style="font-size: 12.5px; font-weight: 600">场景识别：</span>
+                    <el-radio-group v-model="docType" size="small">
+                      <el-radio value="auto">✨ 智能自动</el-radio>
+                      <el-radio value="quotation">📱 报价单</el-radio>
+                      <el-radio value="general">📊 通用表</el-radio>
+                    </el-radio-group>
+                  </div>
+
+                  <div
+                    v-if="docType !== 'general'"
+                    style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px"
+                  >
+                    <span style="font-size: 12.5px; font-weight: 600">右侧备注列：</span>
+                    <el-switch
+                      v-model="pricesOnly"
+                      active-text="仅提机型+价格"
+                      inactive-text="完整保留"
+                    />
+                  </div>
                 </div>
 
-                <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px">
-                  <span style="font-size: 12.5px; font-weight: 600">识别模型档位：</span>
-                  <el-radio-group v-model="modelTier" size="small">
-                    <el-radio value="fast">极速稳定 (Flash Lite)</el-radio>
-                    <el-radio value="accurate">旗舰精读 (Hydrogen)</el-radio>
-                  </el-radio-group>
+                <!-- 低频高级选项折叠区 -->
+                <div
+                  class="glass"
+                  style="padding: 8px 12px; border-radius: var(--glass-radius-sm)"
+                >
+                  <button
+                    type="button"
+                    style="
+                      width: 100%;
+                      display: flex;
+                      align-items: center;
+                      justify-content: space-between;
+                      background: transparent;
+                      border: none;
+                      padding: 2px 0;
+                      cursor: pointer;
+                      color: var(--glass-text);
+                      font-size: 12.5px;
+                      font-weight: 600;
+                    "
+                    @click="showAdvancedOptions = !showAdvancedOptions"
+                  >
+                    <span>高级选项</span>
+                    <span class="glass-muted" style="font-weight: 400; font-size: 12px">
+                      {{ modelTier === "fast" ? "Flash Lite" : "Hydrogen" }} ·
+                      {{ mergePerImage ? "单图合表" : "保留子表" }} ·
+                      {{ showAdvancedOptions ? "收起 ▲" : "展开 ▼" }}
+                    </span>
+                  </button>
+
+                  <div
+                    v-if="showAdvancedOptions"
+                    style="display: flex; flex-direction: column; gap: 9px; margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--glass-border)"
+                  >
+                    <el-input
+                      v-model="customHint"
+                      size="small"
+                      clearable
+                      placeholder="可选提示词（如：保留前导零、备注放提示栏）"
+                    />
+                    <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px">
+                      <span style="font-size: 12px; font-weight: 600">单图多表处理：</span>
+                      <el-switch
+                        v-model="mergePerImage"
+                        active-text="合为1个Sheet"
+                        inactive-text="保留多子表"
+                      />
+                    </div>
+                    <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px">
+                      <span style="font-size: 12px; font-weight: 600">识别模型档位：</span>
+                      <el-radio-group v-model="modelTier" size="small">
+                        <el-radio value="fast">极速稳定</el-radio>
+                        <el-radio value="accurate">旗舰精读</el-radio>
+                      </el-radio-group>
+                    </div>
+                    <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px">
+                      <span style="font-size: 12px; font-weight: 600">多图默认打包：</span>
+                      <el-radio-group v-model="outputMode" size="small">
+                        <el-radio value="per_image">一图一表 (.zip)</el-radio>
+                        <el-radio value="all_in_one">合并多 Sheet</el-radio>
+                      </el-radio-group>
+                    </div>
+                  </div>
                 </div>
 
-                <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px">
-                  <span style="font-size: 12.5px; font-weight: 600">多图默认打包：</span>
-                  <el-radio-group v-model="outputMode" size="small">
-                    <el-radio value="per_image">一图一表 (多图打包 .zip)</el-radio>
-                    <el-radio value="all_in_one">合并多 Sheet</el-radio>
-                  </el-radio-group>
-                </div>
-
+                <!-- 自定义每日额度条 -->
                 <div
                   class="gem-pill pill-sky"
-                  style="justify-content: space-between; padding: 7px 12px; border-radius: var(--glass-radius-sm)"
+                  style="justify-content: space-between; padding: 6px 10px 6px 12px; border-radius: var(--glass-radius-sm)"
                 >
-                  <span>今日剩余免费额度</span>
-                  <span class="num-tabular">{{ quotaRemaining }} / {{ quotaLimit }} 次</span>
+                  <span style="font-size: 12.5px">今日剩余免费额度</span>
+                  <div style="display: flex; align-items: center; gap: 8px">
+                    <span class="num-tabular" style="font-weight: 700">
+                      {{ quotaUnlimited ? `不限次（已用 ${quotaUsed}）` : `${quotaRemaining} / ${quotaLimit} 次` }}
+                    </span>
+                    <el-button size="small" text type="primary" style="padding: 2px 6px; height: auto" @click="openQuotaDialog">
+                      设置
+                    </el-button>
+                  </div>
                 </div>
 
                 <div style="display: flex; gap: 10px">
@@ -387,15 +421,11 @@
                     :disabled="queue.length === 0"
                     @click="startBatchExtraction"
                   >
-                    {{ extracting ? `正在后台分片处理 (${doneCount}/${progressItems.length})...` : "开始提取并归档对象存储" }}
+                    {{ extracting ? `正在后台分片处理 (${doneCount}/${progressItems.length})...` : "开始提取并归档" }}
                   </el-button>
                 </div>
               </div>
             </div>
-          </div>
-
-          <div class="glass-muted" style="text-align: center; font-size: 12.5px; margin-top: 12px">
-            * 批量任务采用单图独立分片执行，长报价单最长支持 40 秒深度提取；成品自动存入 Backblaze B2，可随时在「转换记录」下载。
           </div>
         </section>
 
@@ -470,29 +500,12 @@
             @clear-draft="clearDraft"
           />
         </div>
-
-        <!-- 高频场景 Bento 卡片 -->
-        <section style="margin-top: 32px">
-          <h2 class="section-heading">专为报价单与长图表格打造的增强能力</h2>
-          <p class="section-sub">从手机长截图到多商家比价归档，一次配置全自动跑完。</p>
-          <div class="bento-grid">
-            <SpotlightCard v-for="card in useCases" :key="card.title">
-              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px">
-                <span style="font-weight: 700; font-size: 15px">{{ card.title }}</span>
-                <span class="gem-pill" :class="card.pillClass">{{ card.tag }}</span>
-              </div>
-              <p class="glass-muted" style="margin: 0; font-size: 13.5px; line-height: 1.6">
-                {{ card.desc }}
-              </p>
-            </SpotlightCard>
-          </div>
-        </section>
       </template>
 
       <!-- ==================== 使用指南视图 ==================== -->
       <section v-else-if="activeTab === 'guide'" class="glass-strong" style="padding: 24px">
-        <h2 class="section-heading">4 步批量搞定报价单图片转 Excel</h2>
-        <p class="section-sub">单图自动合表 + 多图进度后台归档至 Backblaze B2，再也不必守在电脑前。</p>
+        <h2 class="section-heading">4 步高效完成图片转 Excel</h2>
+        <p class="section-sub">兼容手机/平板超长报价单与财务/发票/库存等通用表格，自动切片识别并归档至 Backblaze B2。</p>
         <div class="bento-grid">
           <SpotlightCard v-for="(step, idx) in guideSteps" :key="step.title">
             <span class="gem-pill pill-violet" style="margin-bottom: 10px">STEP 0{{ idx + 1 }}</span>
@@ -673,6 +686,84 @@
     </footer>
 
     <CommandPalette v-model:visible="paletteVisible" :commands="commandItems" />
+
+    <!-- 自定义每日额度设置弹窗 -->
+    <el-dialog
+      v-model="quotaDialogVisible"
+      title="自定义每日免费额度"
+      width="420px"
+      align-center
+      destroy-on-close
+    >
+      <div style="display: flex; flex-direction: column; gap: 16px">
+        <div
+          class="glass"
+          style="padding: 10px 14px; display: flex; align-items: center; justify-content: space-between; border-radius: var(--glass-radius-sm)"
+        >
+          <span style="font-size: 13px">今日已使用次数</span>
+          <div style="display: flex; align-items: center; gap: 10px">
+            <span class="num-tabular" style="font-weight: 700; font-size: 15px">{{ quotaUsed }} 次</span>
+            <el-button
+              size="small"
+              type="warning"
+              plain
+              :disabled="quotaUsed === 0 || savingQuota"
+              @click="handleResetQuotaUsed"
+            >
+              重置今日已用
+            </el-button>
+          </div>
+        </div>
+
+        <div style="display: flex; align-items: center; justify-content: space-between">
+          <div>
+            <div style="font-weight: 600; font-size: 13.5px">不限次模式</div>
+            <div class="glass-muted" style="font-size: 12px">开启后关闭每日上限校验，适合大批量集中处理</div>
+          </div>
+          <el-switch v-model="quotaFormUnlimited" />
+        </div>
+
+        <div v-if="!quotaFormUnlimited" style="display: flex; flex-direction: column; gap: 10px">
+          <div style="display: flex; align-items: center; justify-content: space-between">
+            <span style="font-weight: 600; font-size: 13.5px">每日上限次数</span>
+            <el-input-number
+              v-model="quotaFormLimit"
+              :min="1"
+              :max="100000"
+              :step="50"
+              size="default"
+              style="width: 170px"
+            />
+          </div>
+          <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap">
+            <span class="glass-muted" style="font-size: 12px">快捷设定：</span>
+            <el-button
+              v-for="preset in [50, 200, 500, 1000]"
+              :key="preset"
+              size="small"
+              :type="quotaFormLimit === preset ? 'primary' : 'default'"
+              plain
+              @click="quotaFormLimit = preset"
+            >
+              {{ preset }} 次
+            </el-button>
+          </div>
+        </div>
+
+        <div class="glass-muted" style="font-size: 12px; line-height: 1.5">
+          保存后将写入数据库，立即对今日及后续每天持续生效。
+        </div>
+      </div>
+
+      <template #footer>
+        <div style="display: flex; justify-content: flex-end; gap: 8px">
+          <el-button @click="quotaDialogVisible = false">取消</el-button>
+          <el-button type="primary" :loading="savingQuota" @click="handleSaveQuotaConfig">
+            保存并持久生效
+          </el-button>
+        </div>
+      </template>
+    </el-dialog>
     </template>
   </div>
 </template>
@@ -711,6 +802,7 @@ import {
   processBatchJobItem,
   purgeB2Storage,
   setUnauthorizedHandler,
+  updateQuotaConfig,
   type BatchJob,
   type ConversionRecord,
   type DocScenarioType,
@@ -753,6 +845,7 @@ watch(docType, (val) => {
   }
 });
 const customHint = ref("");
+const showAdvancedOptions = ref(false);
 const isDragging = ref(false);
 const extracting = ref(false);
 const paletteVisible = ref(false);
@@ -770,6 +863,12 @@ const b2Configured = ref(false);
 const activeModel = ref("gemini-3.5-flash-lite");
 const quotaRemaining = ref(50);
 const quotaLimit = ref(50);
+const quotaUsed = ref(0);
+const quotaUnlimited = ref(false);
+const quotaDialogVisible = ref(false);
+const quotaFormLimit = ref(50);
+const quotaFormUnlimited = ref(false);
+const savingQuota = ref(false);
 
 // 登录鉴权状态
 const authChecking = ref(true);
@@ -1008,6 +1107,8 @@ async function startBatchExtraction() {
             }
             quotaRemaining.value = res.quota.remaining;
             quotaLimit.value = res.quota.daily_limit;
+            quotaUsed.value = res.quota.used_count;
+            quotaUnlimited.value = Boolean(res.quota.unlimited || res.quota.daily_limit <= 0);
 
             progressItems.value[myIdx].status = "completed";
             progressItems.value[myIdx].quoteTitle = res.quotation.quote_title;
@@ -1111,6 +1212,8 @@ async function startBatchExtraction() {
             if (committed.quota) {
               quotaRemaining.value = committed.quota.remaining;
               quotaLimit.value = committed.quota.daily_limit;
+              quotaUsed.value = committed.quota.used_count;
+              quotaUnlimited.value = Boolean(committed.quota.unlimited || committed.quota.daily_limit <= 0);
             }
             const warnCnt = committed.quotation.merged_sheet.warnings?.length || 0;
             progressItems.value[myIdx].status = "completed";
@@ -1344,12 +1447,56 @@ async function loadWorkspaceBootstrap() {
     if (health.model) activeModel.value = health.model;
     quotaRemaining.value = quota.remaining;
     quotaLimit.value = quota.daily_limit;
+    quotaUsed.value = quota.used_count;
+    quotaUnlimited.value = Boolean(quota.unlimited || quota.daily_limit <= 0);
   } catch {
     // 后端未启动或未授权时保持界面可用
   }
 
   if (activeTab.value === "history") {
     loadHistory();
+  }
+}
+
+function openQuotaDialog() {
+  quotaFormUnlimited.value = quotaUnlimited.value;
+  quotaFormLimit.value = quotaLimit.value > 0 ? quotaLimit.value : 200;
+  quotaDialogVisible.value = true;
+}
+
+async function handleSaveQuotaConfig() {
+  savingQuota.value = true;
+  try {
+    const updated = await updateQuotaConfig({
+      unlimited: quotaFormUnlimited.value,
+      dailyLimit: quotaFormUnlimited.value ? 0 : Math.max(1, Math.round(quotaFormLimit.value || 50)),
+    });
+    quotaRemaining.value = updated.remaining;
+    quotaLimit.value = updated.daily_limit;
+    quotaUsed.value = updated.used_count;
+    quotaUnlimited.value = Boolean(updated.unlimited || updated.daily_limit <= 0);
+    quotaDialogVisible.value = false;
+    ElMessage.success(quotaUnlimited.value ? "已切换为不限次模式并持久保存" : `每日额度已更新为 ${quotaLimit.value} 次并持久保存`);
+  } catch (err) {
+    ElMessage.error(extractApiError(err));
+  } finally {
+    savingQuota.value = false;
+  }
+}
+
+async function handleResetQuotaUsed() {
+  savingQuota.value = true;
+  try {
+    const updated = await updateQuotaConfig({ resetUsed: true });
+    quotaRemaining.value = updated.remaining;
+    quotaLimit.value = updated.daily_limit;
+    quotaUsed.value = updated.used_count;
+    quotaUnlimited.value = Boolean(updated.unlimited || updated.daily_limit <= 0);
+    ElMessage.success("今日已用次数已重置为 0");
+  } catch (err) {
+    ElMessage.error(extractApiError(err));
+  } finally {
+    savingQuota.value = false;
   }
 }
 
@@ -1434,37 +1581,28 @@ const commandItems = computed<CommandItem[]>(() => [
 ]);
 
 const guideSteps = [
-  { title: "批量拖入或粘贴报价单", desc: "支持一次选入多达 20 张长图报价单，超长图自动高精度重叠切片并自动去重拼接。" },
-  { title: "忠实还原原表结构", desc: "A 列直接从原图型号列起步，不同成色区块自动保留原表分段表头并渲染 WPS 苹果绿样式。" },
-  { title: "分片容错 + 自动存 B2", desc: "单段切片失败自动重试并跨模型兜底，成品单表 .xlsx 与整批 .zip 自动上传至 Backblaze B2。" },
-  { title: "随时下载或一键释放空间", desc: "转换记录页支持下载、载入复改，也支持一键清空全部记录并物理删除 B2 历史版本释放额度。" },
-];
-
-const useCases = [
-  { title: "1 图 = 1 完整报价单 Sheet", tag: "忠实还原", pillClass: "pill-emerald", desc: "不强插多余列，A 列直接对应原图首列，自动保留各区块原生表头且每行带型号便于筛选与 VLOOKUP。" },
-  { title: "单份导出与批量打包 .zip", tag: "多图批处理", pillClass: "pill-sky", desc: "支持单份报价单独立下载 .xlsx，多张报价单时一键打包成平铺 .zip 压缩包。" },
-  { title: "长图保宽清晰 + 300% 放大", tag: "长截图友好", pillClass: "pill-violet", desc: "高清切片配合左侧 300% 缩放对照窗，长截图里的密集小字与价格格一目了然。" },
-  { title: "Backblaze B2 存档与一键清零", tag: "对象存储", pillClass: "pill-gold", desc: "自动存档 .xlsx / .zip 至 B2，并在转换记录页提供一键清空与 B2 历史版本物理删除，省心控空间。" },
-  { title: "商家规则备注单独提取", tag: "纯净数据行", pillClass: "pill-coral", desc: "顶部时效与扣差说明单独展示在提示栏，不污染数据行，价格列保留纯数字便于直接公式计算。" },
-  { title: "私有账号密码全站保护", tag: "安全鉴权", pillClass: "pill-sky", desc: "全站接口强制校验登录令牌，防止外部访客盗刷 AI 识别配额与对象存储空间。" },
+  { title: "拖入或 Ctrl+V 粘贴图片", desc: "支持一次选入最多 20 张图片，超长报价单与长表格自动 1:1 沿横线智能找缝切片并附带单行表头视觉锚定。" },
+  { title: "智能区分报价单与通用表", desc: "默认「智能自动」模式：手机/平板报价单自动展开合并格并套用苹果绿样式；财务/发票/库存表自动保护合计行与货币千分位，套用商务灰蓝风格。" },
+  { title: "分片并发容错 + 自动存 B2", desc: "长图每段独立计时与最多 3 轮自动重试，无总时长截断；成品单表 .xlsx 与整批 .zip 自动归档至 Backblaze B2。" },
+  { title: "自由控额度与一键清空间", desc: "工作台可直接自定义每日额度或切换不限次；转换记录页支持一键清空全部记录并物理清理 B2 历史版本。" },
 ];
 
 const faqs = [
   {
-    q: "为什么多张报价单改用「分片进度调度」？",
-    a: "超长报价单识别往往需要 15~40 秒。改成单图高清分段 + 单段失败自动重试与跨模型兜底后，既规避 Vercel 60 秒超时，又能避免切缝截断多出错误机型。",
+    q: "超长报价单识别超过 1 分钟会超时跳过吗？",
+    a: "不会。超长图会被自动切分为多段（最多 30 段），每一小段独立请求计时并带最多 3 轮前端重试与跨模型切换兜底，整张图无论耗时 60 秒还是 120 秒都会完整拼合输出。",
+  },
+  {
+    q: "如何自定义今日免费额度或关闭次数限制？",
+    a: "在工作台右侧「今日剩余免费额度」条上点击「设置」，可自由输入每日上限、一键切换「不限次模式」或「重置今日已用次数」，保存后会持久化到数据库并持续对后续日期生效。",
+  },
+  {
+    q: "财务报表、发票明细、库存单等非报价单图片适用吗？",
+    a: "适用。保持默认「智能自动」或手动切到「通用表」模式，系统会自动跳过报价单专属规则，完整保留合计/小计行、货币符号与千分位格式（如 ¥#,##0.00），遇到一图多结构表还会自动拆成独立 Sheet。",
   },
   {
     q: "怎么释放 Backblaze B2 免费 10GB 存储空间？",
-    a: "在「转换记录」页面点击单条记录的「删除并释放」，或直接点击右上角「一键清空全部记录 / 一键释放 B2 空间」，系统会彻底删除 B2 中的所有文件及历史隐藏版本。",
-  },
-  {
-    q: "合并成一个 Sheet 后还能查看原来的分块吗？",
-    a: "可以。我们在编辑区右上角保留了「合为单表 / 拆分子表」开关，切换即可看原始拆分的每个区块子表，不会重新消耗 API 次数。",
-  },
-  {
-    q: "报价单里的区间价或 +50 加减价会被当成公式吗？",
-    a: "不会。纯数字价格（如 3400、¥2,199.00）会转为真正的 Excel 整数格式方便核对与求和；带有连字符区间（如 3200-3300）或显式加号（+50）的文本会自动保持文本原样。",
+    a: "在「转换记录」页面点击单条记录的「删除并释放」，或点击右上角「一键清空全部记录 / 一键释放 B2 空间」，即可同步物理删除 B2 中的所有文件及历史隐藏版本。",
   },
 ];
 

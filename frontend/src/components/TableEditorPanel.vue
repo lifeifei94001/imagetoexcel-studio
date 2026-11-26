@@ -34,7 +34,7 @@
           :loading="exportingKey === 'current_xlsx'"
           @click="exportCurrentXlsx"
         >
-          导出当前报价单 (.xlsx)
+          导出当前表格 (.xlsx)
         </el-button>
         <el-button
           v-if="quotations.length > 1"
@@ -77,7 +77,7 @@
     >
       <div v-auto-animate style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap">
         <span class="glass-muted" style="font-size: 12.5px; font-weight: 600; margin-right: 4px">
-          报价单列表 ({{ quotations.length }})：
+          文档列表 ({{ quotations.length }})：
         </span>
         <button
           v-for="(q, idx) in quotations"
@@ -116,12 +116,12 @@
     <!-- Bento KPI 概览 -->
     <div class="bento-grid">
       <SpotlightCard>
-        <div class="kpi-label">当前批次报价单</div>
+        <div class="kpi-label">本批文档数</div>
         <div class="kpi-value num-tabular">{{ quotations.length }}</div>
-        <span class="gem-pill pill-sky">1 图 = 1 完整报价单</span>
+        <span class="gem-pill pill-sky">{{ activeQuotation?.detected_doc_type === "general" ? "多场景通用表" : "1 图 = 1 完整表" }}</span>
       </SpotlightCard>
       <SpotlightCard>
-        <div class="kpi-label">当前报价单行数</div>
+        <div class="kpi-label">当前表行数</div>
         <div class="kpi-value num-tabular">{{ currentTotalRows }}</div>
         <span class="gem-pill pill-emerald">零丢行对齐</span>
       </SpotlightCard>

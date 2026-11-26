@@ -10,7 +10,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlmodel import Session, desc, select
 
-from database import DB_MODE, get_session
+from database import DB_MODE, _get_clean_env, get_session
 from models import BatchJob, BatchJobItem, ConversionRecord, DailyQuota, utc_now_str, utc_today_str
 from services.auth_service import require_auth
 from services.b2_storage import (
@@ -41,6 +41,14 @@ router = APIRouter(prefix="/api", tags=["convert"], dependencies=[Depends(requir
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".jfif", ".png", ".gif", ".webp", ".heic", ".heif"}
 MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MB
 DEFAULT_DAILY_LIMIT = 50
+QUOTA_CONFIG_KEY = "__config__"
+MAX_CUSTOM_DAILY_LIMIT = 100000
+
+
+class UpdateQuotaRequest(BaseModel):
+    daily_limit: Optional[int] = None
+    unlimited: Optional[bool] = None
+    reset_used: bool = False
 
 
 class SheetPayload(BaseModel):
@@ -93,6 +101,33 @@ def _safe_filename(raw_name: str, fallback: str = "报价单") -> str:
     return cleaned[:48]
 
 
+def _get_default_daily_limit(session: Session) -> int:
+    """读取持久化的默认每日额度配置（0 表示不限次）；优先数据库配置行，其次环境变量 DAILY_QUOTA_LIMIT，兜底 50。"""
+    cfg = session.exec(
+        select(DailyQuota).where(DailyQuota.quota_date == QUOTA_CONFIG_KEY, DailyQuota.client_key == "default")
+    ).first()
+    if cfg is not None:
+        return max(0, int(cfg.daily_limit))
+    env_raw = _get_clean_env("DAILY_QUOTA_LIMIT")
+    if env_raw:
+        try:
+            return max(0, min(MAX_CUSTOM_DAILY_LIMIT, int(env_raw)))
+        except ValueError:
+            pass
+    return DEFAULT_DAILY_LIMIT
+
+
+def _format_quota_payload(quota: DailyQuota) -> Dict[str, Any]:
+    is_unlimited = int(quota.daily_limit) <= 0
+    return {
+        "quota_date": quota.quota_date,
+        "used_count": int(quota.used_count),
+        "daily_limit": int(quota.daily_limit),
+        "unlimited": is_unlimited,
+        "remaining": -1 if is_unlimited else max(0, int(quota.daily_limit) - int(quota.used_count)),
+    }
+
+
 def _get_or_create_today_quota(session: Session) -> DailyQuota:
     today = utc_today_str()
     quota = session.exec(
@@ -103,7 +138,7 @@ def _get_or_create_today_quota(session: Session) -> DailyQuota:
             quota_date=today,
             client_key="default",
             used_count=0,
-            daily_limit=DEFAULT_DAILY_LIMIT,
+            daily_limit=_get_default_daily_limit(session),
             updated_at=utc_now_str(),
         )
         session.add(quota)
@@ -127,12 +162,57 @@ def _validate_upload_image(up_file: UploadFile, raw_bytes: bytes, idx: int) -> s
 @router.get("/quota")
 def get_quota(session: Session = Depends(get_session)) -> Dict[str, Any]:
     quota = _get_or_create_today_quota(session)
-    remaining = max(0, quota.daily_limit - quota.used_count)
     return {
-        "quota_date": quota.quota_date,
-        "used_count": quota.used_count,
-        "daily_limit": quota.daily_limit,
-        "remaining": remaining,
+        **_format_quota_payload(quota),
+        "gemini_configured": has_gemini_key(),
+        "model": get_active_model(),
+        "b2_configured": b2_is_enabled(),
+    }
+
+
+@router.put("/quota")
+def update_quota_config(req: UpdateQuotaRequest, session: Session = Depends(get_session)) -> Dict[str, Any]:
+    """自定义每日额度（0 或 unlimited=True 表示不限次）或重置今日已用计数，并持久化至后续日期。"""
+    quota = _get_or_create_today_quota(session)
+    now_str = utc_now_str()
+
+    new_limit: Optional[int] = None
+    if req.unlimited is True:
+        new_limit = 0
+    elif req.daily_limit is not None:
+        if req.daily_limit < 0 or req.daily_limit > MAX_CUSTOM_DAILY_LIMIT:
+            raise HTTPException(status_code=400, detail=f"每日额度需在 0（不限次）至 {MAX_CUSTOM_DAILY_LIMIT} 之间")
+        new_limit = int(req.daily_limit)
+    elif req.unlimited is False and quota.daily_limit <= 0:
+        new_limit = DEFAULT_DAILY_LIMIT
+
+    if new_limit is not None:
+        quota.daily_limit = new_limit
+        cfg = session.exec(
+            select(DailyQuota).where(DailyQuota.quota_date == QUOTA_CONFIG_KEY, DailyQuota.client_key == "default")
+        ).first()
+        if not cfg:
+            cfg = DailyQuota(
+                quota_date=QUOTA_CONFIG_KEY,
+                client_key="default",
+                used_count=0,
+                daily_limit=new_limit,
+                updated_at=now_str,
+            )
+        else:
+            cfg.daily_limit = new_limit
+            cfg.updated_at = now_str
+        session.add(cfg)
+
+    if req.reset_used:
+        quota.used_count = 0
+
+    quota.updated_at = now_str
+    session.add(quota)
+    session.commit()
+    session.refresh(quota)
+    return {
+        **_format_quota_payload(quota),
         "gemini_configured": has_gemini_key(),
         "model": get_active_model(),
         "b2_configured": b2_is_enabled(),
@@ -294,12 +374,7 @@ def _persist_completed_quotation(
             "raw_sheets": raw_sheets,
             "plain_text": result.get("plain_text", ""),
         },
-        "quota": {
-            "quota_date": quota.quota_date,
-            "used_count": quota.used_count,
-            "daily_limit": quota.daily_limit,
-            "remaining": max(0, quota.daily_limit - quota.used_count),
-        },
+        "quota": _format_quota_payload(quota),
     }
 
 
@@ -402,8 +477,8 @@ async def process_batch_item(
         raise HTTPException(status_code=404, detail="未找到对应的批处理任务")
 
     quota = _get_or_create_today_quota(session)
-    if not force_demo and has_gemini_key() and (quota.used_count + 1 > quota.daily_limit):
-        raise HTTPException(status_code=429, detail="今日免费转换次数已达上限，请明日再试或开启演示模式")
+    if not force_demo and has_gemini_key() and quota.daily_limit > 0 and (quota.used_count + 1 > quota.daily_limit):
+        raise HTTPException(status_code=429, detail="今日额度已达上限，可在工作台点击「设置」调整今日额度")
 
     raw_bytes = await file.read()
     fname = _validate_upload_image(file, raw_bytes, item_index)
@@ -718,8 +793,8 @@ async def extract_tables(
         raise HTTPException(status_code=400, detail="单次最多支持批量上传 10 张图片")
 
     quota = _get_or_create_today_quota(session)
-    if not force_demo and has_gemini_key() and (quota.used_count + len(files) > quota.daily_limit):
-        raise HTTPException(status_code=429, detail="今日免费转换次数已达上限，请明日再试或使用演示模式预览")
+    if not force_demo and has_gemini_key() and quota.daily_limit > 0 and (quota.used_count + len(files) > quota.daily_limit):
+        raise HTTPException(status_code=429, detail="今日额度已达上限，可在工作台点击「设置」调整今日额度")
 
     all_sheets: List[Dict[str, Any]] = []
     quotations: List[Dict[str, Any]] = []
@@ -813,12 +888,7 @@ async def extract_tables(
         "sheets": all_sheets,
         "quotations": quotations,
         "plain_text": "\n\n---\n\n".join(plain_texts),
-        "quota": {
-            "quota_date": quota.quota_date,
-            "used_count": quota.used_count,
-            "daily_limit": quota.daily_limit,
-            "remaining": max(0, quota.daily_limit - quota.used_count),
-        },
+        "quota": _format_quota_payload(quota),
     }
 
 
