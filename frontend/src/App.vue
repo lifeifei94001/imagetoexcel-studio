@@ -1385,14 +1385,30 @@ async function startBatchExtraction() {
     const validQuotations = collected.filter((x): x is QuotationGroup => x !== null);
     quotations.value = validQuotations;
 
+    const finalizeWithRetry = async () => {
+      let lastFinErr: unknown = null;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          await finalizeBatchJob({
+            jobUid: createdJob.job_uid,
+            quotations: [],
+            mergePerImage: mergePerImage.value,
+            outputMode: outputMode.value,
+          });
+          return;
+        } catch (err) {
+          lastFinErr = err;
+          if (attempt < 2) {
+            await sleep(1000);
+          }
+        }
+      }
+      throw lastFinErr;
+    };
+
     if (validQuotations.length > 0) {
       // 轻量级 finalize：不再上传几 MB 整批 JSON（避免撞 Vercel 4.5MB 413），由后端直接从 B2 现存单表 .xlsx 打包 .zip！
-      await finalizeBatchJob({
-        jobUid: createdJob.job_uid,
-        quotations: [],
-        mergePerImage: mergePerImage.value,
-        outputMode: outputMode.value,
-      });
+      await finalizeWithRetry();
       ElMessage.success(
         validQuotations.length === snapshot.length
           ? `全部 ${validQuotations.length} 份表格已提取并打包归档！`
@@ -1401,12 +1417,7 @@ async function startBatchExtraction() {
       await nextTick();
       editorAnchorRef.value?.scrollIntoView({ behavior: "smooth", block: "start" });
     } else {
-      await finalizeBatchJob({
-        jobUid: createdJob.job_uid,
-        quotations: [],
-        mergePerImage: mergePerImage.value,
-        outputMode: outputMode.value,
-      });
+      await finalizeWithRetry();
       ElMessage.error("本批次图片均未能提取成功，请检查进度栏错误原因");
     }
   } catch (err) {

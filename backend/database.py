@@ -256,8 +256,22 @@ class TursoHttpConnection:
         if self.auth_token:
             headers["Authorization"] = f"Bearer {self.auth_token}"
 
+        last_exc: Optional[Exception] = None
         for attempt in range(3):
-            resp = self.http_session.post(self.pipeline_url, json=payload, headers=headers, timeout=45)
+            try:
+                resp = self.http_session.post(self.pipeline_url, json=payload, headers=headers, timeout=45)
+            except requests.RequestException as exc:
+                last_exc = exc
+                # 清理已失效的 keep-alive 空闲连接，立即重建新连接重试（攻克 RemoteDisconnected）
+                try:
+                    self.http_session.close()
+                except Exception:
+                    pass
+                if attempt < 2:
+                    time.sleep(0.4 * (attempt + 1))
+                    continue
+                raise sqlite3.OperationalError(f"Turso 网络连接闪断，重试 3 次仍失败：{exc}") from exc
+
             if resp.status_code in (429, 502, 503, 504) and attempt < 2:
                 time.sleep(0.5 * (attempt + 1))
                 continue

@@ -87,6 +87,27 @@ def _authorize_b2(force_refresh: bool = False) -> Dict[str, Any]:
     return _b2_auth_cache
 
 
+def _b2_request(method: str, url: str, retries: int = 3, **kwargs: Any) -> requests.Response:
+    """带断连自动重连重试的 B2 HTTP 请求（抵御 RemoteDisconnected / 瞬时 5xx 抖动）。"""
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            resp = requests.request(method, url, **kwargs)
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt < retries - 1:
+                time.sleep(0.4 * (attempt + 1))
+                continue
+            return resp
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(0.4 * (attempt + 1))
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Backblaze B2 请求失败")
+
+
 def save_object(object_key: str, raw_bytes: bytes, content_type: str = "application/octet-stream") -> str:
     """
     将文件持久化至 Backblaze B2（已配置 B2 密钥时）或本地/tmp storage/（未配置时平稳降级）。
@@ -99,46 +120,57 @@ def save_object(object_key: str, raw_bytes: bytes, content_type: str = "applicat
         local_path.write_bytes(raw_bytes)
         return clean_key
 
-    auth = _authorize_b2()
-    up_url_resp = requests.post(
-        f"{auth['api_url']}/b2api/v2/b2_get_upload_url",
-        headers={"Authorization": auth["token"]},
-        json={"bucketId": auth["bucket_id"]},
-        timeout=20,
-    )
-    if up_url_resp.status_code == 401:
-        auth = _authorize_b2(force_refresh=True)
-        up_url_resp = requests.post(
+    sha1_hex = hashlib.sha1(raw_bytes).hexdigest()
+    last_err = ""
+    for upload_try in range(2):
+        auth = _authorize_b2(force_refresh=(upload_try > 0))
+        up_url_resp = _b2_request(
+            "POST",
             f"{auth['api_url']}/b2api/v2/b2_get_upload_url",
             headers={"Authorization": auth["token"]},
             json={"bucketId": auth["bucket_id"]},
             timeout=20,
         )
-    if up_url_resp.status_code != 200:
-        raise RuntimeError(f"获取 Backblaze 上传地址失败 (HTTP {up_url_resp.status_code})")
+        if up_url_resp.status_code == 401:
+            auth = _authorize_b2(force_refresh=True)
+            up_url_resp = _b2_request(
+                "POST",
+                f"{auth['api_url']}/b2api/v2/b2_get_upload_url",
+                headers={"Authorization": auth["token"]},
+                json={"bucketId": auth["bucket_id"]},
+                timeout=20,
+            )
+        if up_url_resp.status_code != 200:
+            last_err = f"获取 Backblaze 上传地址失败 (HTTP {up_url_resp.status_code})"
+            continue
 
-    up_info = up_url_resp.json()
-    sha1_hex = hashlib.sha1(raw_bytes).hexdigest()
-    upload_headers = {
-        "Authorization": up_info["authorizationToken"],
-        "X-Bz-File-Name": quote(clean_key, safe="/"),
-        "Content-Type": content_type,
-        "X-Bz-Content-Sha1": sha1_hex,
-    }
-    put_resp = requests.post(
-        up_info["uploadUrl"],
-        headers=upload_headers,
-        data=raw_bytes,
-        timeout=45,
-    )
-    if put_resp.status_code != 200:
-        raise RuntimeError(f"上传至 Backblaze B2 失败 (HTTP {put_resp.status_code})：{put_resp.text[:200]}")
+        up_info = up_url_resp.json()
+        upload_headers = {
+            "Authorization": up_info["authorizationToken"],
+            "X-Bz-File-Name": quote(clean_key, safe="/"),
+            "Content-Type": content_type,
+            "X-Bz-Content-Sha1": sha1_hex,
+        }
+        try:
+            put_resp = _b2_request(
+                "POST",
+                up_info["uploadUrl"],
+                retries=2,
+                headers=upload_headers,
+                data=raw_bytes,
+                timeout=45,
+            )
+            if put_resp.status_code == 200:
+                return f"b2://{auth['bucket_name']}/{clean_key}"
+            last_err = f"上传至 Backblaze B2 失败 (HTTP {put_resp.status_code})：{put_resp.text[:200]}"
+        except requests.RequestException as exc:
+            last_err = f"上传至 Backblaze B2 连接闪断：{exc}"
 
-    return f"b2://{auth['bucket_name']}/{clean_key}"
+    raise RuntimeError(last_err or "上传至 Backblaze B2 失败")
 
 
 def load_object(storage_ref: str) -> Optional[bytes]:
-    """从 Backblaze B2 或本地降级目录读取对象字节。"""
+    """从 Backblaze B2 或本地降级目录读取对象字节（内置断连自动重试）。"""
     if not storage_ref:
         return None
     if storage_ref.startswith("b2://"):
@@ -148,10 +180,10 @@ def load_object(storage_ref: str) -> Optional[bytes]:
             return None
         auth = _authorize_b2()
         url = f"{auth['download_url']}/file/{bucket_name}/{quote(object_key, safe='/')}"
-        resp = requests.get(url, headers={"Authorization": auth["token"]}, timeout=45)
+        resp = _b2_request("GET", url, headers={"Authorization": auth["token"]}, timeout=45)
         if resp.status_code == 401:
             auth = _authorize_b2(force_refresh=True)
-            resp = requests.get(url, headers={"Authorization": auth["token"]}, timeout=45)
+            resp = _b2_request("GET", url, headers={"Authorization": auth["token"]}, timeout=45)
         if resp.status_code == 200:
             return resp.content
         return None
