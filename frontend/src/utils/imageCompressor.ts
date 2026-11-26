@@ -121,11 +121,15 @@ function detectExactHeaderBand(
   }
 
   const leftStart = Math.floor(targetW * 0.02);
-  const leftEnd = Math.max(leftStart + 4, Math.floor(targetW * 0.16));
+  const leftEnd = Math.max(leftStart + 4, Math.floor(targetW * 0.14));
   const bodyStart = leftEnd;
   const bodyEnd = Math.max(bodyStart + 8, Math.floor(targetW * 0.82));
+  // 白色价格区起点右移至 44%，兼容苹果 iPad 左侧 4 列全绿底布局
+  const whiteStart = Math.floor(targetW * 0.44);
+  const whiteEnd = Math.max(whiteStart + 8, Math.floor(targetW * 0.82));
   const leftCount = leftEnd - leftStart;
   const bodyCount = bodyEnd - bodyStart;
+  const whiteCount = whiteEnd - whiteStart;
 
   const lDark = new Float32Array(maxY);
   const bDark = new Float32Array(maxY);
@@ -141,22 +145,25 @@ function detectExactHeaderBand(
     lDark[y] = ld / leftCount;
 
     let bd = 0;
-    let bw = 0;
     for (let x = bodyStart; x < bodyEnd; x++) {
       const idx = rowBase + x * 4;
-      const lum = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
-      if (lum < 155) bd++;
-      if (lum > 238) bw++;
+      if (0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2] < 155) bd++;
     }
     bDark[y] = bd / bodyCount;
-    bWhite[y] = bw / bodyCount;
+
+    let bw = 0;
+    for (let x = whiteStart; x < whiteEnd; x++) {
+      const idx = rowBase + x * 4;
+      if (0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2] > 238) bw++;
+    }
+    bWhite[y] = bw / whiteCount;
   }
 
   // 找到第一个连续 18px 出现白底价格数据区的起始位置（绕开顶部纯绿/黄公告与成色说明）
   let consec = 0;
   let firstDataY = -1;
   for (let y = 36; y < maxY; y++) {
-    if (bWhite[y] >= 0.5 && lDark[y] < 0.45) {
+    if (bWhite[y] >= 0.55 && lDark[y] < 0.45) {
       consec++;
       if (consec >= 18) {
         firstDataY = y - consec + 1;
@@ -223,7 +230,7 @@ function scanImageRows(img: HTMLImageElement, targetW: number, targetH: number):
   const bodyVariance = new Float32Array(scanH);
 
   const leftStart = Math.floor(scanW * 0.02);
-  const leftEnd = Math.max(leftStart + 4, Math.floor(scanW * 0.16));
+  const leftEnd = Math.max(leftStart + 4, Math.floor(scanW * 0.14));
   const bodyStart = leftEnd;
   const bodyEnd = Math.max(bodyStart + 8, Math.floor(scanW * 0.82));
   const leftCount = leftEnd - leftStart;

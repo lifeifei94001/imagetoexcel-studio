@@ -182,6 +182,14 @@ def normalize_table_grid(payload: Dict[str, Any], fallback_name: str = "Sheet1")
             headers.append(f"列{len(headers) + 1}")
         headers = [h or f"列{i + 1}" for i, h in enumerate(headers)]
 
+        # 先做一次基础换行/空白清洗以便准确做「表头-数据语义对齐纠偏」
+        pre_rows: List[List[str]] = []
+        for row in str_rows:
+            padded = list(row) + [""] * max(0, max_cols - len(row))
+            pre_rows.append([_sanitize_cell_text(c) for c in padded[:max_cols]])
+
+        headers, str_rows, max_cols = _repair_shifted_headers_and_trim_dummies(headers, str_rows, pre_rows, max_cols)
+
         roles = _detect_column_roles(headers)
         model_col = roles["model_col"]
         cap_col = roles["cap_col"]
@@ -298,9 +306,100 @@ def _norm_header(h: str) -> str:
 
 
 _CAP_VALUE_RE = re.compile(
-    r"^(?:(?:4|6|8|12|16|18|20|24)(?:g|gb)?\+)?(?:(?:32|64|128|256|512|1024)(?:g|gb)?|(?:1|2)t(?:b)?)$",
+    r"^(?:(?:wifi|wi-fi|5g|4g|插卡|蜂窝|柔光|纳米|标准|全网通|蓝牙|lte|行货|国行|典藏|素皮|先锋)[\u4e00-\u9fa5a-z0-9/]*\s*)?"
+    r"(?:(?:4|6|8|12|16|18|20|24)(?:g|gb)?\+)?(?:(?:32|64|128|256|512|1024)(?:g|gb)?|(?:1|2)t(?:b)?)"
+    r"(?:\s*(?:典藏版|素皮版|先锋版|柔光版|纳米版|wifi版|插卡版))?$",
     re.IGNORECASE,
 )
+
+
+def _is_capacity_value(val: str) -> bool:
+    s = re.sub(r"\s+", " ", str(val or "").strip())
+    if not s:
+        return False
+    return bool(_CAP_VALUE_RE.match(s))
+
+
+def _repair_shifted_headers_and_trim_dummies(
+    headers: List[str],
+    raw_rows: List[List[str]],
+    pre_rows: List[List[str]],
+    max_cols: int,
+) -> Tuple[List[str], List[List[str]], int]:
+    """
+    核心自愈：
+    1. 解决平板表头漏掉「小型号」或「版本」导致的整体左移 + 末尾多出 `列10` 问题：
+       当检测到表头中 `容量` 在位置 `h_cap`，而实际数据中容量列在更右侧 `d_cap`（且末尾存在足够数量的 `列N` 占位表头），
+       自动删除末尾占位表头并在 `h_cap` 之前插入语义列名（如 `小型号` / `版本`），使全部价格列与表头 100% 对齐！
+    2. 剔除末尾完全空白且表头为自动占位名 `列N` 的幽灵空列。
+    """
+    if not pre_rows or max_cols <= 2:
+        return headers, raw_rows, max_cols
+
+    dummy_re = re.compile(r"^列\d+$")
+    trailing_dummies = 0
+    for h in reversed(headers):
+        if dummy_re.match(h.strip()):
+            trailing_dummies += 1
+        else:
+            break
+
+    # 1. 检测「容量表头」与「真实容量数据列」是否存在右移错位
+    if trailing_dummies > 0:
+        hdr_cap_col: Optional[int] = None
+        for i, h in enumerate(headers):
+            hn = _norm_header(h)
+            if any(k in hn for k in ("容量", "内存", "配置", "规格", "storage")):
+                hdr_cap_col = i
+                break
+
+        sample_rows = [r for r in pre_rows if any(r)][:30]
+        actual_cap_col: Optional[int] = None
+        best_cap_ratio = 0.0
+        for ci in range(1, min(6, max_cols)):
+            non_empty = [r[ci] for r in sample_rows if ci < len(r) and r[ci]]
+            if not non_empty:
+                continue
+            cap_hits = sum(1 for v in non_empty if _is_capacity_value(v))
+            ratio = cap_hits / len(non_empty)
+            if ratio >= 0.55 and ratio > best_cap_ratio:
+                best_cap_ratio = ratio
+                actual_cap_col = ci
+
+        if hdr_cap_col is not None and actual_cap_col is not None and actual_cap_col > hdr_cap_col:
+            delta = actual_cap_col - hdr_cap_col
+            if delta <= trailing_dummies:
+                # 根据漏掉列的数据内容智能命名（如 AST-W00 WIFI -> 小型号，行货/WIFI版 -> 版本）
+                inferred_names: List[str] = []
+                for offset in range(delta):
+                    col_idx = hdr_cap_col + offset
+                    col_vals = [r[col_idx] for r in sample_rows if col_idx < len(r) and r[col_idx]]
+                    has_code_like = any(re.search(r"[A-Za-z]{2,}[\-\s]?\w*\d+", v) for v in col_vals)
+                    has_ver_like = any(k in "".join(col_vals).upper() for k in ("WIFI", "插卡", "行货", "纳米", "柔光"))
+                    if has_code_like and not any(n == "小型号" for n in inferred_names):
+                        inferred_names.append("小型号")
+                    elif has_ver_like:
+                        inferred_names.append("版本")
+                    else:
+                        inferred_names.append("小型号" if offset == 0 else "规格")
+                headers = headers[:hdr_cap_col] + inferred_names + headers[hdr_cap_col : max_cols - delta]
+
+    # 2. 剔除末尾表头为 `列N` 且全部数据行该列皆空的幽灵空列
+    while max_cols > 1 and dummy_re.match(headers[-1].strip()):
+        last_c = max_cols - 1
+        all_empty = all((last_c >= len(r) or not str(r[last_c]).strip()) for r in pre_rows)
+        if not all_empty:
+            break
+        headers.pop()
+        for r in raw_rows:
+            if len(r) > last_c:
+                del r[last_c]
+        for r in pre_rows:
+            if len(r) > last_c:
+                del r[last_c]
+        max_cols -= 1
+
+    return headers, raw_rows, max_cols
 
 _MODEL_BRAND_FIXES = [
     (re.compile(r"\biq00\b", re.IGNORECASE), "iQOO"),
@@ -364,43 +463,59 @@ def _is_note_header(h: str) -> bool:
 
 def _detect_column_roles(headers: List[str]) -> Dict[str, Any]:
     """
-    动态识别报价单各列语义角色（彻底告别硬编码 row[1] 为容量）：
-    兼容 `型号 | 容量 | 价格...` 与 `型号 | 网络型号 | 容量 | 价格... | 扣费说明...` 等任意列布局。
+    动态识别报价单各列语义角色（全品牌手机 + 平板多前置列通用）：
+    兼容 `型号 | 容量 | 价格...`、`型号 | 网络型号 | 容量 | 价格...`、
+    `Mate pad Air系列 | 小型号 | 容量 | 价格...`、以及 iPad `型号 | 网络型号 | 地区 | 版本 | 容量 | 价格...`。
     """
     sec_col: Optional[int] = None
     model_col: Optional[int] = None
     code_col: Optional[int] = None
     cap_col: Optional[int] = None
+    meta_cols: List[int] = []
     note_cols: List[int] = []
 
     normed = [_norm_header(h) for h in (headers or [])]
 
-    # 先精确匹配主型号列（避免被「网络型号」抢占）
+    # 1. 先精确匹配主型号列（避免被「网络型号 / 小型号」抢占）
     for i, hn in enumerate(normed):
         if hn == "分类区块":
             sec_col = i
-        elif hn in {"型号", "机型", "model", "设备名称", "手机型号"} and model_col is None:
+        elif hn in {"型号", "机型", "model", "设备名称", "手机型号", "平板型号"} and model_col is None:
             model_col = i
 
+    # 2. 匹配编码列（含平板「小型号」）、容量列、备注列与系列主型号列
     for i, hn in enumerate(normed):
         if i in (sec_col, model_col):
             continue
-        if code_col is None and any(k in hn for k in ("网络型号", "型号编码", "机器编码", "代号", "sku", "编码")):
+        if code_col is None and any(k in hn for k in ("网络型号", "小型号", "型号编码", "机器编码", "代号", "sku", "编码")):
             code_col = i
-        elif model_col is None and any(k in hn for k in ("型号", "机型", "model", "设备")):
-            model_col = i
         elif cap_col is None and any(k in hn for k in ("容量", "内存", "配置", "规格", "storage", "gb")):
             cap_col = i
         elif _is_note_header(headers[i]):
             note_cols.append(i)
+        elif model_col is None and any(k in hn for k in ("型号", "机型", "model", "设备", "系列", "pad", "平板")):
+            model_col = i
 
-    excluded = {c for c in (sec_col, model_col, code_col, cap_col) if c is not None} | set(note_cols)
+    # 兜底：若第 0 列非容量/备注/分类，且仍未识别出 model_col，则默认第 0 列为主型号列（如「Mate pad Air系列」）
+    if model_col is None and normed and 0 not in (sec_col, code_col, cap_col) and 0 not in note_cols:
+        if any(k in " ".join(normed) for k in ("容量", "内存", "靓机", "小花", "充新")):
+            model_col = 0
+
+    # 3. 识别位于容量列之前的额外描述列（如 iPad 的「地区/行货」「网络/版本/WIFI版」），归入 meta_cols 不当价格列
+    for i, hn in enumerate(normed):
+        if i in (sec_col, model_col, code_col, cap_col) or i in note_cols:
+            continue
+        if (cap_col is not None and i < cap_col) or any(k in hn for k in ("地区", "版本", "网络", "制式", "类型", "颜色", "屏幕", "成色说明")):
+            meta_cols.append(i)
+
+    excluded = {c for c in (sec_col, model_col, code_col, cap_col) if c is not None} | set(note_cols) | set(meta_cols)
     price_cols = [i for i in range(len(normed)) if i not in excluded]
     return {
         "sec_col": sec_col,
         "model_col": model_col,
         "code_col": code_col,
         "cap_col": cap_col,
+        "meta_cols": meta_cols,
         "note_cols": note_cols,
         "price_cols": price_cols,
     }
@@ -417,26 +532,25 @@ def _norm_cap_str(val: str) -> str:
 
 def _cap_to_gb(val: str) -> Optional[int]:
     """
-    将苹果单容量（64/128/256/512/1T/2T）与安卓 RAM+ROM（12+256/12+512/16+256/16+1TB）
-    转为严格可比排序键，供全品牌容量回跳幽灵行检测使用。
+    将苹果单容量（64/128/256/512/1T/2T）、安卓 RAM+ROM（12+256/16+1TB）
+    及平板带版本前缀容量（wifi版 8+256 / 柔光版 16+512）转为严格可比排序键。
     """
     s = _norm_cap_str(val)
     if not s:
         return None
-    if "+" in s:
-        ram_s, _, rom_s = s.partition("+")
-        ram_m = re.match(r"^(\d+)g?$", ram_s)
-        if not ram_m:
-            return None
-        ram_num = int(ram_m.group(1))
-        rom_gb = _cap_to_gb(rom_s)
-        if rom_gb is None:
-            return None
-        return ram_num * 10000 + rom_gb
-    m_t = re.match(r"^(\d+(?:\.\d+)?)t$", s)
+    # 剥离平板常见前缀/后缀（wifi版 / 柔光版 / 纳米版 / 典藏版等）提取核心容量
+    m_android = re.search(r"(\d+)g?\+(\d+(?:\.\d+)?)(tb|t|gb|g)?", s)
+    if m_android:
+        ram_num = int(m_android.group(1))
+        rom_raw = float(m_android.group(2))
+        unit = (m_android.group(3) or "").lower()
+        rom_gb = int(round(rom_raw * 1024)) if unit.startswith("t") else int(round(rom_raw))
+        if rom_gb in {16, 32, 64, 128, 256, 512, 1024, 2048}:
+            return ram_num * 10000 + rom_gb
+    m_t = re.search(r"(?:^|[^\d])(\d+(?:\.\d+)?)t(?:b)?(?:$|[^\da-z])", s)
     if m_t:
         return int(round(float(m_t.group(1)) * 1024))
-    m_g = re.match(r"^(\d+)g?$", s)
+    m_g = re.match(r"^(?:[^\d]*?)(\d+)g?$", s)
     if m_g:
         num = int(m_g.group(1))
         if num in {16, 32, 64, 128, 256, 512, 1024, 2048}:
@@ -450,17 +564,17 @@ def _extract_row_semantics(row: List[str], roles: Optional[Dict[str, Any]] = Non
     model_col = roles.get("model_col") if roles else None
     cap_col = roles.get("cap_col") if roles else None
     code_col = roles.get("code_col") if roles else None
+    meta_cols = set(roles.get("meta_cols") or []) if roles else set()
     note_cols = set(roles.get("note_cols") or []) if roles else set()
 
     if model_col is None and r:
         model_col = 0
     if cap_col is None:
-        # 动态兜底：在前 4 列中自动寻找形如 128/256G/512/1T 的容量单元格
-        for ci in range(1, min(4, len(r))):
-            if ci == code_col:
+        # 动态兜底：在前 6 列中自动寻找形如 128/256G/512/1T/12+256/wifi版 8+256 的容量单元格
+        for ci in range(1, min(6, len(r))):
+            if ci == code_col or ci in meta_cols:
                 continue
-            cell_s = re.sub(r"\s+", "", str(r[ci] or ""))
-            if _CAP_VALUE_RE.match(cell_s):
+            if _is_capacity_value(str(r[ci] or "")):
                 cap_col = ci
                 break
         if cap_col is None and len(r) > 1:
@@ -471,7 +585,11 @@ def _extract_row_semantics(row: List[str], roles: Optional[Dict[str, Any]] = Non
     m_norm = re.sub(r"[\s\-_/]+", "", m_raw).lower()
     c_norm = _norm_cap_str(c_raw)
 
-    skip_set = {c for c in (model_col, cap_col, code_col, roles.get("sec_col") if roles else None) if c is not None} | note_cols
+    skip_set = (
+        {c for c in (model_col, cap_col, code_col, roles.get("sec_col") if roles else None) if c is not None}
+        | note_cols
+        | meta_cols
+    )
     prices: List[str] = []
     for ci, val in enumerate(r):
         if ci in skip_set:
@@ -938,8 +1056,9 @@ def _global_post_clean_and_audit(sheet: Dict[str, Any]) -> Dict[str, Any]:
 
         is_descending_section = total_pairs >= 6 and (dec_pairs / total_pairs) >= 0.85
 
-        # 2. 逐行检查：同机型(同硬件编码)重复容量 / 容量列疑似错位成价格 / 全价位空缺 / 价格档位严重倒挂
-        seen_model_cap: Dict[Tuple[str, str, str], int] = {}
+        # 2. 逐行检查：同机型(同编码+同前置版本列)重复容量 / 容量列疑似错位成价格 / 全价位空缺 / 价格档位严重倒挂
+        meta_cols_list: List[int] = roles.get("meta_cols") or []
+        seen_model_cap: Dict[Tuple[str, ...], int] = {}
         for r_idx in seg:
             m_norm, c_norm, _ = new_sems[r_idx]
             nums = row_nums[r_idx]
@@ -948,8 +1067,12 @@ def _global_post_clean_and_audit(sheet: Dict[str, Any]) -> Dict[str, Any]:
                 if code_col is not None and code_col < len(new_rows[r_idx])
                 else ""
             )
+            meta_norm = tuple(
+                re.sub(r"\s+", "", str(new_rows[r_idx][mc])).lower() if mc < len(new_rows[r_idx]) else ""
+                for mc in meta_cols_list
+            )
             if m_norm and c_norm:
-                key = (m_norm, code_norm, c_norm)
+                key = (m_norm, code_norm, c_norm) + meta_norm
                 if key in seen_model_cap:
                     target_c = cap_col if cap_col is not None else model_col
                     raw_m = str(new_rows[r_idx][model_col]).strip()
@@ -1011,20 +1134,23 @@ def _clean_quotation_rows(
     cap_col: Optional[int] = roles["cap_col"]
     sec_col: Optional[int] = roles["sec_col"]
     code_col: Optional[int] = roles["code_col"]
+    meta_cols_list: List[int] = roles.get("meta_cols") or []
+    meta_cols_set = set(meta_cols_list)
     note_cols_set = set(roles["note_cols"])
 
     if model_col is None:
         return rows, warnings
 
-    header_tokens = {"型号", "机型", "model", "容量", "内存", "备注", "扣费项", "蓝光", "蓝光/彩点", "面容/拆修"}
+    header_tokens = {"型号", "机型", "model", "小型号", "网络型号", "容量", "内存", "备注", "扣费项", "蓝光", "蓝光/彩点", "面容/拆修"}
 
     def _is_embedded_header(r: List[str]) -> bool:
         m_val = (r[model_col] if model_col < len(r) else "").strip().lower()
         c_val = (r[cap_col] if cap_col is not None and cap_col < len(r) else "").strip().lower()
-        if m_val in {"型号", "机型", "model"}:
-            return True
+        if m_val in {"型号", "机型", "model"} or m_val.endswith("系列"):
+            if c_val in {"容量", "内存"} or any("靓机" in str(cell) or "充新" in str(cell) for cell in r):
+                return True
         if c_val in {"容量", "内存"}:
-            hits = sum(1 for cell in r if cell.strip().lower() in header_tokens or "靓机" in cell or "小花" in cell)
+            hits = sum(1 for cell in r if cell.strip().lower() in header_tokens or "靓机" in cell or "小花" in cell or "充新" in cell)
             if hits >= 2:
                 return True
         return False
@@ -1032,7 +1158,7 @@ def _clean_quotation_rows(
     def _price_sig(r: List[str]) -> tuple:
         vals = []
         for idx, val in enumerate(r):
-            if idx in (model_col, cap_col, sec_col, code_col) or idx in note_cols_set:
+            if idx in (model_col, cap_col, sec_col, code_col) or idx in note_cols_set or idx in meta_cols_set:
                 continue
             v = re.sub(r"[¥$€£,\s]", "", str(val or ""))
             if re.match(r"^\d+(\.\d+)?$", v):
@@ -1078,17 +1204,21 @@ def _clean_quotation_rows(
                 primary[ci] = s_val
         return primary
 
-    # 第二遍：去除切片交界处「缺型号但容量+价格与下一行完全相同」的残缺行 + 向下补全合并型号
+    # 第二遍：去除切片交界处「缺型号但容量+价格与下一行完全相同」的残缺行 + 多层嵌套合并列向下继承（型号 -> 小型号/网络型号 -> 地区/版本）
     step2_rows: List[List[str]] = []
     step2_map: Dict[int, int] = {}
     last_section = None
     last_model = ""
+    last_code = ""
+    last_metas: Dict[int, str] = {}
 
     for idx, r in enumerate(step1_rows):
         cur_sec = r[sec_col].strip() if sec_col is not None and sec_col < len(r) else ""
         if cur_sec != last_section:
             last_section = cur_sec
             last_model = ""
+            last_code = ""
+            last_metas = {}
 
         m_val = r[model_col].strip() if model_col < len(r) else ""
         c_val = r[cap_col].strip() if cap_col is not None and cap_col < len(r) else ""
@@ -1108,14 +1238,39 @@ def _clean_quotation_rows(
             if is_orphan_dup:
                 continue
 
-            # 若前面同一区块已有合法机型，且本行有容量或价格 -> 继承合并单元格的机型名
+            # 若前面同一区块已有合法机型，且本行有容量或价格 -> 继承合并单元格的机型名与嵌套子列
             if last_model and (c_val or p_sig):
                 r[model_col] = last_model
+                if code_col is not None and code_col < len(r):
+                    if r[code_col].strip():
+                        last_code = r[code_col].strip()
+                    elif last_code:
+                        r[code_col] = last_code
+                for mc in meta_cols_list:
+                    if mc < len(r):
+                        if r[mc].strip():
+                            last_metas[mc] = r[mc].strip()
+                        elif last_metas.get(mc):
+                            r[mc] = last_metas[mc]
             else:
                 # 无归属机型的孤立切片残行直接丢弃
                 continue
         else:
+            if _norm_model_name(m_val) != _norm_model_name(last_model):
+                last_code = ""
+                last_metas = {}
             last_model = m_val
+            if code_col is not None and code_col < len(r):
+                if r[code_col].strip():
+                    last_code = r[code_col].strip()
+                elif last_code:
+                    r[code_col] = last_code
+            for mc in meta_cols_list:
+                if mc < len(r):
+                    if r[mc].strip():
+                        last_metas[mc] = r[mc].strip()
+                    elif last_metas.get(mc):
+                        r[mc] = last_metas[mc]
 
         step2_map[idx] = len(step2_rows)
         step2_rows.append(r)
@@ -1540,7 +1695,8 @@ def extract_tables_from_image(
         "CRITICAL: Extract EVERY SINGLE ROW and EVERY table/block visible in this image from the very top to the very bottom. "
         "NEVER omit rows, NEVER omit price cells, NEVER output empty blank rows, NEVER stop after the first section, and NEVER truncate the output. "
         "VISUAL HEADER ANCHOR RULE: If there is a bright RED horizontal divider bar near the top of the image, the strip ABOVE the red bar is a copied visual column-header reference from the top of the sheet—use it ONLY to keep exact column names and left-to-right column alignment, and put ONLY the data rows BELOW the red bar into `rows`. "
-        "IMPORTANT: When a model name cell (or model code cell like '13 PRO' / 'A2639') spans multiple capacity rows (vertically merged cell over 128/256/512/1T or 12+256/16+512), REPEAT the exact model name and code on EVERY row belonging to that horizontal grid box! "
+        "EXACT HEADER COUNT RULE: Count EVERY visible column header from left to right and NEVER omit columns such as '小型号', '网络型号', '地区/行货', '网络/WIFI版', or '备注'! For example, Huawei/Honor tablet sheets have 10 columns ('Mate pad Air系列 | 小型号 | 容量 | 充新 | 靓机 | 小花 | 大花 | 外爆 | 内爆可测 | 备注') and iPad sheets have 12 columns ('型号 | 网络型号 | 地区 | 版本 | 容量 | 充新 | 靓机 | 小花 | 大花 | 外爆 | 内爆可测 | 备注'). Every row MUST align 1-to-1 with every header column! "
+        "IMPORTANT: When left-hand columns are nested vertically merged cells (for example a tablet series spanning 8 rows containing multiple '小型号' blocks like 'AST-W00 WIFI' / 'AST-W10 WIFI 柔光版', or an iPad model spanning 12 rows containing '行货' and 'WIFI版' / 'WIFI版 纳米' / '插卡版'), REPEAT EVERY left-hand column value onto EVERY row belonging to its horizontal grid box! "
         "NEVER pull a model name UPWARD from a lower horizontal border box onto orphan rows above the border line! If a row at the very top edge has a blank model cell separated by a dark horizontal border from the model below, leave its model cell empty '' or omit the clipped orphan row rather than assigning the NEXT model's name to it. "
         "SINGLE-LINE MODEL NAME RULE: NEVER put newline characters or literal '\\n' inside model names, network codes, capacities, or prices! If a model name wraps across two lines inside a narrow cell (for example '15 PRO' over 'MAX', or '荣耀Robot' over 'Phone', or 'MATE XT2' over '非凡大师'), ALWAYS join them on ONE line with a single space ('15 PRO MAX', '荣耀Robot Phone', 'MATE XT2 非凡大师'). "
         "BRAND & WATERMARK PRECISION: Carefully distinguish English letters vs digits in brand names and network codes (e.g. 'iQOO' with letters OO NOT digits 00, 'OPPO', 'ROG', 'A3108', 'A2639', 'PMK110', 'LAP-AL10'). Completely IGNORE faint diagonal watermarks (such as '靓机汇报价单') overlapping numbers or capacities—never attach stray watermark letters to capacities or prices. "
