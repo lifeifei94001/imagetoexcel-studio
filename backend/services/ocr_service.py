@@ -726,6 +726,28 @@ def _is_condition_legend_sheet(sheet: Dict[str, Any]) -> bool:
     return False
 
 
+def _is_series_or_header_model(val: str) -> bool:
+    """判断机型列值是否为表头占位词或反复出现的绿色「xxx系列」分段标题（绝非具体机型名）。"""
+    s = str(val or "").strip()
+    if not s:
+        return True
+    low = s.lower()
+    if low in {"型号", "机型", "model", "小型号", "网络型号", "品牌型号", "具体型号", "型号名称", "商品名称"}:
+        return True
+    if s.endswith("系列") or bool(re.search(r"系列\s*/\s*型号$", s)):
+        return True
+    return False
+
+
+def _extract_code_family_prefix(val: str) -> str:
+    """从网络型号/小型号中提取机型族前缀（如 'MRO-W00 WIFI' -> 'mro', 'PCE-W30 WIFI版' -> 'pce'）。"""
+    s = str(val or "").strip()
+    if not s:
+        return ""
+    m = re.match(r"([A-Za-z0-9]{2,8})(?:[-/\s]|$)", s)
+    return m.group(1).lower() if m else ""
+
+
 def merge_sheets_into_single_quotation(
     sheets: List[Dict[str, Any]],
     quote_title: str,
@@ -805,6 +827,10 @@ def merge_sheets_into_single_quotation(
     section_header_rows: List[int] = []
 
     # 第 0 区块的表头已作为 Excel 第 1 行表头
+    master_roles = _detect_column_roles(unified_headers)
+    master_model_col = master_roles.get("model_col")
+    skipped_series_header_variants = False
+
     prev_header_row = [""] * total_cols
     first_headers = cleaned_sheets[0].get("headers") or []
     for i, h in enumerate(first_headers):
@@ -819,16 +845,27 @@ def merge_sheets_into_single_quotation(
             if i < len(local_to_global):
                 cur_header_row[local_to_global[i]] = str(h or "").strip()
 
-        # 若当前区块表头与上一区块存在实质差异（忽略续片仅缺少末尾空白备注列的情况），保留区块小表头行
+        # 若当前区块表头与上一区块存在实质差异（价格/容量/编码列有变化），保留区块小表头行；
+        # 若仅末尾备注列为空，或仅第 1 列在「xxx系列 / 型号」间切换而右侧全部价格列完全一致，则视作纯重复系列表头予以合并清理！
         if s_idx > 0 and cur_header_row != prev_header_row and any(cur_header_row):
-            has_real_header_diff = any(
-                (cur_header_row[ci] != prev_header_row[ci])
+            non_model_diff = any(
+                (ci != master_model_col)
+                and (cur_header_row[ci] != prev_header_row[ci])
                 and (cur_header_row[ci] != "" or not _is_note_header(prev_header_row[ci]))
                 for ci in range(total_cols)
             )
-            if has_real_header_diff:
+            only_series_model_header_swap = (
+                not non_model_diff
+                and master_model_col is not None
+                and _is_series_or_header_model(cur_header_row[master_model_col])
+                and _is_series_or_header_model(prev_header_row[master_model_col])
+            )
+            if non_model_diff:
                 section_header_rows.append(len(merged_rows))
                 merged_rows.append(cur_header_row)
+                prev_header_row = cur_header_row
+            elif only_series_model_header_swap:
+                skipped_series_header_variants = True
                 prev_header_row = cur_header_row
 
         base_row_offset = len(merged_rows)
@@ -853,6 +890,15 @@ def merge_sheets_into_single_quotation(
                     )
             except Exception:
                 continue
+
+    # 若同一张连续表合并了多个不同「xxx系列」分段表头，将顶部 A 列主表头归一为「型号」，避免「Mate pad Air系列」覆盖 Pro 等其他系列
+    if (
+        skipped_series_header_variants
+        and master_model_col is not None
+        and master_model_col < len(unified_headers)
+        and unified_headers[master_model_col].endswith("系列")
+    ):
+        unified_headers[master_model_col] = "型号"
 
     result_sheet = {
         "name": final_name,
@@ -1024,6 +1070,89 @@ def _global_post_clean_and_audit(sheet: Dict[str, Any]) -> Dict[str, Any]:
                             new_rows[j_run - 1][model_col] = models_in_run[0]
                             new_sems[j_run - 1] = _extract_row_semantics(new_rows[j_run - 1], roles)
             i_run = j_run
+
+    # 1.6 系列/表头占位机型自动回填纠偏：
+    # 典型案例：华为平板绿色重复表头「Mate pad系列」紧贴下方超高 8 行合并单元格「Mate pad Pro 2024年 12.2寸」，
+    # 前 3 行（MRO-W00 / MRO-AL10）左侧空白导致模型误填「Mate pad系列」。自动向下（并结合小型号前缀交叉验证）回填真实机型！
+    sec_set_series = set(new_sec_headers)
+    i_ph = 0
+    while i_ph < len(new_rows):
+        if i_ph in sec_set_series or model_col >= len(new_rows[i_ph]):
+            i_ph += 1
+            continue
+        if not _is_series_or_header_model(new_rows[i_ph][model_col]):
+            i_ph += 1
+            continue
+        j_ph = i_ph + 1
+        while (
+            j_ph < len(new_rows)
+            and j_ph not in sec_set_series
+            and model_col < len(new_rows[j_ph])
+            and _is_series_or_header_model(new_rows[j_ph][model_col])
+        ):
+            j_ph += 1
+
+        # 向下寻找最近的真实机型行（限同一连续区块内 12 行）
+        down_idx: Optional[int] = None
+        for d in range(j_ph, min(len(new_rows), j_ph + 12)):
+            if d in sec_set_series:
+                break
+            if model_col < len(new_rows[d]) and not _is_series_or_header_model(new_rows[d][model_col]):
+                down_idx = d
+                break
+
+        # 向上寻找最近的真实机型行（限同一连续区块内 12 行）
+        up_idx: Optional[int] = None
+        for u in range(i_ph - 1, max(-1, i_ph - 13), -1):
+            if u in sec_set_series:
+                break
+            if model_col < len(new_rows[u]) and not _is_series_or_header_model(new_rows[u][model_col]):
+                up_idx = u
+                break
+
+        down_model = str(new_rows[down_idx][model_col]).strip() if down_idx is not None else ""
+        up_model = str(new_rows[up_idx][model_col]).strip() if up_idx is not None else ""
+        down_prefix = (
+            _extract_code_family_prefix(new_rows[down_idx][code_col])
+            if (down_idx is not None and code_col is not None and code_col < len(new_rows[down_idx]))
+            else ""
+        )
+        up_prefix = (
+            _extract_code_family_prefix(new_rows[up_idx][code_col])
+            if (up_idx is not None and code_col is not None and code_col < len(new_rows[up_idx]))
+            else ""
+        )
+
+        # 收集占位段内全部小型号前缀，辅助判断整段归属
+        run_prefixes = {
+            _extract_code_family_prefix(new_rows[k][code_col])
+            for k in range(i_ph, j_ph)
+            if code_col is not None and code_col < len(new_rows[k])
+        } - {""}
+
+        for k in range(i_ph, j_ph):
+            cur_prefix = (
+                _extract_code_family_prefix(new_rows[k][code_col])
+                if (code_col is not None and code_col < len(new_rows[k]))
+                else ""
+            )
+            chosen_model = ""
+            if down_model and cur_prefix and down_prefix and cur_prefix == down_prefix:
+                chosen_model = down_model
+            elif up_model and cur_prefix and up_prefix and cur_prefix == up_prefix:
+                chosen_model = up_model
+            elif down_model and (not up_prefix or down_prefix in run_prefixes or not run_prefixes):
+                chosen_model = down_model
+            elif down_model:
+                chosen_model = down_model
+            elif up_model:
+                chosen_model = up_model
+
+            if chosen_model:
+                new_rows[k][model_col] = chosen_model
+                new_sems[k] = _extract_row_semantics(new_rows[k], roles)
+
+        i_ph = j_ph
 
     # 映射原有 warnings
     new_warnings: List[Dict[str, Any]] = []
@@ -1763,6 +1892,7 @@ def extract_tables_from_image(
         "VISUAL HEADER ANCHOR RULE: If there is a bright RED horizontal divider bar near the top of the image, the strip ABOVE the red bar is a copied visual column-header reference from the top of the sheet—use it ONLY to keep exact column names and left-to-right column alignment, and put ONLY the data rows BELOW the red bar into `rows`. "
         "EXACT HEADER COUNT RULE: Count EVERY visible column header from left to right and NEVER omit columns such as '小型号', '网络型号', '地区/行货', '网络/WIFI版', or '备注'! For example, Huawei/Honor tablet sheets have 10 columns ('Mate pad Air系列 | 小型号 | 容量 | 充新 | 靓机 | 小花 | 大花 | 外爆 | 内爆可测 | 备注') and iPad sheets have 12 columns ('型号 | 网络型号 | 地区 | 版本 | 容量 | 充新 | 靓机 | 小花 | 大花 | 外爆 | 内爆可测 | 备注'). Every row MUST align 1-to-1 with every header column! "
         "IMPORTANT: When left-hand columns are nested vertically merged cells (for example a tablet series spanning 8 rows containing multiple '小型号' blocks like 'AST-W00 WIFI' / 'AST-W10 WIFI 柔光版', or an iPad model spanning 12 rows containing '行货' and 'WIFI版' / 'WIFI版 纳米' / '插卡版'), REPEAT EVERY left-hand column value onto EVERY row belonging to its horizontal grid box! "
+        "NEVER COPY SECTION HEADER AS MODEL NAME: Repeated green sub-header labels ending in '系列' (such as 'Mate pad系列', 'Mate pad Air系列', 'Pro系列', 'Air系列') are COLUMN HEADERS ONLY—NEVER put them into a data row's model column! When a tall vertically merged model cell starts right below a green 'xxx系列' header and its centered model name (e.g. 'Mate pad Pro 2024年 12.2寸' or 'Mate pad Pro 23年 13.2寸') is printed lower down in the middle of the box, ALWAYS read downward inside that same merged box and fill that real model name onto the top rows too! "
         "NEVER pull a model name UPWARD from a lower horizontal border box onto orphan rows above the border line! If a row at the very top edge has a blank model cell separated by a dark horizontal border from the model below, leave its model cell empty '' or omit the clipped orphan row rather than assigning the NEXT model's name to it. "
         "SINGLE-LINE MODEL NAME RULE: NEVER put newline characters or literal '\\n' inside model names, network codes, capacities, or prices! If a model name wraps across two lines inside a narrow cell (for example '15 PRO' over 'MAX', or '荣耀Robot' over 'Phone', or 'MATE XT2' over '非凡大师'), ALWAYS join them on ONE line with a single space ('15 PRO MAX', '荣耀Robot Phone', 'MATE XT2 非凡大师'). "
         "BRAND & WATERMARK PRECISION: Carefully distinguish English letters vs digits in brand names and network codes (e.g. 'iQOO' with letters OO NOT digits 00, 'OPPO', 'ROG', 'A3108', 'A2639', 'PMK110', 'LAP-AL10'). Completely IGNORE faint diagonal watermarks (such as '靓机汇报价单') overlapping numbers or capacities—never attach stray watermark letters to capacities or prices. "
