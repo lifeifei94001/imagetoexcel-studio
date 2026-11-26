@@ -972,7 +972,15 @@ def load_job_payload(job_uid: str, session: Session = Depends(get_session)) -> D
         )
         quotations: List[Dict[str, Any]] = []
         for it in items:
-            raw_it = load_object(f"jobs/{job_uid}/items/{it.item_index + 1:02d}.json")
+            rel_key = f"jobs/{job_uid}/items/{it.item_index + 1:02d}.json"
+            if it.xlsx_b2_key and it.xlsx_b2_key.startswith("b2://"):
+                b_name = it.xlsx_b2_key[len("b2://") :].split("/", 1)[0]
+                item_ref = f"b2://{b_name}/{rel_key}"
+            elif b2_is_enabled():
+                item_ref = f"b2://{get_b2_bucket_name()}/{rel_key}"
+            else:
+                item_ref = rel_key
+            raw_it = load_object(item_ref)
             if raw_it:
                 try:
                     quotations.append(json.loads(raw_it.decode("utf-8")))
