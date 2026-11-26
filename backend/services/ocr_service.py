@@ -306,16 +306,19 @@ def _norm_header(h: str) -> str:
 
 
 _CAP_VALUE_RE = re.compile(
-    r"^(?:(?:wifi|wi-fi|5g|4g|插卡|蜂窝|柔光|纳米|标准|全网通|蓝牙|lte|行货|国行|典藏|素皮|先锋)[\u4e00-\u9fa5a-z0-9/]*\s*)?"
-    r"(?:(?:4|6|8|12|16|18|20|24)(?:g|gb)?\+)?(?:(?:32|64|128|256|512|1024)(?:g|gb)?|(?:1|2)t(?:b)?)"
-    r"(?:\s*(?:典藏版|素皮版|先锋版|柔光版|纳米版|wifi版|插卡版))?$",
+    r"^(?:[\u4e00-\u9fa5a-z0-9+/\-]{1,14}\s+)?"
+    r"(?:(?:4|6|8|12|16|18|20|24|32)(?:g|gb)?\+)?(?:(?:32|64|128|256|512|1024)(?:g|gb)?|(?:1|2)t(?:b)?)"
+    r"(?:\s*[\u4e00-\u9fa5a-z0-9/\-]{1,12})?$",
     re.IGNORECASE,
 )
 
 
 def _is_capacity_value(val: str) -> bool:
     s = re.sub(r"\s+", " ", str(val or "").strip())
-    if not s:
+    if not s or len(s) > 28:
+        return False
+    # 拒绝纯 3~5 位非容量价格数字（如 1450 / 2650）
+    if re.match(r"^\d{3,5}$", s) and s not in {"32", "64", "128", "256", "512", "1024"}:
         return False
     return bool(_CAP_VALUE_RE.match(s))
 
@@ -496,7 +499,11 @@ def _detect_column_roles(headers: List[str]) -> Dict[str, Any]:
         elif model_col is None and any(k in hn for k in ("型号", "机型", "model", "设备", "系列", "pad", "平板")):
             model_col = i
 
-    # 兜底：若第 0 列非容量/备注/分类，且仍未识别出 model_col，则默认第 0 列为主型号列（如「Mate pad Air系列」）
+    # 兜底 1：若第 0 列是「*系列」（如 三星 折叠屏系列 / 魅族系列）且第 1 列是「具体型号」，则第 1 列为编码列
+    if code_col is None and model_col == 0 and len(normed) > 1 and "具体型号" in normed[1]:
+        code_col = 1
+
+    # 兜底 2：若第 0 列非容量/备注/分类，且仍未识别出 model_col，则默认第 0 列为主型号列（如「Mate pad Air系列」）
     if model_col is None and normed and 0 not in (sec_col, code_col, cap_col) and 0 not in note_cols:
         if any(k in " ".join(normed) for k in ("容量", "内存", "靓机", "小花", "充新")):
             model_col = 0
@@ -812,11 +819,17 @@ def merge_sheets_into_single_quotation(
             if i < len(local_to_global):
                 cur_header_row[local_to_global[i]] = str(h or "").strip()
 
-        # 若当前区块表头与上一区块不同，则原样保留一条区块小表头行
+        # 若当前区块表头与上一区块存在实质差异（忽略续片仅缺少末尾空白备注列的情况），保留区块小表头行
         if s_idx > 0 and cur_header_row != prev_header_row and any(cur_header_row):
-            section_header_rows.append(len(merged_rows))
-            merged_rows.append(cur_header_row)
-            prev_header_row = cur_header_row
+            has_real_header_diff = any(
+                (cur_header_row[ci] != prev_header_row[ci])
+                and (cur_header_row[ci] != "" or not _is_note_header(prev_header_row[ci]))
+                for ci in range(total_cols)
+            )
+            if has_real_header_diff:
+                section_header_rows.append(len(merged_rows))
+                merged_rows.append(cur_header_row)
+                prev_header_row = cur_header_row
 
         base_row_offset = len(merged_rows)
         for row in (sh.get("rows") or []):
@@ -926,10 +939,24 @@ def _global_post_clean_and_audit(sheet: Dict[str, Any]) -> Dict[str, Any]:
 
         if len(p_cur) >= 2:
             lookback_start = max(segment_start, len(new_rows) - 6)
+            cur_code_norm = (
+                re.sub(r"\s+", "", str(r[code_col])).lower()
+                if code_col is not None and code_col < len(r)
+                else ""
+            )
             for prev_i in range(len(new_rows) - 1, lookback_start - 1, -1):
                 m_prev, c_prev, p_prev = new_sems[prev_i]
                 same_cap = (cap_col is None) or (bool(c_cur) and c_cur == c_prev)
                 if same_cap and p_prev == p_cur:
+                    prev_code_norm = (
+                        re.sub(r"\s+", "", str(new_rows[prev_i][code_col])).lower()
+                        if code_col is not None and code_col < len(new_rows[prev_i])
+                        else ""
+                    )
+                    # 若两行均有非空且不同的网络型号编码（如 小米12S Pro 2206122SC vs 小米12S 2206123SC）
+                    # 且当前行并非容量回跳幽灵行，则必为两款独立机型，严禁误合并！
+                    if cur_code_norm and prev_code_norm and cur_code_norm != prev_code_norm and not has_later_smaller_cap[orig_i]:
+                        continue
                     if _models_compatible_norm(m_prev, m_cur) or has_later_smaller_cap[orig_i]:
                         matched_prev = prev_i
                         break
@@ -1434,6 +1461,7 @@ def _rows_overlap_equivalent(
     next_row: List[str],
     prev_roles: Optional[Dict[str, Any]] = None,
     next_roles: Optional[Dict[str, Any]] = None,
+    allow_diff_code: bool = False,
 ) -> bool:
     """
     动态列感知判断两段切片重叠处的两行是否为同一条数据：
@@ -1450,15 +1478,20 @@ def _rows_overlap_equivalent(
             return True
 
     # 切缝处容量一致 + 价格序列（>=2 列）完全一致：
-    # 即使切片顶部漏掉合并单元格型号（导致错套成 13 / A2634 或截断成 17），也能精准识别为重复行
-    if cap_a and cap_a == cap_b and len(p_prices) >= 2 and p_prices == n_prices:
-        if _models_compatible_norm(m_a, m_b):
+    # 仅在机型名兼容（如 17 vs 17pro、13 vs 13 PRO、同机型或空机型）或确认容量回跳幽灵行时判定为切缝重复；
+    # 严禁把两款非兼容独立机型（如 Y35 5G vs Y35m 5G，或 小米12S Pro 5G vs 小米12S 5G）仅因同价而误合并！
+    if cap_a and cap_a == cap_b and p_prices and p_prices == n_prices:
+        if _models_compatible_norm(m_a, m_b) or allow_diff_code:
+            # 若编码列存在且双方均有非空不同编码，除非已确认是容量回跳幽灵行（allow_diff_code=True），否则不误删同价异款
+            if not allow_diff_code:
+                c_col_a = prev_roles.get("code_col") if prev_roles else None
+                c_col_b = next_roles.get("code_col") if next_roles else None
+                if c_col_a is not None and c_col_b is not None and c_col_a < len(prev_row) and c_col_b < len(next_row):
+                    ca = re.sub(r"\s+", "", str(prev_row[c_col_a] or "")).lower()
+                    cb = re.sub(r"\s+", "", str(next_row[c_col_b] or "")).lower()
+                    if ca and cb and ca != cb:
+                        return False
             return True
-        # 切缝边界强信号：>=3 个价位数字一字不差且容量相同，几乎必然是同一行重叠
-        if len(p_prices) >= 3:
-            return True
-    elif cap_a and cap_a == cap_b and p_prices and p_prices == n_prices and _models_compatible_norm(m_a, m_b):
-        return True
     return False
 
 
@@ -1504,9 +1537,36 @@ def _dedupe_boundary_overlap(
     prev_tail_start = max(0, len(prev_rows) - max_window)
     prev_tail = prev_rows[prev_tail_start:]
     next_head = next_rows[:max_window]
+
+    # 检测 next_head 中是否存在「容量回跳幽灵行」（例如 13 / A2634 先出 512/1T，紧接着又从 128 起排）
+    next_sems = [_extract_row_semantics(r, next_roles) for r in next_rows[: max_window + 6]]
+    next_has_smaller_cap: List[bool] = [False] * len(next_head)
+    for i in range(len(next_head)):
+        m_i, c_i, _ = next_sems[i]
+        gb_i = _cap_to_gb(c_i)
+        if not m_i or gb_i is None:
+            continue
+        for j in range(i + 1, min(len(next_sems), i + 6)):
+            m_j, c_j, _ = next_sems[j]
+            if m_j != m_i:
+                break
+            gb_j = _cap_to_gb(c_j)
+            if gb_j is not None and gb_j < gb_i:
+                next_has_smaller_cap[i] = True
+                break
+
     max_k = min(len(prev_tail), len(next_head))
     for k in range(max_k, 0, -1):
-        if all(_rows_overlap_equivalent(prev_tail[-k + i], next_head[i], prev_roles, next_roles) for i in range(k)):
+        if all(
+            _rows_overlap_equivalent(
+                prev_tail[-k + i],
+                next_head[i],
+                prev_roles,
+                next_roles,
+                allow_diff_code=next_has_smaller_cap[i],
+            )
+            for i in range(k)
+        ):
             for i in range(k):
                 target_idx = len(prev_rows) - k + i
                 prev_rows[target_idx] = _merge_overlap_row(prev_rows[target_idx], next_head[i], prev_roles, next_roles)
@@ -1516,7 +1576,13 @@ def _dedupe_boundary_overlap(
     for idx in range(min(6, len(next_head))):
         matched_prev: Optional[int] = None
         for p_offset in range(len(prev_tail) - 1, -1, -1):
-            if _rows_overlap_equivalent(prev_tail[p_offset], next_head[idx], prev_roles, next_roles):
+            if _rows_overlap_equivalent(
+                prev_tail[p_offset],
+                next_head[idx],
+                prev_roles,
+                next_roles,
+                allow_diff_code=next_has_smaller_cap[idx],
+            ):
                 matched_prev = prev_tail_start + p_offset
                 break
         if matched_prev is not None:
