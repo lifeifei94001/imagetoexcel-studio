@@ -174,10 +174,9 @@
       <!-- ==================== 工作台主视图 ==================== -->
       <template v-if="activeTab === 'workspace'">
         <section class="hero-section">
-          <h1 class="hero-title">将报价单与表格图片转为可编辑 Excel</h1>
+          <h1 class="hero-title">将报价单与多场景表格图片转为可编辑 Excel</h1>
           <p class="hero-subtitle">
-            支持批量上传多张报价单长图。每张图自动合并为 1 份完整报价单 Sheet，后台分片进度运行、结果自动归档至
-            Backblaze 对象存储，可单表导出 <code>.xlsx</code> 或一键打包 <code>.zip</code>。
+            支持手机/平板超长报价单、财务报表、发票明细、库存单、排班考勤等各类表格图片。自动识别文档场景并匹配对应排版风格，支持批量 20 张长图切片提取与 <code>.xlsx</code> / <code>.zip</code> 一键导出。
           </p>
 
           <div class="mode-switch-wrap" role="tablist" aria-label="转换模式">
@@ -324,7 +323,16 @@
                 />
 
                 <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px">
-                  <span style="font-size: 12.5px; font-weight: 600">单图合表（报价单模式）：</span>
+                  <span style="font-size: 12.5px; font-weight: 600">场景识别模式：</span>
+                  <el-radio-group v-model="docType" size="small">
+                    <el-radio value="auto">✨ 智能自动</el-radio>
+                    <el-radio value="quotation">📱 报价单专精</el-radio>
+                    <el-radio value="general">📊 通用表格</el-radio>
+                  </el-radio-group>
+                </div>
+
+                <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px">
+                  <span style="font-size: 12.5px; font-weight: 600">单图多表处理：</span>
                   <el-switch
                     v-model="mergePerImage"
                     active-text="1图合为1个Sheet"
@@ -332,8 +340,11 @@
                   />
                 </div>
 
-                <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px">
-                  <span style="font-size: 12.5px; font-weight: 600">右侧扣费备注列：</span>
+                <div
+                  v-if="docType !== 'general'"
+                  style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px"
+                >
+                  <span style="font-size: 12.5px; font-weight: 600">报价单右侧备注列：</span>
                   <el-switch
                     v-model="pricesOnly"
                     active-text="仅提机型+价格(更快)"
@@ -702,6 +713,7 @@ import {
   setUnauthorizedHandler,
   type BatchJob,
   type ConversionRecord,
+  type DocScenarioType,
   type QuotationGroup,
   type StorageStats,
 } from "./api/convertApi";
@@ -725,11 +737,21 @@ const DRAFT_STORAGE_KEY = "i2e_editor_draft_v2";
 const { theme, glass, activeTab } = useTheme();
 
 const mode = ref<"excel" | "text">("excel");
+const docType = ref<DocScenarioType>("auto");
 const outputMode = ref<"all_in_one" | "per_image">("per_image");
 const mergePerImage = ref(true);
 const pricesOnly = ref(false);
 const modelTier = ref<"fast" | "accurate">("fast");
 const forceDemo = ref(false);
+
+watch(docType, (val) => {
+  if (val === "general") {
+    pricesOnly.value = false;
+    mergePerImage.value = false;
+  } else if (val === "quotation") {
+    mergePerImage.value = true;
+  }
+});
 const customHint = ref("");
 const isDragging = ref(false);
 const extracting = ref(false);
@@ -973,9 +995,13 @@ async function startBatchExtraction() {
               customHint: customHint.value,
               mergePerImage: mergePerImage.value,
               modelTier: modelTier.value,
-              pricesOnly: pricesOnly.value,
+              pricesOnly: docType.value === "general" ? false : pricesOnly.value,
+              docType: docType.value,
             });
             collected[myIdx] = res.quotation;
+            if (res.quotation.suggest_split_sheets && snapshot.length === 1) {
+              mergePerImage.value = false;
+            }
             if (!res.quotation.is_demo) {
               geminiConfigured.value = true;
               activeModel.value = res.quotation.engine;
@@ -1009,7 +1035,8 @@ async function startBatchExtraction() {
                     forceDemo: forceDemo.value,
                     customHint: hintStr,
                     modelTier: modelTier.value,
-                    pricesOnly: pricesOnly.value,
+                    pricesOnly: docType.value === "general" ? false : pricesOnly.value,
+                    docType: docType.value,
                   });
                   completedSlices++;
                   progressItems.value[myIdx].message = `${seamTag}分 ${slices.length} 段${anchorTag}，提取进度 (${completedSlices}/${slices.length})...`;
@@ -1039,11 +1066,11 @@ async function startBatchExtraction() {
             if (firstHeaders?.length) {
               const headerStr = firstHeaders.join(" | ");
               const contNote =
-                `This slice continues the same quotation table. Keep the EXACT ${firstHeaders.length} columns in order: [${headerStr}]. ` +
+                `This slice continues the same table. Keep the EXACT ${firstHeaders.length} columns in order: [${headerStr}]. ` +
                 (slicePlan.hasHeaderAnchor
                   ? "The top strip above the red horizontal bar is ONLY a visual header reference—extract ONLY data rows below the red bar. "
                   : "") +
-                "Keep '-' or empty placeholder slots for missing tiers and do NOT shift prices left or omit rightmost columns.";
+                "Keep '-' or empty placeholder slots for blank cells and do NOT shift columns left or omit rightmost columns.";
               inheritedHeaderHint = inheritedHeaderHint ? `${inheritedHeaderHint}\n${contNote}` : contNote;
             }
 
@@ -1067,12 +1094,16 @@ async function startBatchExtraction() {
               fileSizeBytes: qItem.file.size,
               mode: mode.value,
               mergePerImage: mergePerImage.value,
+              docType: docType.value,
               sliceResults: sliceResults.filter((x): x is Record<string, unknown> => x !== null),
             });
             if (!committed.quotation) {
               throw new Error("长图合并归档失败");
             }
             collected[myIdx] = committed.quotation;
+            if (committed.quotation.suggest_split_sheets && snapshot.length === 1) {
+              mergePerImage.value = false;
+            }
             if (!committed.quotation.is_demo) {
               geminiConfigured.value = true;
               activeModel.value = committed.quotation.engine;

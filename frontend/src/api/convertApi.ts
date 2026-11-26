@@ -1,6 +1,7 @@
 import axios from "axios";
 
 export type ColumnSemanticType = "text" | "number" | "currency" | "percent" | "date";
+export type DocScenarioType = "auto" | "quotation" | "general";
 
 export interface CellWarning {
   row: number;
@@ -25,6 +26,7 @@ export interface ExtractedSheet {
   warnings: CellWarning[];
   section_header_rows?: number[];
   source_filename?: string;
+  style_preset?: "quotation" | "general";
 }
 
 export interface QuotationGroup {
@@ -34,6 +36,8 @@ export interface QuotationGroup {
   engine: string;
   is_demo: boolean;
   notice: string;
+  detected_doc_type?: "quotation" | "general";
+  suggest_split_sheets?: boolean;
   merged_sheet: ExtractedSheet;
   raw_sheets: ExtractedSheet[];
   plain_text?: string;
@@ -302,6 +306,7 @@ export async function processBatchJobItem(params: {
   mergePerImage: boolean;
   modelTier?: "fast" | "accurate";
   pricesOnly?: boolean;
+  docType?: DocScenarioType;
 }): Promise<{
   job_uid: string;
   item: BatchJobItem;
@@ -316,6 +321,7 @@ export async function processBatchJobItem(params: {
   formData.append("merge_per_image", String(params.mergePerImage));
   formData.append("model_tier", params.modelTier || "fast");
   formData.append("prices_only", String(Boolean(params.pricesOnly)));
+  formData.append("doc_type", params.docType || "auto");
   if (params.customHint?.trim()) {
     formData.append("custom_hint", params.customHint.trim());
   }
@@ -333,6 +339,7 @@ export async function extractSlice(params: {
   customHint?: string;
   modelTier?: "fast" | "accurate";
   pricesOnly?: boolean;
+  docType?: DocScenarioType;
 }): Promise<Record<string, unknown>> {
   const formData = new FormData();
   formData.append("file", params.file);
@@ -341,6 +348,7 @@ export async function extractSlice(params: {
   formData.append("force_demo", String(params.forceDemo));
   formData.append("model_tier", params.modelTier || "fast");
   formData.append("prices_only", String(Boolean(params.pricesOnly)));
+  formData.append("doc_type", params.docType || "auto");
   if (params.customHint?.trim()) {
     formData.append("custom_hint", params.customHint.trim());
   }
@@ -357,6 +365,7 @@ export async function commitSlicedQuotation(params: {
   fileSizeBytes: number;
   mode: "excel" | "text";
   mergePerImage: boolean;
+  docType?: DocScenarioType;
   sliceResults: Record<string, unknown>[];
   failedError?: string;
 }): Promise<{
@@ -371,6 +380,7 @@ export async function commitSlicedQuotation(params: {
     file_size_bytes: params.fileSizeBytes,
     mode: params.mode,
     merge_per_image: params.mergePerImage,
+    doc_type: params.docType || "auto",
     slice_results: params.sliceResults,
     failed_error: params.failedError || "",
   });

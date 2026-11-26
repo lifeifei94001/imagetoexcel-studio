@@ -748,17 +748,100 @@ def _extract_code_family_prefix(val: str) -> str:
     return m.group(1).lower() if m else ""
 
 
+def _is_summary_row(row: List[str]) -> bool:
+    """判断是否为财务/通用表格的汇总行（合计/总计/小计/汇总），严禁被机型继承或当孤立残行丢弃。"""
+    for cell in (row or [])[:3]:
+        s = str(cell or "").strip().lower()
+        if not s:
+            continue
+        if s in {"合计", "总计", "小计", "汇总", "共计", "total", "subtotal", "grand total"} or any(
+            s.startswith(p) for p in ("合计", "总计", "小计", "汇总", "共计", "total:", "subtotal:")
+        ):
+            return True
+    return False
+
+
+def _is_quotation_sheet(
+    headers: List[str],
+    rows: List[List[str]],
+    title: str = "",
+    doc_type: str = "auto",
+) -> bool:
+    """
+    自动区分「手机/平板报价单」与「通用多场景表格」（财务报表/发票/库存/考勤/日程等）：
+    - doc_type='quotation' 强制报价单模式；
+    - doc_type='general' 强制通用表格模式；
+    - doc_type='auto' 基于表头语义、容量列实测占比与标题特征综合打分（>=2 判定为报价单）。
+    """
+    dt = (doc_type or "auto").strip().lower()
+    if dt == "quotation":
+        return True
+    if dt == "general":
+        return False
+
+    h_list = [str(h or "").strip() for h in (headers or [])]
+    h_join = " ".join(h_list)
+    score = 0
+
+    strong_quote_kws = ("充新", "靓机", "小花", "大花", "外爆", "内爆", "保修", "蓝光", "彩点", "扣费", "高保")
+    strong_hits = sum(1 for kw in strong_quote_kws if kw in h_join)
+    score += min(4, strong_hits * 2)
+
+    roles = _detect_column_roles(h_list)
+    cap_col = roles.get("cap_col")
+    if cap_col is not None and rows:
+        sample_caps = [str(r[cap_col]).strip() for r in rows[:25] if cap_col < len(r) and str(r[cap_col]).strip()]
+        if sample_caps:
+            cap_ratio = sum(1 for v in sample_caps if _is_capacity_value(v)) / len(sample_caps)
+            if cap_ratio >= 0.5:
+                score += 2
+
+    if any(k in h_join for k in ("型号", "机型", "小型号", "网络型号")) or any(h.endswith("系列") for h in h_list):
+        score += 1
+
+    t_s = str(title or "")
+    if any(k in t_s for k in ("报价", "回收", "靓机", "过保", "在保", "平板行货")):
+        score += 1
+
+    return score >= 2
+
+
+def _should_keep_multi_sheets_separate(sheets: List[Dict[str, Any]], doc_type: str = "auto") -> bool:
+    """
+    当通用多场景图片包含多张结构迥异的表格（如发票上方买卖方信息表 + 下方商品明细表）时，
+    自动建议拆分为独立 Sheet，避免硬拼成畸形单表。
+    """
+    if len(sheets) <= 1:
+        return False
+    dt = (doc_type or "auto").strip().lower()
+    if dt == "quotation":
+        return False
+    if any(_is_quotation_sheet(s.get("headers") or [], s.get("rows") or [], s.get("name", ""), dt) for s in sheets):
+        return False
+
+    base_h = {_norm_header(h) for h in (sheets[0].get("headers") or []) if str(h or "").strip()}
+    base_len = len(sheets[0].get("headers") or [])
+    for sh in sheets[1:]:
+        cur_h = {_norm_header(h) for h in (sh.get("headers") or []) if str(h or "").strip()}
+        cur_len = len(sh.get("headers") or [])
+        union_n = max(1, len(base_h | cur_h))
+        overlap = len(base_h & cur_h) / union_n
+        if overlap < 0.4 and (cur_len != base_len or overlap < 0.2):
+            return True
+    return False
+
+
 def merge_sheets_into_single_quotation(
     sheets: List[Dict[str, Any]],
     quote_title: str,
     fallback_stem: str = "报价单",
+    doc_type: str = "auto",
 ) -> Dict[str, Any]:
     """
-    忠实原图合表：
-    - 彻底去掉人工「分类/区块」列，A 列直接为原图第 1 列（如 型号）；
-    - 自动过滤顶部「成色说明 / 等级说明」非价格图例表；
-    - 当后续区块表头文字与上一区块不同时，在数据流中保留该区块原表头行并记入 section_header_rows，
-      导出 Excel 时自动渲染为苹果绿区块表头，最大程度贴近原图与 WPS 效果。
+    忠实原图合表（兼容报价单与通用表格双模式）：
+    - 彻底去掉人工「分类/区块」列，A 列直接为原图第 1 列；
+    - 报价单模式下自动过滤顶部「成色说明 / 等级说明」图例表并清理纯重复系列表头；
+    - 通用表格模式下跳过报价单专属清洗，保护合计行与原始列结构，标记 style_preset='general'。
     """
     final_name = _pick_quote_title(quote_title, fallback_stem)
     if not sheets:
@@ -770,22 +853,41 @@ def merge_sheets_into_single_quotation(
             "merges": [],
             "warnings": [],
             "section_header_rows": [],
+            "style_preset": "general" if doc_type == "general" else "quotation",
         }
 
-    # 若同时存在正式报价表与顶部「成色说明」图例表，自动剔除图例表
-    non_legend = [sh for sh in sheets if not _is_condition_legend_sheet(sh)]
-    candidate_sheets = non_legend if non_legend else sheets
+    any_quote = any(
+        _is_quotation_sheet(sh.get("headers") or [], sh.get("rows") or [], quote_title or sh.get("name", ""), doc_type)
+        for sh in sheets
+    )
 
-    # 先对每个区块独立清洗（防重复表头/残缺行/合并空型号），避免干扰后续区块小表头
+    # 仅在报价单场景下过滤顶部「成色说明」图例表
+    if any_quote:
+        non_legend = [sh for sh in sheets if not _is_condition_legend_sheet(sh)]
+        candidate_sheets = non_legend if non_legend else sheets
+    else:
+        candidate_sheets = sheets
+
+    # 先对每个区块独立清洗（防重复表头/残缺行/合并空型号），通用表则跳过报价单专属规则
     cleaned_sheets: List[Dict[str, Any]] = []
     for sh in candidate_sheets:
         sh_copy = json.loads(json.dumps(sh))
+        sh_is_quote = _is_quotation_sheet(
+            sh_copy.get("headers") or [],
+            sh_copy.get("rows") or [],
+            quote_title or sh_copy.get("name", ""),
+            doc_type,
+        )
         c_rows, c_warns = _clean_quotation_rows(
-            sh_copy.get("headers") or [], sh_copy.get("rows") or [], sh_copy.get("warnings") or []
+            sh_copy.get("headers") or [],
+            sh_copy.get("rows") or [],
+            sh_copy.get("warnings") or [],
+            is_quotation=sh_is_quote,
         )
         if c_rows:
             sh_copy["rows"] = c_rows
             sh_copy["warnings"] = c_warns
+            sh_copy["style_preset"] = "quotation" if sh_is_quote else "general"
             cleaned_sheets.append(sh_copy)
 
     if not cleaned_sheets:
@@ -795,7 +897,7 @@ def merge_sheets_into_single_quotation(
         single = cleaned_sheets[0]
         single["name"] = final_name
         single.setdefault("section_header_rows", [])
-        return _global_post_clean_and_audit(single)
+        return _global_post_clean_and_audit(single, doc_type=doc_type)
 
     # 选用列数最完整（同列数取第 1 个）的子表作为顶部主表头
     master_sheet = max(cleaned_sheets, key=lambda s: len(s.get("headers") or []))
@@ -830,6 +932,9 @@ def merge_sheets_into_single_quotation(
     master_roles = _detect_column_roles(unified_headers)
     master_model_col = master_roles.get("model_col")
     skipped_series_header_variants = False
+    seen_series_headers: set = set()
+    if master_model_col is not None and master_model_col < len(unified_headers) and unified_headers[master_model_col].endswith("系列"):
+        seen_series_headers.add(unified_headers[master_model_col])
 
     prev_header_row = [""] * total_cols
     first_headers = cleaned_sheets[0].get("headers") or []
@@ -844,6 +949,8 @@ def merge_sheets_into_single_quotation(
         for i, h in enumerate(cur_headers):
             if i < len(local_to_global):
                 cur_header_row[local_to_global[i]] = str(h or "").strip()
+        if master_model_col is not None and master_model_col < len(cur_header_row) and cur_header_row[master_model_col].endswith("系列"):
+            seen_series_headers.add(cur_header_row[master_model_col])
 
         # 若当前区块表头与上一区块存在实质差异（价格/容量/编码列有变化），保留区块小表头行；
         # 若仅末尾备注列为空，或仅第 1 列在「xxx系列 / 型号」间切换而右侧全部价格列完全一致，则视作纯重复系列表头予以合并清理！
@@ -855,7 +962,8 @@ def merge_sheets_into_single_quotation(
                 for ci in range(total_cols)
             )
             only_series_model_header_swap = (
-                not non_model_diff
+                any_quote
+                and not non_model_diff
                 and master_model_col is not None
                 and _is_series_or_header_model(cur_header_row[master_model_col])
                 and _is_series_or_header_model(prev_header_row[master_model_col])
@@ -891,9 +999,11 @@ def merge_sheets_into_single_quotation(
             except Exception:
                 continue
 
-    # 若同一张连续表合并了多个不同「xxx系列」分段表头，将顶部 A 列主表头归一为「型号」，避免「Mate pad Air系列」覆盖 Pro 等其他系列
+    # 若同一张连续报价表涵盖多个不同「xxx系列」分段表头（如华为 Mate pad Air/Mate pad、苹果 Pro/Air/Mini），
+    # 将顶部 A 列主表头归一为「型号」，避免首个系列名覆盖整表其他系列
     if (
-        skipped_series_header_variants
+        any_quote
+        and (skipped_series_header_variants or len(seen_series_headers) >= 2)
         and master_model_col is not None
         and master_model_col < len(unified_headers)
         and unified_headers[master_model_col].endswith("系列")
@@ -908,29 +1018,27 @@ def merge_sheets_into_single_quotation(
         "merges": [],
         "warnings": merged_warnings,
         "section_header_rows": section_header_rows,
+        "style_preset": "quotation" if any_quote else "general",
     }
-    return _global_post_clean_and_audit(result_sheet)
+    return _global_post_clean_and_audit(result_sheet, doc_type=doc_type)
 
 
-def _global_post_clean_and_audit(sheet: Dict[str, Any]) -> Dict[str, Any]:
+def _global_post_clean_and_audit(sheet: Dict[str, Any], doc_type: str = "auto") -> Dict[str, Any]:
     """
-    合表后全局二次精洗与异常逻辑自检（核心攻克超长图 13 混入 13 PRO 尾两行等跨块幽灵行）：
-    1. 严格保留 section_header_rows 不动，并在每个连续数据段内做 6 行回看窗口去重：
-       - 若本行与前 1~6 行中某行「容量一致 + 价格序列（>=2 列）完全一致」，且满足以下任一条件：
-         a) 机型名兼容（如 13 PRO vs 13、17pro vs 17 或同机型），或
-         b) 属于「容量回跳幽灵行」（当前行刚切入新机型且容量偏大如 512/1T，后续同机型行又从更小容量 128/256 重新起排），
-         则判定为切缝幽灵行并剔除，保留前序完整机型行与编码，同步平移 section_header_rows 和 warnings 索引。
-    2. 全局自检标黄（写入 warnings 供前端高亮复核）：
-       - 同区块同机型出现重复容量；
-       - 有效机型+容量行全价位缺失；
-       - 同行档位价格严重违背该区块主导的从左到右递减规律（跳升超 15%）。
+    合表后全局二次精洗与异常逻辑自检：
+    - 先识别当前表是「报价单」还是「通用多场景表格」并写入 style_preset；
+    - 通用表格仅保留原始结构与原有 warnings，严禁运行报价单专属的容量/成色档位自检与去重规则；
+    - 报价单则执行跨块幽灵行剔除、网络型号分组一致性纠偏、xxx系列误填回填与价格逻辑自检。
     """
     headers: List[str] = sheet.get("headers") or []
     rows: List[List[str]] = sheet.get("rows") or []
     warnings: List[Dict[str, Any]] = list(sheet.get("warnings") or [])
     sec_headers_set = set(int(x) for x in (sheet.get("section_header_rows") or []))
 
-    if not headers or not rows:
+    is_quote = _is_quotation_sheet(headers, rows, sheet.get("name", ""), doc_type)
+    sheet["style_preset"] = "quotation" if is_quote else "general"
+
+    if not headers or not rows or not is_quote:
         return sheet
 
     roles = _detect_column_roles(headers)
@@ -1275,15 +1383,37 @@ def _clean_quotation_rows(
     headers: List[str],
     rows: List[List[str]],
     warnings: List[Dict[str, Any]],
+    is_quotation: bool = True,
 ) -> tuple[List[List[str]], List[Dict[str, Any]]]:
     """
-    Q2 智能清洗报价单异常行：
-    1. 剔除因分段识别混入数据区的重复表头行（如 型号/容量/靓机 行）；
-    2. 剔除切片边界处「缺型号但容量+价格与下一行重合」的残缺重复行；
-    3. 区块内合并单元格造成的空型号行向下继承机型名；仍无归属机型的孤立行自动过滤，彻底杜绝无机型却有价格。
+    智能清洗异常行（区分报价单与通用表格）：
+    - 通用表格（is_quotation=False）：仅剔除与顶部表头完全一致的重复内嵌表头行，完整保留合计/小计行、空白首列分组行与全部原始数据；
+    - 报价单（is_quotation=True）：剔除重复表头与切缝残缺行，自动向下继承多层嵌套合并列，并保护合计/小计行不被覆盖。
     """
     if not rows or not headers:
         return rows, warnings
+
+    if not is_quotation:
+        norm_hdr = [re.sub(r"\s+", "", str(h or "")).lower() for h in headers]
+        kept_rows: List[List[str]] = []
+        row_map: Dict[int, int] = {}
+        for idx, r in enumerate(rows):
+            norm_r = [re.sub(r"\s+", "", str(c or "")).lower() for c in r[: len(norm_hdr)]]
+            if norm_r == norm_hdr and any(norm_hdr):
+                continue
+            row_map[idx] = len(kept_rows)
+            kept_rows.append(list(r))
+        mapped_warns: List[Dict[str, Any]] = []
+        for w in (warnings or []):
+            try:
+                orig_r = int(w["row"])
+                if orig_r in row_map:
+                    mapped_warns.append(
+                        {"row": row_map[orig_r], "col": int(w["col"]), "reason": str(w.get("reason") or "")}
+                    )
+            except Exception:
+                continue
+        return kept_rows, mapped_warns
 
     roles = _detect_column_roles(headers)
     model_col: Optional[int] = roles["model_col"]
@@ -1378,6 +1508,12 @@ def _clean_quotation_rows(
 
         m_val = r[model_col].strip() if model_col < len(r) else ""
         c_val = r[cap_col].strip() if cap_col is not None and cap_col < len(r) else ""
+
+        # 汇总行（合计/总计/小计）原样保留，绝不套用上一行机型名也不丢弃
+        if _is_summary_row(r):
+            step2_map[idx] = len(step2_rows)
+            step2_rows.append(r)
+            continue
 
         if not m_val:
             # 检查是否与后 1~2 行（带完整机型）容量+价格重复
@@ -1591,14 +1727,17 @@ def _rows_overlap_equivalent(
     prev_roles: Optional[Dict[str, Any]] = None,
     next_roles: Optional[Dict[str, Any]] = None,
     allow_diff_code: bool = False,
+    is_quotation: bool = True,
 ) -> bool:
     """
     动态列感知判断两段切片重叠处的两行是否为同一条数据：
-    - 兼容 `型号 | 容量 | 价格...` 与 `型号 | 网络型号 | 容量 | 价格...` 等多前置列结构；
-    - 兼容切缝导致的短机型截断（17 vs 17pro）或错标邻近机型（13 PRO 尾行被错套 13 / A2634）。
+    - 通用表格模式（is_quotation=False）：仅在整行完全一致时判定为重叠重复，杜绝误删同金额相邻流水/明细行；
+    - 报价单模式（is_quotation=True）：兼容多前置列结构与切缝短机型截断/容量回跳幽灵行。
     """
     if _row_signature(prev_row) == _row_signature(next_row):
         return True
+    if not is_quotation:
+        return False
     m_a, cap_a, p_prices = _extract_row_semantics(prev_row, prev_roles)
     m_b, cap_b, n_prices = _extract_row_semantics(next_row, next_roles)
 
@@ -1653,10 +1792,12 @@ def _dedupe_boundary_overlap(
     prev_headers: Optional[List[str]] = None,
     next_headers: Optional[List[str]] = None,
     max_window: int = 10,
+    is_quotation: bool = True,
 ) -> int:
     """
     计算前后两段切片在重叠区域的重复行数（动态适配任意前置列布局）：
-    - 若匹配到切缝残缺行或跨机型幽灵行，自动保留更完整的一方并跳过 next_rows 起始重复行。
+    - 报价单模式：若匹配到切缝残缺行或跨机型幽灵行，自动保留更完整的一方并跳过 next_rows 起始重复行；
+    - 通用表格模式：仅对整行完全一致的切片重叠行去重，避免误删同金额相邻流水/明细。
     """
     if not prev_rows or not next_rows:
         return 0
@@ -1667,22 +1808,23 @@ def _dedupe_boundary_overlap(
     prev_tail = prev_rows[prev_tail_start:]
     next_head = next_rows[:max_window]
 
-    # 检测 next_head 中是否存在「容量回跳幽灵行」（例如 13 / A2634 先出 512/1T，紧接着又从 128 起排）
-    next_sems = [_extract_row_semantics(r, next_roles) for r in next_rows[: max_window + 6]]
+    # 检测 next_head 中是否存在「容量回跳幽灵行」（仅报价单模式启用）
     next_has_smaller_cap: List[bool] = [False] * len(next_head)
-    for i in range(len(next_head)):
-        m_i, c_i, _ = next_sems[i]
-        gb_i = _cap_to_gb(c_i)
-        if not m_i or gb_i is None:
-            continue
-        for j in range(i + 1, min(len(next_sems), i + 6)):
-            m_j, c_j, _ = next_sems[j]
-            if m_j != m_i:
-                break
-            gb_j = _cap_to_gb(c_j)
-            if gb_j is not None and gb_j < gb_i:
-                next_has_smaller_cap[i] = True
-                break
+    if is_quotation:
+        next_sems = [_extract_row_semantics(r, next_roles) for r in next_rows[: max_window + 6]]
+        for i in range(len(next_head)):
+            m_i, c_i, _ = next_sems[i]
+            gb_i = _cap_to_gb(c_i)
+            if not m_i or gb_i is None:
+                continue
+            for j in range(i + 1, min(len(next_sems), i + 6)):
+                m_j, c_j, _ = next_sems[j]
+                if m_j != m_i:
+                    break
+                gb_j = _cap_to_gb(c_j)
+                if gb_j is not None and gb_j < gb_i:
+                    next_has_smaller_cap[i] = True
+                    break
 
     max_k = min(len(prev_tail), len(next_head))
     for k in range(max_k, 0, -1):
@@ -1693,6 +1835,7 @@ def _dedupe_boundary_overlap(
                 prev_roles,
                 next_roles,
                 allow_diff_code=next_has_smaller_cap[i],
+                is_quotation=is_quotation,
             )
             for i in range(k)
         ):
@@ -1711,6 +1854,7 @@ def _dedupe_boundary_overlap(
                 prev_roles,
                 next_roles,
                 allow_diff_code=next_has_smaller_cap[idx],
+                is_quotation=is_quotation,
             ):
                 matched_prev = prev_tail_start + p_offset
                 break
@@ -1726,8 +1870,9 @@ def merge_quotation_slices(
     slice_results: List[Dict[str, Any]],
     filename: str,
     merge_per_image: bool = True,
+    doc_type: str = "auto",
 ) -> Dict[str, Any]:
-    """将同一张超长报价单切分后的多段识别结果无损拼接、重叠去重，并合成为 1 份完整报价单。"""
+    """将同一张超长表格切分后的多段识别结果无损拼接、重叠去重，并自适应报价单与通用表格双模式。"""
     stem = Path(filename or "extracted").stem
     if not slice_results:
         return _build_demo_result(filename, "excel")
@@ -1747,6 +1892,13 @@ def merge_quotation_slices(
         if n and n not in notes_parts:
             notes_parts.append(n)
 
+    # 先基于所有切片综合判定是否为报价单（避免通用长表误用报价单模糊去重）
+    all_slice_sheets = [sh for sr in slice_results for sh in (sr.get("raw_sheets") or sr.get("sheets") or [])]
+    is_quote_doc = any(
+        _is_quotation_sheet(sh.get("headers") or [], sh.get("rows") or [], quote_title or sh.get("name", ""), doc_type)
+        for sh in all_slice_sheets
+    )
+
     combined_raw_sheets: List[Dict[str, Any]] = []
     for sr in slice_results:
         for sh in (sr.get("raw_sheets") or sr.get("sheets") or []):
@@ -1760,11 +1912,11 @@ def merge_quotation_slices(
             same_name = prev_name == cur_name
             same_headers = prev.get("headers") == sh_copy.get("headers")
             is_continuation = cur_name.lower() in {"", "sheet1", "table", "continuation", "续表"}
-            if same_name or (same_headers and is_continuation):
+            if same_name or same_headers or is_continuation:
                 prev_rows = prev.get("rows") or []
                 next_rows = sh_copy.get("rows") or []
                 skip = _dedupe_boundary_overlap(
-                    prev_rows, next_rows, prev.get("headers"), sh_copy.get("headers")
+                    prev_rows, next_rows, prev.get("headers"), sh_copy.get("headers"), is_quotation=is_quote_doc
                 )
                 trimmed_next = next_rows[skip:]
                 if same_headers:
@@ -1779,23 +1931,33 @@ def merge_quotation_slices(
                     continue
                 sh_copy["rows"] = trimmed_next
             else:
-                # 不同区块名或列数微差时，仍在相邻切片边界做动态列感知去重
                 skip = _dedupe_boundary_overlap(
-                    prev.get("rows") or [], sh_copy.get("rows") or [], prev.get("headers"), sh_copy.get("headers")
+                    prev.get("rows") or [],
+                    sh_copy.get("rows") or [],
+                    prev.get("headers"),
+                    sh_copy.get("headers"),
+                    is_quotation=is_quote_doc,
                 )
                 sh_copy["rows"] = (sh_copy.get("rows") or [])[skip:]
             if sh_copy.get("rows"):
                 combined_raw_sheets.append(sh_copy)
 
     for rsh in combined_raw_sheets:
+        rsh_is_quote = _is_quotation_sheet(
+            rsh.get("headers") or [], rsh.get("rows") or [], quote_title or rsh.get("name", ""), doc_type
+        )
         r_rows, r_warns = _clean_quotation_rows(
-            rsh["headers"], rsh["rows"], rsh.get("warnings") or []
+            rsh["headers"], rsh["rows"], rsh.get("warnings") or [], is_quotation=rsh_is_quote
         )
         rsh["rows"] = r_rows
         rsh["warnings"] = r_warns
         rsh.setdefault("section_header_rows", [])
+        rsh["style_preset"] = "quotation" if rsh_is_quote else "general"
 
-    merged_sheet = merge_sheets_into_single_quotation(combined_raw_sheets, quote_title, stem)
+    merged_sheet = merge_sheets_into_single_quotation(combined_raw_sheets, quote_title, stem, doc_type=doc_type)
+    suggest_split = _should_keep_multi_sheets_separate(combined_raw_sheets, doc_type=doc_type)
+    detected_doc_type = "quotation" if is_quote_doc else "general"
+
     last_res = slice_results[-1]
     plain_lines = []
     if merged_sheet.get("headers"):
@@ -1810,11 +1972,13 @@ def merge_quotation_slices(
         "document_notes": " | ".join(notes_parts),
         "raw_sheets": combined_raw_sheets,
         "merged_sheet": merged_sheet,
-        "sheets": [merged_sheet] if merge_per_image else combined_raw_sheets,
+        "sheets": [merged_sheet] if (merge_per_image and not suggest_split) else combined_raw_sheets,
         "plain_text": "\n".join(plain_lines),
         "engine": last_res.get("engine", DEFAULT_GEMINI_MODEL),
         "is_demo": bool(last_res.get("is_demo", False)),
-        "notice": f"长图已分 {len(slice_results)} 段高清切片提取并去重合并（共 {len(merged_sheet.get('rows') or [])} 行）",
+        "detected_doc_type": detected_doc_type,
+        "suggest_split_sheets": suggest_split,
+        "notice": f"长图已分 {len(slice_results)} 段高清切片提取并去重合并（共 {len(merged_sheet.get('rows') or [])} 行 · {'报价单模式' if is_quote_doc else '通用表格模式'}）",
     }
 
 
@@ -1848,16 +2012,25 @@ def extract_tables_from_image(
     merge_per_image: bool = True,
     model_tier: str = "fast",
     prices_only: bool = False,
+    doc_type: str = "auto",
 ) -> Dict[str, Any]:
     """
-    核心图像表格提取函数（高可靠加固版）：
+    核心图像表格提取函数（双模式自适应 + 高可靠加固版）：
+    - 支持 doc_type='auto'（智能自动识别报价单/通用表格）、'quotation'（报价单专精）、'general'（通用多场景表格）；
     - 默认锁定极速稳定模型 gemini-3.5-flash-lite / gemini-3.1-flash-lite（绝不擅自切换易 503 的 Hydrogen）；
     - 超时预算严格控制在 Vercel 60s 函数上限内（22s + 16s + 12s <= 52s）；
     - 除 429/5xx/超时自动切换外，对空输出、畸形 JSON 或 0 行结果同样触发自动跨模型兜底重试。
     """
+    norm_doc_type = (doc_type or "auto").strip().lower()
+    if norm_doc_type not in {"auto", "quotation", "general"}:
+        norm_doc_type = "auto"
+    effective_prices_only = bool(prices_only) and norm_doc_type != "general"
+
     api_key = _get_gemini_api_key()
     if force_demo or not api_key:
         demo_res = _build_demo_result(filename, mode)
+        demo_res["detected_doc_type"] = "general"
+        demo_res["suggest_split_sheets"] = False
         if not merge_per_image:
             demo_res["sheets"] = demo_res["raw_sheets"]
         return demo_res
@@ -1879,33 +2052,51 @@ def extract_tables_from_image(
     candidate_models: List[str] = raw_candidates[:3]
     primary_model = candidate_models[0]
 
-    right_col_rule = (
-        "PRICES-ONLY MODE ENABLED: Extract ONLY the left identification columns (e.g. '型号', '网络型号', '容量/内存') and all numeric price tier columns (e.g. '靓机', '小花', '大花', '外爆', '内爆可测'). COMPLETELY SKIP long rightmost deduction/remark text columns ('备注', '扣费说明', '扣费项', '蓝光/彩点') to maximize speed and numeric precision. "
-        if prices_only
-        else "NEVER omit rightmost remark or deduction columns! Even if the rightmost columns contain dense multi-line Chinese rules (like '绿色-50 / 港澳版-150 / 像头水印-100 / 弹屏-450') or share a merged header ('扣费说明' / '备注'), ALWAYS include them faithfully as dedicated rightmost column(s). "
-    )
-
-    instruction = (
-        "You are an expert document and quotation-sheet OCR extraction engine. "
-        "CRITICAL: Extract EVERY SINGLE ROW and EVERY table/block visible in this image from the very top to the very bottom. "
-        "NEVER omit rows, NEVER omit price cells, NEVER output empty blank rows, NEVER stop after the first section, and NEVER truncate the output. "
-        "VISUAL HEADER ANCHOR RULE: If there is a bright RED horizontal divider bar near the top of the image, the strip ABOVE the red bar is a copied visual column-header reference from the top of the sheet—use it ONLY to keep exact column names and left-to-right column alignment, and put ONLY the data rows BELOW the red bar into `rows`. "
-        "EXACT HEADER COUNT RULE: Count EVERY visible column header from left to right and NEVER omit columns such as '小型号', '网络型号', '地区/行货', '网络/WIFI版', or '备注'! For example, Huawei/Honor tablet sheets have 10 columns ('Mate pad Air系列 | 小型号 | 容量 | 充新 | 靓机 | 小花 | 大花 | 外爆 | 内爆可测 | 备注') and iPad sheets have 12 columns ('型号 | 网络型号 | 地区 | 版本 | 容量 | 充新 | 靓机 | 小花 | 大花 | 外爆 | 内爆可测 | 备注'). Every row MUST align 1-to-1 with every header column! "
-        "IMPORTANT: When left-hand columns are nested vertically merged cells (for example a tablet series spanning 8 rows containing multiple '小型号' blocks like 'AST-W00 WIFI' / 'AST-W10 WIFI 柔光版', or an iPad model spanning 12 rows containing '行货' and 'WIFI版' / 'WIFI版 纳米' / '插卡版'), REPEAT EVERY left-hand column value onto EVERY row belonging to its horizontal grid box! "
-        "NEVER COPY SECTION HEADER AS MODEL NAME: Repeated green sub-header labels ending in '系列' (such as 'Mate pad系列', 'Mate pad Air系列', 'Pro系列', 'Air系列') are COLUMN HEADERS ONLY—NEVER put them into a data row's model column! When a tall vertically merged model cell starts right below a green 'xxx系列' header and its centered model name (e.g. 'Mate pad Pro 2024年 12.2寸' or 'Mate pad Pro 23年 13.2寸') is printed lower down in the middle of the box, ALWAYS read downward inside that same merged box and fill that real model name onto the top rows too! "
-        "NEVER pull a model name UPWARD from a lower horizontal border box onto orphan rows above the border line! If a row at the very top edge has a blank model cell separated by a dark horizontal border from the model below, leave its model cell empty '' or omit the clipped orphan row rather than assigning the NEXT model's name to it. "
-        "SINGLE-LINE MODEL NAME RULE: NEVER put newline characters or literal '\\n' inside model names, network codes, capacities, or prices! If a model name wraps across two lines inside a narrow cell (for example '15 PRO' over 'MAX', or '荣耀Robot' over 'Phone', or 'MATE XT2' over '非凡大师'), ALWAYS join them on ONE line with a single space ('15 PRO MAX', '荣耀Robot Phone', 'MATE XT2 非凡大师'). "
-        "BRAND & WATERMARK PRECISION: Carefully distinguish English letters vs digits in brand names and network codes (e.g. 'iQOO' with letters OO NOT digits 00, 'OPPO', 'ROG', 'A3108', 'A2639', 'PMK110', 'LAP-AL10'). Completely IGNORE faint diagonal watermarks (such as '靓机汇报价单') overlapping numbers or capacities—never attach stray watermark letters to capacities or prices. "
-        "Do NOT include repeated sub-table header rows (like '型号 | 容量 | 靓机...') inside `rows`; instead represent each sub-block as an item in `sheets` with its exact `headers`. "
-        "If a sub-table has '-' or blank placeholder columns (for example no highest price tier), KEEP that column slot so all blocks preserve consistent column structure and alignment. "
-        + right_col_rule
-        + "Preserve EVERY Chinese character verbatim with 100% precision (e.g. '高保充新-全套', '不看保修', '不需保修', '在保', '充新', '靓机', '小靓机', '小花', '大花', '外爆', '内爆可测', '网络型号', '蓝光/彩点', '扣费说明', '扣费项', '备注扣费项', '电芯'). NEVER substitute lookalike Chinese characters and NEVER translate titles or section names into English. "
-        "Set `title` to the main quotation header visible in the image (e.g. vendor name + date like '苹果行货 过保机 2026-11-25上午 回收报价'). "
-        "Put top/edge vendor rules, validity notices, disclaimers, AND any top condition-definition legend table (like '成色说明 / 等级说明 / 外屏 / 边框背板 / 内屏显示') into `document_notes`—NEVER extract that condition-definition legend table as a sheet in `sheets` when phone model price rows exist! "
-        "Preserve exact text, model names, capacities (both Apple '128'/'256'/'512'/'1T' and Android '12+256'/'16+512'/'16+1TB'), numbers, range strings (e.g. '3200-3300'), '+50', and leading zeros (e.g. '001042'). "
-        "Every row in `rows` MUST have the exact same number of elements as `headers` (use empty string '' for blank cells). "
-        "Set `col_types` accurately for each column (`text`, `number`, `currency`, `percent`, `date`)."
-    )
+    if norm_doc_type == "general":
+        instruction = (
+            "You are an expert universal document-and-table OCR extraction engine (supporting financial statements, invoices, receipts, inventory sheets, attendance logs, schedules, BOMs, web/ERP screenshots, and general Chinese/English tables). "
+            "CRITICAL: Extract EVERY SINGLE ROW, EVERY COLUMN, and EVERY distinct table visible in this image from top to bottom. "
+            "NEVER omit columns (including remarks/notes/descriptions), NEVER omit summary/subtotal/total rows ('合计', '小计', '总计', 'Total'), NEVER output blank empty rows, and NEVER truncate the output. "
+            "VISUAL HEADER ANCHOR RULE: If there is a bright RED horizontal divider bar near the top of the image, the strip ABOVE the red bar is a copied visual column-header reference—use it ONLY to keep exact column names and left-to-right column alignment, and put ONLY the data rows BELOW the red bar into `rows`. "
+            "MULTI-TABLE SEPARATION RULE: If the image contains multiple structurally distinct tables (for example an invoice buyer/seller summary block at the top and an itemized line-items table below), output each distinct table as a separate item in `sheets` with a concise Chinese/English `name`. "
+            "MERGED CELLS & TEXT FIDELITY: When a left-hand grouping column is vertically merged across multiple detail rows, repeat that group value onto each corresponding row (EXCEPT summary/total rows like '合计'/'小计', which must keep their own layout). Join wrapped single-cell titles on one line with spaces instead of literal '\\n'. "
+            "NUMBER & CURRENCY FIDELITY: Preserve exact numbers, currency symbols and thousands separators (e.g. '¥1,284,000.00', '$499.50'), percentages ('24.6%'), dates ('2026-11-26'), formulas/ranges, and leading zeros (e.g. '001042'). Ignore diagonal watermarks. "
+            "Put non-tabular page headers, footnotes, or disclaimers into `document_notes`. Set `title` to the main document title visible in the image. "
+            "Every row in `rows` MUST have the exact same length as `headers` (use '' for blank cells), and set `col_types` accurately (`text`, `number`, `currency`, `percent`, `date`)."
+        )
+    else:
+        right_col_rule = (
+            "PRICES-ONLY MODE ENABLED (for quotation sheets): Extract ONLY the left identification columns (e.g. '型号', '网络型号', '小型号', '容量/内存') and all numeric price tier columns (e.g. '充新', '靓机', '小花', '大花', '外爆', '内爆可测'). COMPLETELY SKIP long rightmost deduction/remark text columns ('备注', '扣费说明', '扣费项', '蓝光/彩点') to maximize speed and numeric precision. (If this image is NOT a quotation sheet—e.g. a financial report, invoice, or general table—keep ALL columns faithfully.) "
+            if effective_prices_only
+            else "NEVER omit rightmost remark or deduction columns! Even if the rightmost columns contain dense multi-line Chinese rules (like '绿色-50 / 港澳版-150 / 像头水印-100 / 弹屏-450') or share a merged header ('扣费说明' / '备注'), ALWAYS include them faithfully as dedicated rightmost column(s). "
+        )
+        general_adapt_rule = (
+            "GENERAL MULTI-SCENARIO ADAPTATION: If this image is a general non-quotation table (financial statement, invoice, BOM, inventory, schedule, attendance, ERP screenshot), faithfully keep ALL columns, preserve currency symbols and thousands separators (e.g. '¥1,284,000.00'), preserve all '合计/小计/总计' summary rows, and place structurally distinct tables as separate items in `sheets`. "
+            if norm_doc_type == "auto"
+            else ""
+        )
+        instruction = (
+            "You are an expert document and quotation-sheet OCR extraction engine. "
+            "CRITICAL: Extract EVERY SINGLE ROW and EVERY table/block visible in this image from the very top to the very bottom. "
+            "NEVER omit rows, NEVER omit price cells, NEVER output empty blank rows, NEVER stop after the first section, and NEVER truncate the output. "
+            + general_adapt_rule
+            + "VISUAL HEADER ANCHOR RULE: If there is a bright RED horizontal divider bar near the top of the image, the strip ABOVE the red bar is a copied visual column-header reference from the top of the sheet—use it ONLY to keep exact column names and left-to-right column alignment, and put ONLY the data rows BELOW the red bar into `rows`. "
+            "EXACT HEADER COUNT RULE: Count EVERY visible column header from left to right and NEVER omit columns such as '小型号', '网络型号', '地区/行货', '网络/WIFI版', or '备注'! For example, Huawei/Honor tablet sheets have 10 columns ('Mate pad Air系列 | 小型号 | 容量 | 充新 | 靓机 | 小花 | 大花 | 外爆 | 内爆可测 | 备注') and iPad sheets have 12 columns ('型号 | 网络型号 | 地区 | 版本 | 容量 | 充新 | 靓机 | 小花 | 大花 | 外爆 | 内爆可测 | 备注'). Every row MUST align 1-to-1 with every header column! "
+            "IMPORTANT: When left-hand columns are nested vertically merged cells (for example a tablet series spanning 8 rows containing multiple '小型号' blocks like 'AST-W00 WIFI' / 'AST-W10 WIFI 柔光版', or an iPad model spanning 12 rows containing '行货' and 'WIFI版' / 'WIFI版 纳米' / '插卡版'), REPEAT EVERY left-hand column value onto EVERY row belonging to its horizontal grid box! "
+            "NEVER COPY SECTION HEADER AS MODEL NAME: Repeated green sub-header labels ending in '系列' (such as 'Mate pad系列', 'Mate pad Air系列', 'Pro系列', 'Air系列') are COLUMN HEADERS ONLY—NEVER put them into a data row's model column! When a tall vertically merged model cell starts right below a green 'xxx系列' header and its centered model name (e.g. 'Mate pad Pro 2024年 12.2寸' or 'Mate pad Pro 23年 13.2寸') is printed lower down in the middle of the box, ALWAYS read downward inside that same merged box and fill that real model name onto the top rows too! "
+            "NEVER pull a model name UPWARD from a lower horizontal border box onto orphan rows above the border line! If a row at the very top edge has a blank model cell separated by a dark horizontal border from the model below, leave its model cell empty '' or omit the clipped orphan row rather than assigning the NEXT model's name to it. "
+            "SINGLE-LINE MODEL NAME RULE: NEVER put newline characters or literal '\\n' inside model names, network codes, capacities, or prices! If a model name wraps across two lines inside a narrow cell (for example '15 PRO' over 'MAX', or '荣耀Robot' over 'Phone', or 'MATE XT2' over '非凡大师'), ALWAYS join them on ONE line with a single space ('15 PRO MAX', '荣耀Robot Phone', 'MATE XT2 非凡大师'). "
+            "BRAND & WATERMARK PRECISION: Carefully distinguish English letters vs digits in brand names and network codes (e.g. 'iQOO' with letters OO NOT digits 00, 'OPPO', 'ROG', 'A3108', 'A2639', 'PMK110', 'LAP-AL10'). Completely IGNORE faint diagonal watermarks (such as '靓机汇报价单') overlapping numbers or capacities—never attach stray watermark letters to capacities or prices. "
+            "Do NOT include repeated sub-table header rows (like '型号 | 容量 | 靓机...') inside `rows`; instead represent each sub-block as an item in `sheets` with its exact `headers`. "
+            "If a sub-table has '-' or blank placeholder columns (for example no highest price tier), KEEP that column slot so all blocks preserve consistent column structure and alignment. "
+            + right_col_rule
+            + "Preserve EVERY Chinese character verbatim with 100% precision (e.g. '高保充新-全套', '不看保修', '不需保修', '在保', '充新', '靓机', '小靓机', '小花', '大花', '外爆', '内爆可测', '网络型号', '蓝光/彩点', '扣费说明', '扣费项', '备注扣费项', '电芯'). NEVER substitute lookalike Chinese characters and NEVER translate titles or section names into English. "
+            "Set `title` to the main quotation or document header visible in the image (e.g. '苹果行货 过保机 2026-11-25上午 回收报价'). "
+            "Put top/edge vendor rules, validity notices, disclaimers, AND any top condition-definition legend table (like '成色说明 / 等级说明 / 外屏 / 边框背板 / 内屏显示') into `document_notes`—NEVER extract that condition-definition legend table as a sheet in `sheets` when phone/tablet price rows exist! "
+            "Preserve exact text, model names, capacities (both Apple '128'/'256'/'512'/'1T' and Android '12+256'/'16+512'/'16+1TB'), numbers, currency formats (e.g. '¥1,284,000.00'), range strings (e.g. '3200-3300'), '+50', and leading zeros (e.g. '001042'). "
+            "Every row in `rows` MUST have the exact same number of elements as `headers` (use empty string '' for blank cells). "
+            "Set `col_types` accurately for each column (`text`, `number`, `currency`, `percent`, `date`)."
+        )
     if custom_hint.strip():
         instruction += f"\nAdditional user hint: {custom_hint.strip()}"
 
@@ -2005,10 +2196,19 @@ def extract_tables_from_image(
 
     stem = Path(filename or "extracted").stem
     normalized = normalize_table_grid(parsed, fallback_name=stem)
-    raw_sheets = [sh for sh in normalized["sheets"] if not _is_condition_legend_sheet(sh)] or normalized["sheets"]
+    quote_title = _pick_quote_title(normalized["title"], stem)
 
-    # 若启用「仅提机型+价格列」，后处理兜底剥离模型因顶部列头锚定带出的右侧备注/扣费列
-    if prices_only:
+    any_quote = any(
+        _is_quotation_sheet(sh.get("headers") or [], sh.get("rows") or [], quote_title or sh.get("name", ""), norm_doc_type)
+        for sh in normalized["sheets"]
+    )
+    if any_quote:
+        raw_sheets = [sh for sh in normalized["sheets"] if not _is_condition_legend_sheet(sh)] or normalized["sheets"]
+    else:
+        raw_sheets = normalized["sheets"]
+
+    # 若启用「仅提机型+价格列」，仅对报价单剥离右侧备注/扣费列，绝不误删通用财务/发票表的备注列
+    if effective_prices_only and any_quote:
         for rsh in raw_sheets:
             sh_hdrs = rsh.get("headers") or []
             keep_cols = [i for i, h in enumerate(sh_hdrs) if not _is_note_header(h)]
@@ -2025,24 +2225,32 @@ def extract_tables_from_image(
                 ]
 
     for rsh in raw_sheets:
+        rsh_is_quote = _is_quotation_sheet(
+            rsh.get("headers") or [], rsh.get("rows") or [], quote_title or rsh.get("name", ""), norm_doc_type
+        )
         r_rows, r_warns = _clean_quotation_rows(
-            rsh["headers"], rsh["rows"], rsh.get("warnings") or []
+            rsh["headers"], rsh["rows"], rsh.get("warnings") or [], is_quotation=rsh_is_quote
         )
         rsh["rows"] = r_rows
         rsh["warnings"] = r_warns
         rsh.setdefault("section_header_rows", [])
+        rsh["style_preset"] = "quotation" if rsh_is_quote else "general"
 
-    quote_title = _pick_quote_title(normalized["title"], stem)
-    merged_sheet = merge_sheets_into_single_quotation(raw_sheets, quote_title, stem)
+    merged_sheet = merge_sheets_into_single_quotation(raw_sheets, quote_title, stem, doc_type=norm_doc_type)
+    suggest_split = _should_keep_multi_sheets_separate(raw_sheets, doc_type=norm_doc_type)
+    detected_doc_type = "quotation" if any_quote else "general"
 
     normalized["quote_title"] = quote_title
     normalized["raw_sheets"] = raw_sheets
     normalized["merged_sheet"] = merged_sheet
-    normalized["sheets"] = [merged_sheet] if merge_per_image else raw_sheets
+    normalized["sheets"] = [merged_sheet] if (merge_per_image and not suggest_split) else raw_sheets
     normalized["engine"] = used_model
     normalized["is_demo"] = False
+    normalized["detected_doc_type"] = detected_doc_type
+    normalized["suggest_split_sheets"] = suggest_split
+    mode_tag = "报价单模式" if any_quote else "通用表格模式"
     if used_model != primary_model:
-        normalized["notice"] = f"主模型高峰限流，已自动切换 {used_model} 完成结构化表格识别"
+        normalized["notice"] = f"主模型高峰限流，已自动切换 {used_model} 完成识别（{mode_tag}）"
     else:
-        normalized["notice"] = f"已通过 {used_model} 多模态引擎完成结构化表格识别"
+        normalized["notice"] = f"已通过 {used_model} 多模态引擎完成识别（{mode_tag}）"
     return normalized

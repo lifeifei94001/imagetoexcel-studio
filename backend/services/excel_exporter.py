@@ -46,8 +46,9 @@ def _display_width(text: str) -> int:
 
 def _parse_typed_cell(raw_val: str, col_type: str) -> Tuple[Any, str]:
     """
-    R2 数值保真：
+    R2 数值与货币保真：
     - 对 number / currency / percent 列尽力转为真实数字并保留 Excel 格式；
+    - 保留原始货币符号（¥ / $ / € / £）与千分位格式（如 ¥#,##0.00），不把财务金额退化成裸整数；
     - 含前导零编码（如 001042）保持文本，防止丢失前缀零。
     """
     text = (raw_val or "").strip()
@@ -71,11 +72,21 @@ def _parse_typed_cell(raw_val: str, col_type: str) -> Tuple[Any, str]:
     if col_type in ("currency", "number"):
         if text.startswith("+"):
             return text, "@"
-        cleaned = re.sub(r"[¥$€£,\s]", "", text)
+        sym_match = re.match(r"^([¥￥$€£])", text)
+        cur_sym = "¥" if (sym_match and sym_match.group(1) in ("¥", "￥")) else (sym_match.group(1) if sym_match else "")
+        has_comma = "," in text
+        has_decimal = "." in text
+        cleaned = re.sub(r"[¥￥$€£,\s]", "", text)
         if re.match(r"^0\d+$", cleaned):
             return text, "@"
         try:
             num = float(cleaned)
+            if cur_sym:
+                fmt = f"{cur_sym}#,##0.00" if (has_decimal or not num.is_integer()) else f"{cur_sym}#,##0"
+                return (int(num) if num.is_integer() and not has_decimal else num), fmt
+            if has_comma:
+                fmt = "#,##0.00" if (has_decimal or not num.is_integer()) else "#,##0"
+                return (int(num) if num.is_integer() and not has_decimal else num), fmt
             if num.is_integer():
                 return int(num), "0"
             return num, "0.##"
@@ -85,19 +96,55 @@ def _parse_typed_cell(raw_val: str, col_type: str) -> Tuple[Any, str]:
     return text, "@"
 
 
+def _is_summary_row_cells(row: List[str]) -> bool:
+    for cell in row[:3]:
+        s = str(cell or "").strip().lower()
+        if not s:
+            continue
+        if s in {"合计", "总计", "小计", "汇总", "共计", "total", "subtotal", "grand total"} or any(
+            s.startswith(p) for p in ("合计", "总计", "小计", "汇总", "共计", "total:", "subtotal:")
+        ):
+            return True
+    return False
+
+
+def _infer_style_preset(sheet_data: Dict[str, Any]) -> str:
+    explicit = str(sheet_data.get("style_preset") or "").strip().lower()
+    if explicit in ("quotation", "general"):
+        return explicit
+    headers_text = " ".join(str(h or "") for h in (sheet_data.get("headers") or []))
+    if any(k in headers_text for k in ("充新", "靓机", "小花", "大花", "外爆", "内爆", "容量", "型号", "系列")):
+        return "quotation"
+    return "general"
+
+
 def _populate_worksheet(ws: Any, sheet_data: Dict[str, Any]) -> None:
     headers: List[str] = [str(h) for h in (sheet_data.get("headers") or ["列1"])]
     rows: List[List[str]] = sheet_data.get("rows") or []
     col_types: List[str] = sheet_data.get("col_types") or ["text"] * len(headers)
     merges: List[Dict[str, int]] = sheet_data.get("merges") or []
+    style_preset = _infer_style_preset(sheet_data)
 
-    # Q3/Q4: WPS 清爽苹果绿报价单样式 + 不合并型号单元格以兼容筛选/VLOOKUP
-    header_fill = PatternFill(start_color="A9D08E", end_color="A9D08E", fill_type="solid")
-    header_font = Font(name="微软雅黑", size=11, bold=True, color="000000")
-    zebra_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
-    body_font = Font(name="微软雅黑", size=10, color="0F172A")
-    price_font = Font(name="微软雅黑", size=10, bold=True, color="0F172A")
-    thin_side = Side(style="thin", color="8EA99B")
+    if style_preset == "general":
+        # 通用多场景表格（财务/发票/库存/考勤）：商务简洁灰蓝表头 + 柔和浅灰斑马纹 + 合计行加粗底纹
+        header_fill = PatternFill(start_color="1E3A5F", end_color="1E3A5F", fill_type="solid")
+        header_font = Font(name="微软雅黑", size=11, bold=True, color="FFFFFF")
+        zebra_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
+        summary_fill = PatternFill(start_color="EEF2FF", end_color="EEF2FF", fill_type="solid")
+        body_font = Font(name="微软雅黑", size=10, color="0F172A")
+        price_font = Font(name="微软雅黑", size=10, bold=False, color="0F172A")
+        summary_font = Font(name="微软雅黑", size=10, bold=True, color="0F172A")
+        thin_side = Side(style="thin", color="CBD5E1")
+    else:
+        # 报价单专精样式：WPS 清爽苹果绿表头 + 浅绿斑马纹（不合并型号单元格，兼容筛选/VLOOKUP）
+        header_fill = PatternFill(start_color="A9D08E", end_color="A9D08E", fill_type="solid")
+        header_font = Font(name="微软雅黑", size=11, bold=True, color="000000")
+        zebra_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+        summary_fill = PatternFill(start_color="D9EAD3", end_color="D9EAD3", fill_type="solid")
+        body_font = Font(name="微软雅黑", size=10, color="0F172A")
+        price_font = Font(name="微软雅黑", size=10, bold=True, color="0F172A")
+        summary_font = Font(name="微软雅黑", size=10, bold=True, color="0F172A")
+        thin_side = Side(style="thin", color="8EA99B")
     cell_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
 
     col_widths = [_display_width(h) + 4 for h in headers]
@@ -131,6 +178,7 @@ def _populate_worksheet(ws: Any, sheet_data: Dict[str, Any]) -> None:
 
     for r_idx, row in enumerate(rows, start=2):
         is_section_header = (r_idx - 2) in section_header_rows
+        is_summary = (not is_section_header) and _is_summary_row_cells(row)
         max_lines = 1
         for c_idx in range(1, len(headers) + 1):
             raw_cell = str(row[c_idx - 1]) if c_idx - 1 < len(row) else ""
@@ -145,17 +193,20 @@ def _populate_worksheet(ws: Any, sheet_data: Dict[str, Any]) -> None:
                 cell.border = cell_border
                 continue
 
-            effective_type = "text" if _is_capacity_column(h_name) else c_type
+            effective_type = "text" if (style_preset == "quotation" and _is_capacity_column(h_name)) else c_type
             typed_val, num_fmt = _parse_typed_cell(raw_cell, effective_type)
             cell = ws.cell(row=r_idx, column=c_idx, value=typed_val)
             cell.border = cell_border
 
             if num_fmt and num_fmt != "@":
                 cell.number_format = num_fmt
-                cell.font = price_font
-                cell.alignment = Alignment(horizontal="center", vertical="center")
+                cell.font = summary_font if is_summary else price_font
+                cell.alignment = Alignment(
+                    horizontal="right" if (style_preset == "general" and ("," in num_fmt or any(s in num_fmt for s in ("¥", "$", "€", "£", "%")))) else "center",
+                    vertical="center",
+                )
             elif _is_note_column(h_name) or "\n" in raw_cell or _display_width(raw_cell) > 18:
-                cell.font = body_font
+                cell.font = summary_font if is_summary else body_font
                 cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
                 col_w = max(8, final_widths[c_idx - 1] - 2)
                 line_cnt = 0
@@ -163,10 +214,12 @@ def _populate_worksheet(ws: Any, sheet_data: Dict[str, Any]) -> None:
                     line_cnt += max(1, (_display_width(line) + col_w - 1) // col_w)
                 max_lines = max(max_lines, line_cnt)
             else:
-                cell.font = body_font
+                cell.font = summary_font if is_summary else body_font
                 cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-            if r_idx % 2 == 1:
+            if is_summary:
+                cell.fill = summary_fill
+            elif r_idx % 2 == 1:
                 cell.fill = zebra_fill
 
         ws.row_dimensions[r_idx].height = 28 if is_section_header else max(22, min(78, max_lines * 15 + 6))

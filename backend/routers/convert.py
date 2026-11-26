@@ -25,6 +25,7 @@ from services.b2_storage import (
 from services.excel_exporter import (
     build_batch_zip_bytes,
     build_single_xlsx_bytes,
+    build_xlsx_bytes,
     export_tables_package,
     make_download_headers,
 )
@@ -52,6 +53,7 @@ class SheetPayload(BaseModel):
     warnings: List[Dict[str, Any]] = []
     section_header_rows: List[int] = []
     source_filename: Optional[str] = None
+    style_preset: Optional[str] = None
 
 
 class ExportRequest(BaseModel):
@@ -185,6 +187,7 @@ class CommitQuotationRequest(BaseModel):
     file_size_bytes: int = 0
     mode: str = "excel"
     merge_per_image: bool = True
+    doc_type: str = "auto"
     slice_results: List[Dict[str, Any]] = []
     failed_error: str = ""
 
@@ -214,8 +217,9 @@ def _persist_completed_quotation(
         rsh_copy["export_filename"] = rsh_copy.get("name") or quote_title
         raw_sheets.append(rsh_copy)
 
-    target_sheet = merged_sheet if merge_per_image else (raw_sheets[0] if raw_sheets else merged_sheet)
-    xlsx_bytes = build_single_xlsx_bytes(target_sheet)
+    suggest_split = bool(result.get("suggest_split_sheets", False))
+    use_multi_sheets = (not merge_per_image or suggest_split) and len(raw_sheets) > 1
+    xlsx_bytes = build_xlsx_bytes(raw_sheets) if use_multi_sheets else build_single_xlsx_bytes(merged_sheet)
     safe_xlsx_name = f"{_safe_filename(quote_title, Path(fname).stem)}.xlsx"
     b2_xlsx_key = f"jobs/{job.job_uid}/{item_index + 1:02d}_{safe_xlsx_name}"
 
@@ -284,6 +288,8 @@ def _persist_completed_quotation(
             "engine": used_engine,
             "is_demo": is_demo,
             "notice": result.get("notice", ""),
+            "detected_doc_type": result.get("detected_doc_type", "quotation"),
+            "suggest_split_sheets": suggest_split,
             "merged_sheet": merged_sheet,
             "raw_sheets": raw_sheets,
             "plain_text": result.get("plain_text", ""),
@@ -306,6 +312,7 @@ async def extract_single_slice(
     custom_hint: str = Form(""),
     model_tier: str = Form("fast"),
     prices_only: bool = Form(False),
+    doc_type: str = Form("auto"),
 ) -> Dict[str, Any]:
     """长图切片独立识别接口（仅返回结构化切片结果，待全部切片完成后再统一计费与入库）。"""
     raw_bytes = await file.read()
@@ -321,6 +328,7 @@ async def extract_single_slice(
             merge_per_image=False,
             model_tier=model_tier,
             prices_only=prices_only,
+            doc_type=doc_type,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
@@ -360,6 +368,7 @@ def commit_sliced_quotation(
         req.slice_results,
         filename=req.source_filename,
         merge_per_image=req.merge_per_image,
+        doc_type=req.doc_type,
     )
     return _persist_completed_quotation(
         session=session,
@@ -385,6 +394,7 @@ async def process_batch_item(
     merge_per_image: bool = Form(True),
     model_tier: str = Form("fast"),
     prices_only: bool = Form(False),
+    doc_type: str = Form("auto"),
     session: Session = Depends(get_session),
 ) -> Dict[str, Any]:
     job = session.exec(select(BatchJob).where(BatchJob.job_uid == job_uid)).first()
@@ -409,6 +419,7 @@ async def process_batch_item(
             merge_per_image=merge_per_image,
             model_tier=model_tier,
             prices_only=prices_only,
+            doc_type=doc_type,
         )
     except RuntimeError as exc:
         failed_item = BatchJobItem(

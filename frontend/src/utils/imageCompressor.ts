@@ -134,6 +134,7 @@ function detectExactHeaderBand(
   const lDark = new Float32Array(maxY);
   const bDark = new Float32Array(maxY);
   const bWhite = new Float32Array(maxY);
+  const rowMeanLum = new Float32Array(maxY);
 
   for (let y = 0; y < maxY; y++) {
     const rowBase = y * targetW * 4;
@@ -145,11 +146,15 @@ function detectExactHeaderBand(
     lDark[y] = ld / leftCount;
 
     let bd = 0;
+    let lumSum = 0;
     for (let x = bodyStart; x < bodyEnd; x++) {
       const idx = rowBase + x * 4;
-      if (0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2] < 155) bd++;
+      const lum = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
+      if (lum < 155) bd++;
+      lumSum += lum;
     }
     bDark[y] = bd / bodyCount;
+    rowMeanLum[y] = lumSum / bodyCount;
 
     let bw = 0;
     for (let x = whiteStart; x < whiteEnd; x++) {
@@ -174,29 +179,46 @@ function detectExactHeaderBand(
     }
   }
 
-  if (firstDataY <= 24) return null;
+  if (firstDataY > 24) {
+    // 路径 A：有黑色横线的标准报价单 / 网格表，精准截取单行绿色/浅色列头
+    let hdrBottom = -1;
+    for (let y = firstDataY; y >= Math.max(0, firstDataY - 24); y--) {
+      if (lDark[y] >= 0.45 && bDark[y] >= 0.45) {
+        hdrBottom = y;
+        break;
+      }
+    }
+    if (hdrBottom > 24) {
+      let hdrTop = Math.max(0, hdrBottom - 64);
+      for (let y = hdrBottom - 24; y >= Math.max(0, hdrBottom - 115); y--) {
+        if (lDark[y] >= 0.45 && bDark[y] >= 0.45) {
+          hdrTop = y;
+          break;
+        }
+      }
+      const stripH = hdrBottom - hdrTop;
+      if (stripH >= 20 && stripH <= 130) {
+        return { topY: hdrTop, bottomY: hdrBottom + 1, firstDataY };
+      }
+    }
 
-  // 在 firstDataY 上方 24px 内找表头底边框线
-  let hdrBottom = firstDataY;
-  for (let y = firstDataY; y >= Math.max(0, firstDataY - 24); y--) {
-    if (lDark[y] >= 0.45 && bDark[y] >= 0.45) {
-      hdrBottom = y;
-      break;
+    // 路径 B（通用无边框现代长表兜底，如 ERP/飞书/Notion 蓝灰底色表头 + 白底数据区）：
+    // 在 firstDataY 上方检测连续 24~84px 的深色/彩底色表头带（平均亮度 < 215）
+    let bandBottom = firstDataY - 1;
+    while (bandBottom > 0 && rowMeanLum[bandBottom] >= 225) {
+      bandBottom--;
+    }
+    let bandTop = bandBottom;
+    while (bandTop > 0 && rowMeanLum[bandTop] < 218 && bandBottom - bandTop < 90) {
+      bandTop--;
+    }
+    const bandH = bandBottom - bandTop;
+    if (bandH >= 24 && bandH <= 88) {
+      return { topY: Math.max(0, bandTop), bottomY: bandBottom + 1, firstDataY };
     }
   }
 
-  // 从表头底线再往上 24~115px 找表头顶边框线（精准截取单行绿色列头，如 38~52px）
-  let hdrTop = Math.max(0, hdrBottom - 64);
-  for (let y = hdrBottom - 24; y >= Math.max(0, hdrBottom - 115); y--) {
-    if (lDark[y] >= 0.45 && bDark[y] >= 0.45) {
-      hdrTop = y;
-      break;
-    }
-  }
-
-  const stripH = hdrBottom - hdrTop;
-  if (stripH < 20 || stripH > 130) return null;
-  return { topY: hdrTop, bottomY: hdrBottom + 1, firstDataY };
+  return null;
 }
 
 /** 对整张超长图做轻量灰度行扫描（兼顾 1px 细实线清晰度且不触碰浏览器 Canvas 尺寸上限）。 */

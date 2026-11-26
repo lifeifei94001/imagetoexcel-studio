@@ -15,6 +15,13 @@
         <span class="gem-pill" :class="activeQuotation?.is_demo ? 'pill-gold' : 'pill-emerald'">
           {{ activeQuotation?.is_demo ? "演示提取模式" : `AI 引擎：${activeQuotation?.engine || "gemini"}` }}
         </span>
+        <span
+          v-if="activeQuotation"
+          class="gem-pill"
+          :class="activeQuotation.detected_doc_type === 'general' ? 'pill-sky' : 'pill-violet'"
+        >
+          {{ activeQuotation.detected_doc_type === "general" ? "通用表格 · 商务灰蓝" : "报价单模式 · 苹果绿" }}
+        </span>
         <span v-if="activeQuotation?.notice" class="glass-muted" style="font-size: 13px">
           {{ activeQuotation.notice }}
         </span>
@@ -556,7 +563,8 @@ function removeColumn(cIdx: number) {
 }
 
 function buildExportSheetsForQuotation(q: QuotationGroup): ExtractedSheet[] {
-  if (props.mergePerImage) {
+  const shouldSplit = (!props.mergePerImage || Boolean(q.suggest_split_sheets)) && (q.raw_sheets?.length || 0) > 1;
+  if (!shouldSplit) {
     return [{ ...q.merged_sheet, name: (q.quote_title || q.merged_sheet.name).slice(0, 28), export_filename: q.quote_title }];
   }
   return (q.raw_sheets?.length ? q.raw_sheets : [q.merged_sheet]).map((s) => ({
