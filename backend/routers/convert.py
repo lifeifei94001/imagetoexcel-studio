@@ -2,12 +2,15 @@ import io
 import json
 import re
 import uuid
+import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from sqlalchemy import update
 from sqlmodel import Session, desc, select
 
 from database import DB_MODE, _get_clean_env, get_session
@@ -42,6 +45,9 @@ ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".jfif", ".png", ".gif", ".webp", ".heic"
 MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MB
 DEFAULT_DAILY_LIMIT = 50
 QUOTA_CONFIG_KEY = "__config__"
+CLIENT_LOCK_PREFIX = "__client__:"
+STALE_RUNNING_SECONDS = 180
+ACTIVE_HEARTBEAT_WINDOW_SECONDS = 120
 MAX_CUSTOM_DAILY_LIMIT = 100000
 
 
@@ -49,6 +55,10 @@ class UpdateQuotaRequest(BaseModel):
     daily_limit: Optional[int] = None
     unlimited: Optional[bool] = None
     reset_used: bool = False
+
+
+class HeartbeatRequest(BaseModel):
+    client_id: str = ""
 
 
 class SheetPayload(BaseModel):
@@ -77,6 +87,7 @@ class CreateJobRequest(BaseModel):
     output_mode: str = "per_image"
     merge_per_image: bool = True
     total_items: int = 1
+    client_id: str = ""
 
 
 class QuotationGroupPayload(BaseModel):
@@ -99,6 +110,126 @@ class FinalizeJobRequest(BaseModel):
 def _safe_filename(raw_name: str, fallback: str = "报价单") -> str:
     cleaned = re.sub(r"[\\/:*?\"<>|\[\]]+", "_", (raw_name or fallback).strip()).strip("_.") or fallback
     return cleaned[:48]
+
+
+def _parse_utc_str(ts: Optional[str]) -> Optional[datetime]:
+    if not ts:
+        return None
+    s = str(ts).strip().replace("T", " ").rstrip("Z")
+    try:
+        return datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _seconds_since(ts: Optional[str]) -> float:
+    dt = _parse_utc_str(ts)
+    if not dt:
+        return 999999.0
+    return max(0.0, (datetime.now(timezone.utc) - dt).total_seconds())
+
+
+def _save_client_lock(session: Session, job_uid: str, client_id: str) -> None:
+    if not client_id:
+        return
+    lock_key = f"{CLIENT_LOCK_PREFIX}{job_uid}"
+    row = session.exec(select(DailyQuota).where(DailyQuota.quota_date == lock_key)).first()
+    now_str = utc_now_str()
+    if not row:
+        row = DailyQuota(
+            quota_date=lock_key,
+            client_key=client_id[:64],
+            used_count=0,
+            daily_limit=0,
+            updated_at=now_str,
+        )
+    else:
+        row.client_key = client_id[:64]
+        row.updated_at = now_str
+    session.add(row)
+
+
+def _get_client_lock(session: Session, job_uid: str) -> str:
+    row = session.exec(select(DailyQuota).where(DailyQuota.quota_date == f"{CLIENT_LOCK_PREFIX}{job_uid}")).first()
+    return str(row.client_key) if row else ""
+
+
+def _delete_client_lock(session: Session, job_uid: str) -> None:
+    rows = session.exec(select(DailyQuota).where(DailyQuota.quota_date == f"{CLIENT_LOCK_PREFIX}{job_uid}")).all()
+    for r in rows:
+        session.delete(r)
+
+
+def _reconcile_job_state(
+    session: Session,
+    job: BatchJob,
+    items: Optional[List[BatchJobItem]] = None,
+) -> tuple[int, int, bool]:
+    """
+    以真实的 BatchJobItem 行校准批次已完成/失败数，彻底杜绝并发提交时的计数丢失（如 19 份显示 18/19）；
+    并自动修复超过 3 分钟无心跳的僵尸 running 状态。
+    """
+    if items is None:
+        items = list(
+            session.exec(
+                select(BatchJobItem).where(BatchJobItem.job_uid == job.job_uid).order_by(BatchJobItem.item_index)
+            ).all()
+        )
+    real_completed = sum(1 for it in items if it.status == "completed")
+    real_failed = sum(1 for it in items if it.status == "failed")
+    changed = False
+
+    if job.completed_items != real_completed:
+        job.completed_items = real_completed
+        changed = True
+    if job.failed_items != real_failed:
+        job.failed_items = real_failed
+        changed = True
+
+    if job.status == "running":
+        age_sec = _seconds_since(job.updated_at or job.created_at)
+        if age_sec > STALE_RUNNING_SECONDS:
+            if real_completed >= job.total_items and real_completed > 0:
+                job.status = "completed"
+            elif real_completed > 0:
+                job.status = "partial_failed"
+            else:
+                job.status = "failed"
+            _delete_client_lock(session, job.job_uid)
+            changed = True
+
+    if changed:
+        session.add(job)
+    return real_completed, real_failed, changed
+
+
+def _build_zip_from_b2_items(job: BatchJob, completed_items: List[BatchJobItem]) -> tuple[bytes, str]:
+    """直接从 Backblaze B2 / 本地存储读取各已完成单表 .xlsx 并服务端打包 .zip（彻底规避 Vercel 4.5MB 请求体上限）。"""
+    zip_buf = io.BytesIO()
+    used_names: set = set()
+    added_count = 0
+    with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for idx, it in enumerate(completed_items):
+            if not it.xlsx_b2_key:
+                continue
+            raw_xlsx = load_object(it.xlsx_b2_key)
+            if not raw_xlsx:
+                continue
+            raw_stem = Path(it.xlsx_filename or it.quote_title or f"表格_{idx + 1}").stem
+            base = _safe_filename(raw_stem, f"表格_{idx + 1}")
+            cand = base
+            seq = 2
+            while cand.lower() in used_names:
+                cand = f"{base[:42]}_{seq}"
+                seq += 1
+            used_names.add(cand.lower())
+            zf.writestr(f"{cand}.xlsx", raw_xlsx)
+            added_count += 1
+    if added_count == 0:
+        return b"", ""
+    zip_buf.seek(0)
+    zip_name = f"{_safe_filename(job.title, '批量表格打包')}_{job.job_uid[:6]}.zip"
+    return zip_buf.getvalue(), zip_name
 
 
 def _get_default_daily_limit(session: Session) -> int:
@@ -238,12 +369,12 @@ def delete_history(record_id: int, session: Session = Depends(get_session)) -> D
 @router.post("/jobs")
 def create_batch_job(req: CreateJobRequest, session: Session = Depends(get_session)) -> Dict[str, Any]:
     if req.total_items < 1 or req.total_items > 20:
-        raise HTTPException(status_code=400, detail="单批次支持 1~20 张报价单图片")
+        raise HTTPException(status_code=400, detail="单批次支持 1~20 张表格图片")
 
     job_uid = uuid.uuid4().hex[:12]
     job = BatchJob(
         job_uid=job_uid,
-        title=_safe_filename(req.title, "批量报价单任务"),
+        title=_safe_filename(req.title, "批量表格任务"),
         mode=req.mode,
         output_mode=req.output_mode,
         merge_per_image=req.merge_per_image,
@@ -256,9 +387,80 @@ def create_batch_job(req: CreateJobRequest, session: Session = Depends(get_sessi
         updated_at=utc_now_str(),
     )
     session.add(job)
+    if req.client_id:
+        _save_client_lock(session, job_uid, req.client_id)
     session.commit()
     session.refresh(job)
     return job.model_dump()
+
+
+@router.get("/jobs/active")
+def get_active_running_jobs(
+    client_id: str = Query(default=""),
+    session: Session = Depends(get_session),
+) -> Dict[str, Any]:
+    """查询当前是否有正在运行中的批处理任务（用于多台电脑同时打开时友好提示「另一台设备正在跑」）。"""
+    running_jobs = list(
+        session.exec(select(BatchJob).where(BatchJob.status == "running").order_by(desc(BatchJob.id)).limit(10)).all()
+    )
+    active_list: List[Dict[str, Any]] = []
+    other_active: List[Dict[str, Any]] = []
+    any_reconciled = False
+
+    for j in running_jobs:
+        real_completed, _, changed = _reconcile_job_state(session, j)
+        if changed:
+            any_reconciled = True
+        if j.status != "running":
+            continue
+        age_sec = _seconds_since(j.updated_at or j.created_at)
+        if age_sec > ACTIVE_HEARTBEAT_WINDOW_SECONDS:
+            continue
+        owner_cid = _get_client_lock(session, j.job_uid)
+        is_self = bool(client_id and owner_cid and owner_cid == client_id)
+        info = {
+            "job_uid": j.job_uid,
+            "title": j.title,
+            "completed_items": real_completed,
+            "total_items": j.total_items,
+            "created_at": j.created_at,
+            "updated_at": j.updated_at,
+            "elapsed_seconds": int(_seconds_since(j.created_at)),
+            "is_self": is_self,
+        }
+        active_list.append(info)
+        if not is_self:
+            other_active.append(info)
+
+    if any_reconciled:
+        session.commit()
+
+    return {
+        "has_other_active": len(other_active) > 0,
+        "other_active_jobs": other_active,
+        "active_jobs": active_list,
+    }
+
+
+@router.post("/jobs/{job_uid}/heartbeat")
+def job_heartbeat(
+    job_uid: str,
+    req: HeartbeatRequest,
+    session: Session = Depends(get_session),
+) -> Dict[str, Any]:
+    """运行中客户端每 20 秒续期心跳，确保多电脑实时感知运行进度，断线 2 分钟自动失效。"""
+    job = session.exec(select(BatchJob).where(BatchJob.job_uid == job_uid)).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="未找到对应的批处理任务")
+    if job.status == "running":
+        job.updated_at = utc_now_str()
+        real_completed, _, _ = _reconcile_job_state(session, job)
+        if req.client_id:
+            _save_client_lock(session, job_uid, req.client_id)
+        session.add(job)
+        session.commit()
+        return {"ok": True, "completed_items": real_completed, "total_items": job.total_items}
+    return {"ok": False, "status": job.status}
 
 
 class CommitQuotationRequest(BaseModel):
@@ -317,6 +519,30 @@ def _persist_completed_quotation(
     col_cnt = len(merged_sheet.get("headers") or [])
     warn_cnt = len(merged_sheet.get("warnings") or [])
 
+    quotation_obj = {
+        "source_filename": fname,
+        "quote_title": quote_title,
+        "document_notes": result.get("document_notes", ""),
+        "engine": used_engine,
+        "is_demo": is_demo,
+        "notice": result.get("notice", ""),
+        "detected_doc_type": result.get("detected_doc_type", "quotation"),
+        "suggest_split_sheets": suggest_split,
+        "merged_sheet": merged_sheet,
+        "raw_sheets": raw_sheets,
+        "plain_text": result.get("plain_text", ""),
+    }
+
+    # 单张完成后即把轻量单图 JSON 存入 B2，彻底摆脱 finalize 时 19 张大 JSON 触发 Vercel 4.5MB 413 限制
+    try:
+        save_object(
+            f"jobs/{job.job_uid}/items/{item_index + 1:02d}.json",
+            json.dumps(quotation_obj, ensure_ascii=False).encode("utf-8"),
+            "application/json; charset=utf-8",
+        )
+    except Exception:
+        pass
+
     job_item = BatchJobItem(
         job_uid=job.job_uid,
         item_index=item_index,
@@ -348,32 +574,26 @@ def _persist_completed_quotation(
     )
     session.add(record)
 
-    job.completed_items += 1
+    # 先落库 BatchJobItem，再基于真实行计数刷新 job.completed_items 与原子累加每日额度，彻底消除并发丢计数！
+    session.flush()
+    _reconcile_job_state(session, job)
     job.updated_at = utc_now_str()
     session.add(job)
 
-    quota.used_count += 1
-    quota.updated_at = utc_now_str()
-    session.add(quota)
+    now_str = utc_now_str()
+    session.exec(
+        update(DailyQuota)
+        .where(DailyQuota.id == quota.id)
+        .values(used_count=DailyQuota.used_count + 1, updated_at=now_str)
+    )
     session.commit()
     session.refresh(job_item)
+    session.refresh(quota)
 
     return {
         "job_uid": job.job_uid,
         "item": job_item.model_dump(),
-        "quotation": {
-            "source_filename": fname,
-            "quote_title": quote_title,
-            "document_notes": result.get("document_notes", ""),
-            "engine": used_engine,
-            "is_demo": is_demo,
-            "notice": result.get("notice", ""),
-            "detected_doc_type": result.get("detected_doc_type", "quotation"),
-            "suggest_split_sheets": suggest_split,
-            "merged_sheet": merged_sheet,
-            "raw_sheets": raw_sheets,
-            "plain_text": result.get("plain_text", ""),
-        },
+        "quotation": quotation_obj,
         "quota": _format_quota_payload(quota),
     }
 
@@ -431,9 +651,10 @@ def commit_sliced_quotation(
             error_message=req.failed_error[:300],
             created_at=utc_now_str(),
         )
-        job.failed_items += 1
-        job.updated_at = utc_now_str()
         session.add(failed_item)
+        session.flush()
+        _reconcile_job_state(session, job)
+        job.updated_at = utc_now_str()
         session.add(job)
         session.commit()
         return {"job_uid": job_uid, "item": failed_item.model_dump()}
@@ -506,9 +727,10 @@ async def process_batch_item(
             error_message=str(exc)[:300],
             created_at=utc_now_str(),
         )
-        job.failed_items += 1
-        job.updated_at = utc_now_str()
         session.add(failed_item)
+        session.flush()
+        _reconcile_job_state(session, job)
+        job.updated_at = utc_now_str()
         session.add(job)
         session.commit()
         raise HTTPException(status_code=502, detail=str(exc))
@@ -532,12 +754,25 @@ def finalize_batch_job(
     req: FinalizeJobRequest,
     session: Session = Depends(get_session),
 ) -> Dict[str, Any]:
+    """
+    轻量级批次收尾接口（支持 0 payload，不再要求前端上传几 MB 整批 JSON 撞 Vercel 4.5MB 413 上限）：
+    - 以 BatchJobItem 真实行重新校准 completed_items / failed_items；
+    - 直接从 B2 读取已存单表 .xlsx 打包整批 .zip 存入 B2；
+    - 释放多设备运行锁并置终态。
+    """
     job = session.exec(select(BatchJob).where(BatchJob.job_uid == job_uid)).first()
     if not job:
         raise HTTPException(status_code=404, detail="未找到对应的批处理任务")
 
+    items = list(
+        session.exec(
+            select(BatchJobItem).where(BatchJobItem.job_uid == job_uid).order_by(BatchJobItem.item_index)
+        ).all()
+    )
+    real_completed, real_failed, _ = _reconcile_job_state(session, job, items)
+    completed_items_rows = [it for it in items if it.status == "completed" and it.xlsx_b2_key]
+
     quotations_dicts = [q.model_dump() for q in req.quotations]
-    # 存储结构化 JSON 供「转换记录 -> 载入工作台继续编辑」（B2 瞬时抖动容错，不影响已完成的提取结果）
     if quotations_dicts:
         json_bytes = json.dumps(
             {
@@ -555,59 +790,93 @@ def finalize_batch_job(
                 "application/json; charset=utf-8",
             )
         except Exception:
-            job.json_b2_key = ""
+            job.json_b2_key = "__items__" if real_completed > 0 else ""
+    elif real_completed > 0:
+        job.json_b2_key = "__items__"
 
-        # 若包含多份报价单，额外生成一份打包 .zip 存入 Backblaze B2
-        if len(quotations_dicts) > 1:
-            export_sheets: List[Dict[str, Any]] = []
-            for q in quotations_dicts:
-                sh = dict(q["merged_sheet"])
-                sh["export_filename"] = q["quote_title"]
-                sh["name"] = q["quote_title"][:28]
-                export_sheets.append(sh)
-            zip_bytes = build_batch_zip_bytes(export_sheets)
-            zip_name = f"{_safe_filename(job.title, '报价单批量打包')}_{job_uid[:6]}.zip"
-            try:
+    # 只要有 >=2 份已完成 .xlsx，优先直接从 B2 现有 .xlsx 打包 .zip（零额外大请求体！）
+    if len(completed_items_rows) > 1:
+        try:
+            zip_bytes, zip_name = _build_zip_from_b2_items(job, completed_items_rows)
+            if zip_bytes and zip_name:
                 job.zip_b2_key = save_object(f"jobs/{job_uid}/{zip_name}", zip_bytes, "application/zip")
                 job.zip_filename = zip_name
-            except Exception:
-                job.zip_b2_key = ""
+        except Exception:
+            job.zip_b2_key = ""
+    elif len(quotations_dicts) > 1:
+        export_sheets: List[Dict[str, Any]] = []
+        for q in quotations_dicts:
+            sh = dict(q["merged_sheet"])
+            sh["export_filename"] = q["quote_title"]
+            sh["name"] = q["quote_title"][:28]
+            export_sheets.append(sh)
+        zip_bytes = build_batch_zip_bytes(export_sheets)
+        zip_name = f"{_safe_filename(job.title, '批量表格打包')}_{job_uid[:6]}.zip"
+        try:
+            job.zip_b2_key = save_object(f"jobs/{job_uid}/{zip_name}", zip_bytes, "application/zip")
+            job.zip_filename = zip_name
+        except Exception:
+            job.zip_b2_key = ""
 
-    if job.completed_items == 0 and job.failed_items > 0:
+    if real_completed == 0 and real_failed > 0:
         job.status = "failed"
-    elif job.failed_items > 0:
+    elif real_failed > 0 or (real_completed > 0 and real_completed < job.total_items):
         job.status = "partial_failed"
-    else:
+    elif real_completed > 0:
         job.status = "completed"
+    else:
+        job.status = "failed"
 
+    job.merge_per_image = req.merge_per_image
+    job.output_mode = req.output_mode
     job.storage_backend = "b2" if b2_is_enabled() else "local"
     job.updated_at = utc_now_str()
+    _delete_client_lock(session, job_uid)
     session.add(job)
     session.commit()
     session.refresh(job)
 
-    items = session.exec(
-        select(BatchJobItem).where(BatchJobItem.job_uid == job_uid).order_by(BatchJobItem.item_index)
-    ).all()
     return {
         **job.model_dump(),
+        "can_download_zip": bool(job.zip_b2_key) or len(completed_items_rows) >= 2,
+        "completed_xlsx_count": len(completed_items_rows),
         "items": [it.model_dump() for it in items],
     }
 
 
 @router.get("/jobs")
 def list_batch_jobs(session: Session = Depends(get_session)) -> List[Dict[str, Any]]:
-    jobs = session.exec(select(BatchJob).order_by(desc(BatchJob.id)).limit(25)).all()
+    jobs = list(session.exec(select(BatchJob).order_by(desc(BatchJob.id)).limit(25)).all())
     if not jobs:
         return []
     job_uids = [j.job_uid for j in jobs]
     all_items = session.exec(
         select(BatchJobItem).where(BatchJobItem.job_uid.in_(job_uids)).order_by(BatchJobItem.item_index)
     ).all()
-    items_by_uid: Dict[str, List[Dict[str, Any]]] = {}
+    items_by_uid: Dict[str, List[BatchJobItem]] = {}
     for it in all_items:
-        items_by_uid.setdefault(it.job_uid, []).append(it.model_dump())
-    return [{**j.model_dump(), "items": items_by_uid.get(j.job_uid, [])} for j in jobs]
+        items_by_uid.setdefault(it.job_uid, []).append(it)
+
+    any_changed = False
+    result_list: List[Dict[str, Any]] = []
+    for j in jobs:
+        j_items = items_by_uid.get(j.job_uid, [])
+        _, _, changed = _reconcile_job_state(session, j, j_items)
+        if changed:
+            any_changed = True
+        xlsx_cnt = sum(1 for it in j_items if it.status == "completed" and it.xlsx_b2_key)
+        result_list.append(
+            {
+                **j.model_dump(),
+                "can_download_zip": bool(j.zip_b2_key) or xlsx_cnt >= 2,
+                "completed_xlsx_count": xlsx_cnt,
+                "items": [it.model_dump() for it in j_items],
+            }
+        )
+
+    if any_changed:
+        session.commit()
+    return result_list
 
 
 @router.get("/jobs/{job_uid}/download")
@@ -623,10 +892,10 @@ def download_job_artifact(
     if item_id is not None:
         item = session.get(BatchJobItem, item_id)
         if not item or item.job_uid != job_uid:
-            raise HTTPException(status_code=404, detail="未找到对应的单份报价单文件")
+            raise HTTPException(status_code=404, detail="未找到对应的单份表格文件")
         raw = load_object(item.xlsx_b2_key)
         if not raw:
-            raise HTTPException(status_code=404, detail="对象存储中未找到该报价单文件")
+            raise HTTPException(status_code=404, detail="对象存储中未找到该表格文件")
         fname = item.xlsx_filename or f"{_safe_filename(item.quote_title)}.xlsx"
         return StreamingResponse(
             io.BytesIO(raw),
@@ -634,7 +903,7 @@ def download_job_artifact(
             headers=make_download_headers(fname),
         )
 
-    # 无 item_id：有批量 .zip 优先下 .zip，单图任务下唯一的 .xlsx
+    # 无 item_id：有已缓存批量 .zip 优先下 .zip
     if job.zip_b2_key:
         raw = load_object(job.zip_b2_key)
         if raw:
@@ -645,16 +914,38 @@ def download_job_artifact(
                 headers=make_download_headers(fname),
             )
 
-    first_item = session.exec(
-        select(BatchJobItem)
-        .where(BatchJobItem.job_uid == job_uid, BatchJobItem.status == "completed")
-        .order_by(BatchJobItem.item_index)
-    ).first()
+    # 兜底按需现打 .zip：只要批次内有 >=2 份已完成 .xlsx（含历史遗留或中途中断批次），自动从 B2 打包下载并缓存！
+    completed_items = list(
+        session.exec(
+            select(BatchJobItem)
+            .where(BatchJobItem.job_uid == job_uid, BatchJobItem.status == "completed")
+            .order_by(BatchJobItem.item_index)
+        ).all()
+    )
+    completed_with_xlsx = [it for it in completed_items if it.xlsx_b2_key]
+    if len(completed_with_xlsx) >= 2:
+        zip_bytes, zip_name = _build_zip_from_b2_items(job, completed_with_xlsx)
+        if zip_bytes and zip_name:
+            try:
+                job.zip_b2_key = save_object(f"jobs/{job_uid}/{zip_name}", zip_bytes, "application/zip")
+                job.zip_filename = zip_name
+                _reconcile_job_state(session, job)
+                session.add(job)
+                session.commit()
+            except Exception:
+                pass
+            return StreamingResponse(
+                io.BytesIO(zip_bytes),
+                media_type="application/zip",
+                headers=make_download_headers(zip_name),
+            )
+
+    first_item = completed_with_xlsx[0] if completed_with_xlsx else None
     if not first_item or not first_item.xlsx_b2_key:
         raise HTTPException(status_code=404, detail="该批次暂无可下载产物")
     raw = load_object(first_item.xlsx_b2_key)
     if not raw:
-        raise HTTPException(status_code=404, detail="对象存储中未找到该报价单文件")
+        raise HTTPException(status_code=404, detail="对象存储中未找到该表格文件")
     fname = first_item.xlsx_filename or f"{_safe_filename(first_item.quote_title)}.xlsx"
     return StreamingResponse(
         io.BytesIO(raw),
@@ -670,6 +961,32 @@ def load_job_payload(job_uid: str, session: Session = Depends(get_session)) -> D
         raise HTTPException(status_code=404, detail="未找到对应的批处理任务")
     if not job.json_b2_key:
         raise HTTPException(status_code=404, detail="该批次未保存可二次编辑的结构化数据")
+
+    if job.json_b2_key == "__items__":
+        items = list(
+            session.exec(
+                select(BatchJobItem)
+                .where(BatchJobItem.job_uid == job_uid, BatchJobItem.status == "completed")
+                .order_by(BatchJobItem.item_index)
+            ).all()
+        )
+        quotations: List[Dict[str, Any]] = []
+        for it in items:
+            raw_it = load_object(f"jobs/{job_uid}/items/{it.item_index + 1:02d}.json")
+            if raw_it:
+                try:
+                    quotations.append(json.loads(raw_it.decode("utf-8")))
+                except Exception:
+                    continue
+        if not quotations:
+            raise HTTPException(status_code=404, detail="对象存储中未找到该批次的结构化编辑数据")
+        return {
+            "job_uid": job_uid,
+            "merge_per_image": job.merge_per_image,
+            "output_mode": job.output_mode,
+            "quotations": quotations,
+        }
+
     raw = load_object(job.json_b2_key)
     if not raw:
         raise HTTPException(status_code=404, detail="从 Backblaze 对象存储读取结构化数据失败")
@@ -692,6 +1009,7 @@ def delete_batch_job(job_uid: str, session: Session = Depends(get_session)) -> D
     items = session.exec(select(BatchJobItem).where(BatchJobItem.job_uid == job_uid)).all()
     for it in items:
         session.delete(it)
+    _delete_client_lock(session, job_uid)
     session.delete(job)
     session.commit()
     return {

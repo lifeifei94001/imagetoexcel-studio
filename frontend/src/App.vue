@@ -197,6 +197,26 @@
           </div>
         </section>
 
+        <!-- 多设备并发运行提示横幅（检测到另一台电脑正在跑任务时友好提醒） -->
+        <el-alert
+          v-if="otherActiveJobs.length > 0 && !extracting"
+          type="warning"
+          show-icon
+          :closable="false"
+          style="margin-bottom: 16px; border-radius: var(--glass-radius-sm)"
+        >
+          <template #title>
+            <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap">
+              <span>
+                检测到另一台设备正在处理「{{ otherActiveJobs[0].title }}」（当前进度
+                <strong>{{ otherActiveJobs[0].completed_items }}/{{ otherActiveJobs[0].total_items }}</strong>，已运行
+                {{ formatElapsed(otherActiveJobs[0].elapsed_seconds) }}），为避免触发 API 并发限流，建议稍等片刻再开始。
+              </span>
+              <el-button size="small" plain type="warning" @click="checkOtherActiveJobs">刷新状态</el-button>
+            </div>
+          </template>
+        </el-alert>
+
         <!-- 双栏队列式上传工作台 -->
         <section class="glass-strong uploader-shell">
           <div class="uploader-grid">
@@ -567,8 +587,8 @@
                   <span class="gem-pill" :class="job.storage_backend === 'b2' ? 'pill-sky' : 'pill-gold'">
                     {{ job.storage_backend === "b2" ? "Backblaze B2" : "本地缓存" }}
                   </span>
-                  <span class="gem-pill" :class="job.status === 'completed' ? 'pill-emerald' : 'pill-gold'">
-                    {{ job.completed_items }}/{{ job.total_items }} 份 · {{ job.status }}
+                  <span class="gem-pill" :class="job.status === 'completed' ? 'pill-emerald' : job.status === 'running' ? 'pill-sky' : 'pill-gold'">
+                    {{ job.completed_items }}/{{ job.total_items }} 份 · {{ formatJobStatus(job.status) }}
                   </span>
                   <span class="glass-muted num-tabular" style="font-size: 12px">{{ formatBeijingTime(job.created_at) }}</span>
                 </div>
@@ -583,26 +603,41 @@
                     载入工作台编辑
                   </el-button>
                   <el-button
-                    v-if="job.zip_b2_key || (job.items.length === 1 && job.items[0]?.xlsx_b2_key)"
+                    v-if="hasJobZipDownload(job) || (job.items.length === 1 && job.items[0]?.xlsx_b2_key)"
                     size="small"
                     type="primary"
                     :loading="downloadingKey === job.job_uid"
-                    @click="downloadStoredArtifact(job.job_uid, undefined, job.zip_filename || job.items[0]?.xlsx_filename || '报价单.xlsx')"
+                    @click="
+                      downloadStoredArtifact(
+                        job.job_uid,
+                        undefined,
+                        hasJobZipDownload(job)
+                          ? job.zip_filename || `${job.title}_打包.zip`
+                          : job.items[0]?.xlsx_filename || '表格.xlsx'
+                      )
+                    "
                   >
-                    {{ job.zip_b2_key ? "下载整批打包 (.zip)" : "下载报价单 (.xlsx)" }}
+                    {{
+                      hasJobZipDownload(job)
+                        ? `一键打包下载 (.zip · ${job.completed_xlsx_count || job.completed_items}份)`
+                        : "下载表格 (.xlsx)"
+                    }}
                   </el-button>
                   <el-button size="small" type="danger" text @click="removeBatchJob(job.job_uid)">删除并释放</el-button>
                 </div>
               </div>
 
-              <!-- 批次内每张报价单明细 -->
+              <!-- 批次内每张表格明细 -->
               <div v-if="job.items.length > 0" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 8px">
                 <div v-for="item in job.items" :key="item.id" class="queue-item">
-                  <div style="min-width: 0">
+                  <div style="min-width: 0; flex: 1">
                     <div style="font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap">
                       {{ item.quote_title || item.source_filename }}
                     </div>
-                    <div class="glass-muted num-tabular" style="font-size: 12px">
+                    <div
+                      class="glass-muted num-tabular"
+                      style="font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis"
+                    >
                       {{ item.row_count }}×{{ item.col_count }} · {{ item.engine }}
                     </div>
                   </div>
@@ -610,6 +645,7 @@
                     v-if="item.status === 'completed' && item.xlsx_b2_key"
                     size="small"
                     plain
+                    style="flex-shrink: 0"
                     :loading="downloadingKey === `${job.job_uid}-${item.id}`"
                     @click="downloadStoredArtifact(job.job_uid, item.id, item.xlsx_filename)"
                   >
@@ -770,7 +806,7 @@
 
 <script setup lang="ts">
 import axios from "axios";
-import { computed, nextTick, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useEventListener, useMagicKeys } from "@vueuse/core";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { Grid, Lock, UploadFilled } from "@element-plus/icons-vue";
@@ -790,6 +826,7 @@ import {
   downloadJobArtifact,
   extractApiError,
   extractSlice,
+  fetchActiveJobs,
   fetchAuthStatus,
   fetchBatchJobs,
   fetchHealth,
@@ -797,12 +834,15 @@ import {
   fetchQuota,
   fetchStorageStats,
   finalizeBatchJob,
+  getClientSessionId,
   loadJobIntoEditor,
   loginWithPassword,
   processBatchJobItem,
   purgeB2Storage,
+  sendJobHeartbeat,
   setUnauthorizedHandler,
   updateQuotaConfig,
+  type ActiveJobSummary,
   type BatchJob,
   type ConversionRecord,
   type DocScenarioType,
@@ -870,6 +910,12 @@ const quotaFormLimit = ref(50);
 const quotaFormUnlimited = ref(false);
 const savingQuota = ref(false);
 
+// 多设备并发运行检测 + 防误关拦截
+const clientSessionId = getClientSessionId();
+const otherActiveJobs = ref<ActiveJobSummary[]>([]);
+let activeJobsPollTimer: number | null = null;
+let heartbeatTimer: number | null = null;
+
 // 登录鉴权状态
 const authChecking = ref(true);
 const authRequired = ref(false);
@@ -913,6 +959,75 @@ const ctrlK = keys["Ctrl+K"];
 watch([cmdK, ctrlK], ([m, c]) => {
   if (m || c) paletteVisible.value = true;
 });
+
+useEventListener(window, "beforeunload", (e: BeforeUnloadEvent) => {
+  if (extracting.value) {
+    e.preventDefault();
+    e.returnValue = "批量图片转表格任务正在运行中，刷新或关闭页面将中断未完成的图片，确定离开吗？";
+  }
+});
+
+useEventListener(document, "visibilitychange", () => {
+  if (document.visibilityState === "visible" && (!authRequired.value || authenticated.value)) {
+    checkOtherActiveJobs();
+  }
+});
+
+async function checkOtherActiveJobs() {
+  if (authRequired.value && !authenticated.value) return;
+  try {
+    const res = await fetchActiveJobs(clientSessionId);
+    otherActiveJobs.value = res.other_active_jobs || [];
+  } catch {
+    // 静默忽略轮询偶发波动
+  }
+}
+
+function formatElapsed(sec: number): string {
+  const s = Math.max(0, Math.floor(sec || 0));
+  if (s < 60) return `${s}秒`;
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return r > 0 ? `${m}分${r}秒` : `${m}分钟`;
+}
+
+function formatJobStatus(status: string): string {
+  if (status === "completed") return "已完成";
+  if (status === "running") return "运行中";
+  if (status === "partial_failed") return "部分完成";
+  if (status === "failed") return "失败";
+  return status;
+}
+
+function hasJobZipDownload(job: BatchJob): boolean {
+  if (job.can_download_zip || job.zip_b2_key) return true;
+  const xlsxCnt = job.items?.filter((it) => it.status === "completed" && Boolean(it.xlsx_b2_key)).length || 0;
+  return xlsxCnt >= 2;
+}
+
+function stopHeartbeat() {
+  if (heartbeatTimer !== null) {
+    window.clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+}
+
+function startActiveJobsPolling() {
+  if (activeJobsPollTimer !== null) return;
+  checkOtherActiveJobs();
+  activeJobsPollTimer = window.setInterval(() => {
+    if (document.visibilityState === "visible" && !extracting.value) {
+      checkOtherActiveJobs();
+    }
+  }, 15000);
+}
+
+function stopActiveJobsPolling() {
+  if (activeJobsPollTimer !== null) {
+    window.clearInterval(activeJobsPollTimer);
+    activeJobsPollTimer = null;
+  }
+}
 
 useEventListener(window, "paste", (e: ClipboardEvent) => {
   if (activeTab.value !== "workspace") return;
@@ -1043,6 +1158,31 @@ async function loadSampleImages(sampleNames: string[]) {
 
 async function startBatchExtraction() {
   if (queue.value.length === 0 || extracting.value) return;
+
+  // 开跑前实时检测另一台设备是否正在执行任务（软提醒 + 二次确认，防撞车限流）
+  try {
+    const activeInfo = await fetchActiveJobs(clientSessionId);
+    otherActiveJobs.value = activeInfo.other_active_jobs || [];
+    if (activeInfo.has_other_active && activeInfo.other_active_jobs.length > 0) {
+      const running = activeInfo.other_active_jobs[0];
+      try {
+        await ElMessageBox.confirm(
+          `检测到另一台设备正在处理「${running.title}」（当前进度 ${running.completed_items}/${running.total_items}，已运行 ${formatElapsed(running.elapsed_seconds)}）。同时运行容易触发模型并发限流，建议稍等片刻再开始。`,
+          "另一台设备正在运行中",
+          {
+            confirmButtonText: "仍然立即开始",
+            cancelButtonText: "先等一下",
+            type: "warning",
+          }
+        );
+      } catch {
+        return;
+      }
+    }
+  } catch {
+    // 忽略检测网络抖动，不阻断正常使用
+  }
+
   extracting.value = true;
   lastBatchJobUid.value = "";
   const snapshot = [...queue.value];
@@ -1059,7 +1199,7 @@ async function startBatchExtraction() {
     const batchTitle =
       snapshot.length === 1
         ? snapshot[0].file.name.replace(/\.[^.]+$/, "")
-        : `批量报价单_${snapshot.length}份`;
+        : `批量表格_${snapshot.length}份`;
 
     const createdJob = await createBatchJob({
       title: batchTitle,
@@ -1067,8 +1207,15 @@ async function startBatchExtraction() {
       outputMode: outputMode.value,
       mergePerImage: mergePerImage.value,
       totalItems: snapshot.length,
+      clientId: clientSessionId,
     });
     lastBatchJobUid.value = createdJob.job_uid;
+
+    // 启动每 20 秒心跳，让其他电脑实时看到本机运行进度，断线 2 分钟自动释放
+    stopHeartbeat();
+    heartbeatTimer = window.setInterval(() => {
+      sendJobHeartbeat(createdJob.job_uid, clientSessionId).catch(() => {});
+    }, 20000);
 
     const collected: Array<QuotationGroup | null> = new Array(snapshot.length).fill(null);
     let cursor = 0;
@@ -1239,16 +1386,17 @@ async function startBatchExtraction() {
     quotations.value = validQuotations;
 
     if (validQuotations.length > 0) {
+      // 轻量级 finalize：不再上传几 MB 整批 JSON（避免撞 Vercel 4.5MB 413），由后端直接从 B2 现存单表 .xlsx 打包 .zip！
       await finalizeBatchJob({
         jobUid: createdJob.job_uid,
-        quotations: validQuotations,
+        quotations: [],
         mergePerImage: mergePerImage.value,
         outputMode: outputMode.value,
       });
       ElMessage.success(
         validQuotations.length === snapshot.length
-          ? `全部 ${validQuotations.length} 份报价单已提取并归档！`
-          : `已完成 ${validQuotations.length}/${snapshot.length} 份（部分失败可查看进度说明）`
+          ? `全部 ${validQuotations.length} 份表格已提取并打包归档！`
+          : `已完成 ${validQuotations.length}/${snapshot.length} 份（已自动归档已完成文件）`
       );
       await nextTick();
       editorAnchorRef.value?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -1264,7 +1412,9 @@ async function startBatchExtraction() {
   } catch (err) {
     ElMessage.error(extractApiError(err));
   } finally {
+    stopHeartbeat();
     extracting.value = false;
+    checkOtherActiveJobs();
   }
 }
 
@@ -1511,6 +1661,7 @@ async function handleLogin() {
     loginPassword.value = "";
     ElMessage.success(`欢迎回来，${res.username}`);
     await loadWorkspaceBootstrap();
+    startActiveJobsPolling();
   } catch (err) {
     loginError.value = extractApiError(err);
   } finally {
@@ -1518,7 +1669,21 @@ async function handleLogin() {
   }
 }
 
-function handleLogout() {
+async function handleLogout() {
+  if (extracting.value) {
+    try {
+      await ElMessageBox.confirm("当前仍有识别任务正在运行，退出登录将中断剩余图片处理，确定退出吗？", "任务运行中", {
+        confirmButtonText: "强制退出",
+        cancelButtonText: "取消",
+        type: "warning",
+      });
+    } catch {
+      return;
+    }
+  }
+  stopHeartbeat();
+  stopActiveJobsPolling();
+  otherActiveJobs.value = [];
   clearStoredAuthToken();
   authenticated.value = false;
   currentUsername.value = "";
@@ -1630,6 +1795,12 @@ onMounted(async () => {
 
   if (!authRequired.value || authenticated.value) {
     await loadWorkspaceBootstrap();
+    startActiveJobsPolling();
   }
+});
+
+onBeforeUnmount(() => {
+  stopHeartbeat();
+  stopActiveJobsPolling();
 });
 </script>

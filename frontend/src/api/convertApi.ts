@@ -114,9 +114,28 @@ export interface BatchJob {
   zip_filename: string;
   json_b2_key: string;
   storage_backend: string;
+  can_download_zip?: boolean;
+  completed_xlsx_count?: number;
   created_at?: string;
   updated_at?: string;
   items: BatchJobItem[];
+}
+
+export interface ActiveJobSummary {
+  job_uid: string;
+  title: string;
+  completed_items: number;
+  total_items: number;
+  created_at?: string;
+  updated_at?: string;
+  elapsed_seconds: number;
+  is_self: boolean;
+}
+
+export interface ActiveJobsResponse {
+  has_other_active: boolean;
+  other_active_jobs: ActiveJobSummary[];
+  active_jobs: ActiveJobSummary[];
 }
 
 export interface AuthStatus {
@@ -150,7 +169,21 @@ export interface ClearRecordsResponse {
 }
 
 const AUTH_TOKEN_STORAGE_KEY = "i2e_auth_token_v1";
+const CLIENT_SESSION_KEY = "i2e_client_tab_id_v1";
 let unauthorizedCallback: (() => void) | null = null;
+
+export function getClientSessionId(): string {
+  try {
+    let cid = sessionStorage.getItem(CLIENT_SESSION_KEY);
+    if (!cid) {
+      cid = `tab_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+      sessionStorage.setItem(CLIENT_SESSION_KEY, cid);
+    }
+    return cid;
+  } catch {
+    return `tab_${Math.random().toString(36).slice(2, 10)}`;
+  }
+}
 
 export function getStoredAuthToken(): string {
   try {
@@ -299,6 +332,7 @@ export async function createBatchJob(params: {
   outputMode: "all_in_one" | "per_image";
   mergePerImage: boolean;
   totalItems: number;
+  clientId?: string;
 }): Promise<BatchJob> {
   const { data } = await http.post<BatchJob>("/jobs", {
     title: params.title,
@@ -306,8 +340,22 @@ export async function createBatchJob(params: {
     output_mode: params.outputMode,
     merge_per_image: params.mergePerImage,
     total_items: params.totalItems,
+    client_id: params.clientId || getClientSessionId(),
   });
   return data;
+}
+
+export async function fetchActiveJobs(clientId?: string): Promise<ActiveJobsResponse> {
+  const { data } = await http.get<ActiveJobsResponse>("/jobs/active", {
+    params: { client_id: clientId || getClientSessionId() },
+  });
+  return data;
+}
+
+export async function sendJobHeartbeat(jobUid: string, clientId?: string): Promise<void> {
+  await http.post(`/jobs/${jobUid}/heartbeat`, {
+    client_id: clientId || getClientSessionId(),
+  });
 }
 
 export async function processBatchJobItem(params: {
