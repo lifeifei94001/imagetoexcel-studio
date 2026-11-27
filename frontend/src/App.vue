@@ -347,6 +347,15 @@
                       inactive-text="完整保留"
                     />
                   </div>
+
+                  <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px">
+                    <span style="font-size: 12.5px; font-weight: 600">双模型交叉核验：</span>
+                    <el-switch
+                      v-model="dualVerify"
+                      active-text="开启(分歧留空标黄)"
+                      inactive-text="单模型"
+                    />
+                  </div>
                 </div>
 
                 <!-- 低频高级选项折叠区 -->
@@ -873,6 +882,7 @@ const docType = ref<DocScenarioType>("auto");
 const outputMode = ref<"all_in_one" | "per_image">("per_image");
 const mergePerImage = ref(true);
 const pricesOnly = ref(false);
+const dualVerify = ref(true);
 const modelTier = ref<"fast" | "accurate">("fast");
 const forceDemo = ref(false);
 
@@ -1243,6 +1253,7 @@ async function startBatchExtraction() {
               modelTier: modelTier.value,
               pricesOnly: docType.value === "general" ? false : pricesOnly.value,
               docType: docType.value,
+              dualVerify: dualVerify.value,
             });
             collected[myIdx] = res.quotation;
             if (res.quotation.suggest_split_sheets && snapshot.length === 1) {
@@ -1285,6 +1296,7 @@ async function startBatchExtraction() {
                     modelTier: modelTier.value,
                     pricesOnly: docType.value === "general" ? false : pricesOnly.value,
                     docType: docType.value,
+                    dualVerify: dualVerify.value,
                   });
                   completedSlices++;
                   progressItems.value[myIdx].message = `${seamTag}分 ${slices.length} 段${anchorTag}，提取进度 (${completedSlices}/${slices.length})...`;

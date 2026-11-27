@@ -2,6 +2,7 @@ import base64
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -748,6 +749,50 @@ def _extract_code_family_prefix(val: str) -> str:
     return m.group(1).lower() if m else ""
 
 
+def _code_family_key(val: str) -> str:
+    """
+    提取网络型号/具体型号的「机型族归属键」，用于严格拦截跨网码串机型：
+    - 苹果 A 码（A2896 vs A2892）：每个 A 码唯一对应一款机型，保留全码；
+    - 带连字符编码（JAD-AL00 / JAD-AL50, PNM-AN10 / VER-AN10, MRO-W00 / MRO-AL10）：取连字符前缀；
+    - 三星 5 位码（A9080 / A8050 / A7070 / C5560 / S9480）：取前 3 位（a90 / a80 / a70 / c55 / s94）；
+    - 安卓字母+数字码（V2454A / V2454DA, M582Q / M582V, RMX3663）：取字母+数字主干。
+    """
+    raw = str(val or "").strip()
+    if not raw:
+        return ""
+    first_tok = re.split(r"[\s/(（]+", raw)[0].strip()
+    if not first_tok or first_tok in {"-", "—", "不详", "无"}:
+        return ""
+    up = first_tok.upper()
+    if re.match(r"^A[1-4]\d{3}$", up):
+        return up.lower()
+    if "-" in up:
+        prefix = up.split("-", 1)[0]
+        if len(prefix) >= 2:
+            return prefix.lower()
+    m_sam = re.match(r"^([A-Z])(\d{2})\d{2}$", up)
+    if m_sam:
+        return f"{m_sam.group(1)}{m_sam.group(2)}".lower()
+    m_core = re.match(r"^([A-Z]{1,4}\d{3,5})[A-Z]*$", up)
+    if m_core:
+        return m_core.group(1).lower()
+    alnum = re.sub(r"[^A-Za-z0-9]", "", up).lower()
+    return alnum[:6] if len(alnum) >= 3 else alnum
+
+
+def _codes_same_family(c1: str, c2: str) -> bool:
+    k1 = _code_family_key(c1)
+    k2 = _code_family_key(c2)
+    if not k1 or not k2:
+        return True
+    return k1 == k2
+
+
+def _is_protected_blank_warning(reason: str) -> bool:
+    s = str(reason or "")
+    return "已留空" in s or "核验分歧" in s or "冲突" in s
+
+
 def _is_summary_row(row: List[str]) -> bool:
     """判断是否为财务/通用表格的汇总行（合计/总计/小计/汇总），严禁被机型继承或当孤立残行丢弃。"""
     for cell in (row or [])[:3]:
@@ -1181,14 +1226,15 @@ def _global_post_clean_and_audit(sheet: Dict[str, Any], doc_type: str = "auto") 
 
     # 1.6 系列/表头占位机型自动回填纠偏：
     # 典型案例：华为平板绿色重复表头「Mate pad系列」紧贴下方超高 8 行合并单元格「Mate pad Pro 2024年 12.2寸」，
-    # 前 3 行（MRO-W00 / MRO-AL10）左侧空白导致模型误填「Mate pad系列」。自动向下（并结合小型号前缀交叉验证）回填真实机型！
+    # 注意：只修复非空的「xxx系列 / 型号」表头占位词，绝不覆盖双模型核验或防串行规则刻意留空的 "" 单元格！
     sec_set_series = set(new_sec_headers)
     i_ph = 0
     while i_ph < len(new_rows):
         if i_ph in sec_set_series or model_col >= len(new_rows[i_ph]):
             i_ph += 1
             continue
-        if not _is_series_or_header_model(new_rows[i_ph][model_col]):
+        cur_m_raw = str(new_rows[i_ph][model_col] or "").strip()
+        if not cur_m_raw or not _is_series_or_header_model(cur_m_raw):
             i_ph += 1
             continue
         j_ph = i_ph + 1
@@ -1196,6 +1242,7 @@ def _global_post_clean_and_audit(sheet: Dict[str, Any], doc_type: str = "auto") 
             j_ph < len(new_rows)
             and j_ph not in sec_set_series
             and model_col < len(new_rows[j_ph])
+            and bool(str(new_rows[j_ph][model_col] or "").strip())
             and _is_series_or_header_model(new_rows[j_ph][model_col])
         ):
             j_ph += 1
@@ -1276,6 +1323,121 @@ def _global_post_clean_and_audit(sheet: Dict[str, Any], doc_type: str = "auto") 
                     new_warnings.append({"row": nr, "col": col_c, "reason": str(w.get("reason") or "")})
         except Exception:
             continue
+
+    # 1.7 跨网码族同机型串行拦截（「宁愿留空也不瞎填」核心护栏）：
+    # 典型实测案例：
+    # - 三星 R130「A80 | A9080」与 R131「A80 | A8050」同机型不同网码族；
+    # - 三星 R134~135「A70S | C5560」承接 R133「A70S | A7070」跨族串行；
+    # - 苹果过保 R49~52「14 PRO MAX | A2892」紧接 R45~48「14 PRO MAX | A2896」跨 A 码串行；
+    # - 荣耀1 R100~103「Magic V2 5G | PNM-AN10」与 R116「Magic V2 5G | VER-AN10」跨族冲突。
+    if code_col is not None:
+        sec_set_cc = set(new_sec_headers)
+        # 统计每个 code_family 关联了哪些机型名（用于判断如 VER-AN10 已被 Magic V2 至臻版/RSR 佐证）
+        fam_to_models: Dict[str, set] = {}
+        for r_i, row_val in enumerate(new_rows):
+            if r_i in sec_set_cc or code_col >= len(row_val) or model_col >= len(row_val):
+                continue
+            fk = _code_family_key(row_val[code_col])
+            mn = new_sems[r_i][0]
+            if fk and mn:
+                fam_to_models.setdefault(fk, set()).add(mn)
+
+        # 按连续段归组 (m_norm, code_family) -> 列表 [(start_row, end_row, code_fam, raw_code, caps_set)]
+        model_runs: Dict[str, List[Dict[str, Any]]] = {}
+        r_cursor = 0
+        while r_cursor < len(new_rows):
+            if r_cursor in sec_set_cc or model_col >= len(new_rows[r_cursor]) or code_col >= len(new_rows[r_cursor]):
+                r_cursor += 1
+                continue
+            mn = new_sems[r_cursor][0]
+            fk = _code_family_key(new_rows[r_cursor][code_col])
+            if not mn or not fk:
+                r_cursor += 1
+                continue
+            r_end = r_cursor + 1
+            caps_set = {new_sems[r_cursor][1]} if new_sems[r_cursor][1] else set()
+            while (
+                r_end < len(new_rows)
+                and r_end not in sec_set_cc
+                and model_col < len(new_rows[r_end])
+                and code_col < len(new_rows[r_end])
+                and new_sems[r_end][0] == mn
+                and _code_family_key(new_rows[r_end][code_col]) == fk
+            ):
+                if new_sems[r_end][1]:
+                    caps_set.add(new_sems[r_end][1])
+                r_end += 1
+            model_runs.setdefault(mn, []).append(
+                {
+                    "start": r_cursor,
+                    "end": r_end,
+                    "fam": fk,
+                    "raw_code": str(new_rows[r_cursor][code_col]).strip(),
+                    "raw_model": str(new_rows[r_cursor][model_col]).strip(),
+                    "caps": caps_set,
+                }
+            )
+            r_cursor = r_end
+
+        for mn, runs in model_runs.items():
+            distinct_fams = {g["fam"] for g in runs}
+            if len(distinct_fams) < 2:
+                continue
+
+            def _run_affinity(g: Dict[str, Any]) -> int:
+                score = 0
+                # 1) 网码族前缀直接命中机型名（如 a80 in 'a80', a70 in 'a70s'）
+                if len(g["fam"]) >= 3 and g["fam"] in mn:
+                    score += 3
+                # 2) 同网码族还出现过该机型的衍生版本（如 VER-AN10 同时出现 Magic V2 至臻版/RSR，剥离 4G/5G 后缀比对基名）
+                mn_base = re.sub(r"[45]g$", "", mn)
+                if any(
+                    other != mn
+                    and (
+                        mn in other
+                        or other in mn
+                        or (len(mn_base) >= 4 and (mn_base in other or (len(re.sub(r"[45]g$", "", other)) >= 4 and re.sub(r"[45]g$", "", other) in mn_base)))
+                    )
+                    for other in fam_to_models.get(g["fam"], set())
+                ):
+                    score += 2
+                return score
+
+            affinities = [_run_affinity(g) for g in runs]
+            max_aff = max(affinities)
+            suspect_indices: List[int] = []
+
+            if max_aff > 0:
+                # 有明确归属佐证的保留，无佐证的冲突段一律留空标黄
+                suspect_indices = [idx for idx, af in enumerate(affinities) if af < max_aff]
+            else:
+                # 无前缀字面佐证时（如 14 PRO MAX 跨 A2896 / A2892）：若后续段容量与前段重合，或紧贴前段无缝切换不同网码族 -> 判为串机型留空
+                seen_caps_in_model: set = set(runs[0]["caps"])
+                for idx in range(1, len(runs)):
+                    g_cur = runs[idx]
+                    g_prev = runs[idx - 1]
+                    has_cap_overlap = bool(g_cur["caps"] & seen_caps_in_model)
+                    is_adjacent_switch = g_cur["start"] == g_prev["end"]
+                    if has_cap_overlap or is_adjacent_switch:
+                        suspect_indices.append(idx)
+                    seen_caps_in_model |= g_cur["caps"]
+
+            for s_idx in suspect_indices:
+                g_bad = runs[s_idx]
+                other_codes = sorted({g["raw_code"] for j, g in enumerate(runs) if j != s_idx and g["raw_code"] != g_bad["raw_code"]})
+                other_hint = " / ".join(other_codes[:2])
+                for row_k in range(g_bad["start"], g_bad["end"]):
+                    new_rows[row_k][model_col] = ""
+                    new_sems[row_k] = _extract_row_semantics(new_rows[row_k], roles)
+                    if (row_k, model_col) not in warn_keys:
+                        warn_keys.add((row_k, model_col))
+                        new_warnings.append(
+                            {
+                                "row": row_k,
+                                "col": model_col,
+                                "reason": f"防错填拦截：原识别「{g_bad['raw_model']}」与网码「{g_bad['raw_code']}」跨族冲突（前序网码 {other_hint}），已留空请对照原图确认",
+                            }
+                        )
 
     # 全局逻辑自检（按区块段检查重复容量、缺价、价格档位倒挂）
     sec_set_new = set(new_sec_headers)
@@ -1490,7 +1652,19 @@ def _clean_quotation_rows(
                 primary[ci] = s_val
         return primary
 
-    # 第二遍：去除切片交界处「缺型号但容量+价格与下一行完全相同」的残缺行 + 多层嵌套合并列向下继承（型号 -> 小型号/网络型号 -> 地区/版本）
+    # 记录原有刻意留空的告警单元格（双模型分歧留空 / 防串行留空），清洗阶段严禁覆盖或丢弃这些行
+    orig_protected_model_rows: set = {
+        int(w["row"])
+        for w in (warnings or [])
+        if str(w.get("col", "")).isdigit()
+        and int(w["col"]) == model_col
+        and _is_protected_blank_warning(w.get("reason", ""))
+    }
+    step1_protected: set = {step1_map[orig_r] for orig_r in orig_protected_model_rows if orig_r in step1_map}
+    extra_step2_warnings: List[Dict[str, Any]] = []
+
+    # 第二遍：去除切片交界处「缺型号但容量+价格与下一行完全相同」的残缺行 + 多层嵌套合并列向下继承
+    # 铁律（「宁愿留空也不瞎填」）：若当前空机型行带有不同网码族的新编码（如 A7070 -> C5560），严禁套用上一行机型名！
     step2_rows: List[List[str]] = []
     step2_map: Dict[int, int] = {}
     last_section = None
@@ -1508,6 +1682,7 @@ def _clean_quotation_rows(
 
         m_val = r[model_col].strip() if model_col < len(r) else ""
         c_val = r[cap_col].strip() if cap_col is not None and cap_col < len(r) else ""
+        cur_code_val = r[code_col].strip() if code_col is not None and code_col < len(r) else ""
 
         # 汇总行（合计/总计/小计）原样保留，绝不套用上一行机型名也不丢弃
         if _is_summary_row(r):
@@ -1516,6 +1691,15 @@ def _clean_quotation_rows(
             continue
 
         if not m_val:
+            # 若为双模型分歧刻意留空的保护行，原样保留空机型并打断向下继承
+            if idx in step1_protected:
+                last_model = ""
+                if cur_code_val:
+                    last_code = cur_code_val
+                step2_map[idx] = len(step2_rows)
+                step2_rows.append(r)
+                continue
+
             # 检查是否与后 1~2 行（带完整机型）容量+价格重复
             p_sig = _price_sig(r)
             is_orphan_dup = False
@@ -1530,12 +1714,30 @@ def _clean_quotation_rows(
             if is_orphan_dup:
                 continue
 
+            # 关键防瞎填护栏：若当前行有新的不同网码族（如 C5560 紧接 A7070），严禁继承上一行机型，留空并标黄！
+            if cur_code_val and last_code and not _codes_same_family(cur_code_val, last_code):
+                if c_val or p_sig:
+                    last_model = ""
+                    last_code = cur_code_val
+                    last_metas = {}
+                    new_s2_idx = len(step2_rows)
+                    step2_map[idx] = new_s2_idx
+                    step2_rows.append(r)
+                    extra_step2_warnings.append(
+                        {
+                            "step2_row": new_s2_idx,
+                            "col": model_col,
+                            "reason": f"防错填拦截：网码已切换为「{cur_code_val}」但机型未识别，已留空请对照原图补录",
+                        }
+                    )
+                continue
+
             # 若前面同一区块已有合法机型，且本行有容量或价格 -> 继承合并单元格的机型名与嵌套子列
             if last_model and (c_val or p_sig):
                 r[model_col] = last_model
                 if code_col is not None and code_col < len(r):
-                    if r[code_col].strip():
-                        last_code = r[code_col].strip()
+                    if cur_code_val:
+                        last_code = cur_code_val
                     elif last_code:
                         r[code_col] = last_code
                 for mc in meta_cols_list:
@@ -1545,7 +1747,19 @@ def _clean_quotation_rows(
                         elif last_metas.get(mc):
                             r[mc] = last_metas[mc]
             else:
-                # 无归属机型的孤立切片残行直接丢弃
+                # 若虽无前序机型但带有明确网码+容量/价格，同样保留留空并标黄，避免静默丢行
+                if cur_code_val and (c_val or p_sig):
+                    last_code = cur_code_val
+                    new_s2_idx = len(step2_rows)
+                    step2_map[idx] = new_s2_idx
+                    step2_rows.append(r)
+                    extra_step2_warnings.append(
+                        {
+                            "step2_row": new_s2_idx,
+                            "col": model_col,
+                            "reason": f"防错填拦截：网码「{cur_code_val}」对应机型未识别，已留空请对照原图补录",
+                        }
+                    )
                 continue
         else:
             if _norm_model_name(m_val) != _norm_model_name(last_model):
@@ -1553,8 +1767,8 @@ def _clean_quotation_rows(
                 last_metas = {}
             last_model = m_val
             if code_col is not None and code_col < len(r):
-                if r[code_col].strip():
-                    last_code = r[code_col].strip()
+                if cur_code_val:
+                    last_code = cur_code_val
                 elif last_code:
                     r[code_col] = last_code
             for mc in meta_cols_list:
@@ -1569,22 +1783,42 @@ def _clean_quotation_rows(
 
     # 第三遍：智能消除相邻 1~6 行内的「同容量 + 同价格序列 + 截断/兼容机型名」重复行
     # 典型案例：切片缝把 17pro 截断成 17，或把 13 PRO 的 512/1T 错标成 13 / A2634
+    # 注意：受保护的刻意留空行（双模型分歧/跨族防串行留空）以及不同网络型号编码的独立机型绝不误合并！
+    step2_protected: set = {step2_map[s1_i] for s1_i in step1_protected if s1_i in step2_map} | {
+        int(ew["step2_row"]) for ew in extra_step2_warnings
+    }
     cleaned_rows: List[List[str]] = []
+    cleaned_protected: set = set()
     step3_map: Dict[int, int] = {}
     for idx, r in enumerate(step2_rows):
         m_cur = r[model_col].strip() if model_col < len(r) else ""
         c_cur = _norm_cap_str(r[cap_col]) if cap_col is not None and cap_col < len(r) else ""
+        code_cur = (
+            re.sub(r"\s+", "", str(r[code_col] or "")).lower()
+            if code_col is not None and code_col < len(r)
+            else ""
+        )
         p_cur = _price_sig(r)
+        is_cur_protected = idx in step2_protected
 
         merged_into: Optional[int] = None
-        if p_cur:
+        if p_cur and not is_cur_protected:
             search_start = max(0, len(cleaned_rows) - 6)
             for prev_i in range(len(cleaned_rows) - 1, search_start - 1, -1):
+                if prev_i in cleaned_protected:
+                    continue
                 pr = cleaned_rows[prev_i]
                 m_prev = pr[model_col].strip() if model_col < len(pr) else ""
                 c_prev = _norm_cap_str(pr[cap_col]) if cap_col is not None and cap_col < len(pr) else ""
+                code_prev = (
+                    re.sub(r"\s+", "", str(pr[code_col] or "")).lower()
+                    if code_col is not None and code_col < len(pr)
+                    else ""
+                )
                 p_prev = _price_sig(pr)
                 same_cap = (cap_col is None) or (bool(c_cur) and c_cur == c_prev)
+                if code_cur and code_prev and code_cur != code_prev:
+                    continue
                 if same_cap and p_prev == p_cur and _models_compatible(m_prev, m_cur):
                     cleaned_rows[prev_i] = _merge_dup_pair(pr, r)
                     merged_into = prev_i
@@ -1593,8 +1827,11 @@ def _clean_quotation_rows(
         if merged_into is not None:
             step3_map[idx] = merged_into
         else:
-            step3_map[idx] = len(cleaned_rows)
+            new_c_idx = len(cleaned_rows)
+            step3_map[idx] = new_c_idx
             cleaned_rows.append(r)
+            if is_cur_protected:
+                cleaned_protected.add(new_c_idx)
 
     new_warnings: List[Dict[str, Any]] = []
     for w in (warnings or []):
@@ -1610,6 +1847,11 @@ def _clean_quotation_rows(
                 )
         except Exception:
             continue
+
+    for ew in extra_step2_warnings:
+        s2_r = ew["step2_row"]
+        if s2_r in step3_map:
+            new_warnings.append({"row": step3_map[s2_r], "col": int(ew["col"]), "reason": ew["reason"]})
 
     return cleaned_rows, new_warnings
 
@@ -1930,6 +2172,12 @@ def merge_quotation_slices(
                             )
                     continue
                 sh_copy["rows"] = trimmed_next
+                if skip > 0 and sh_copy.get("warnings"):
+                    sh_copy["warnings"] = [
+                        {"row": int(w.get("row", -1)) - skip, "col": int(w.get("col", 0)), "reason": w.get("reason", "")}
+                        for w in sh_copy["warnings"]
+                        if int(w.get("row", -1)) - skip >= 0
+                    ]
             else:
                 skip = _dedupe_boundary_overlap(
                     prev.get("rows") or [],
@@ -1939,6 +2187,12 @@ def merge_quotation_slices(
                     is_quotation=is_quote_doc,
                 )
                 sh_copy["rows"] = (sh_copy.get("rows") or [])[skip:]
+                if skip > 0 and sh_copy.get("warnings"):
+                    sh_copy["warnings"] = [
+                        {"row": int(w.get("row", -1)) - skip, "col": int(w.get("col", 0)), "reason": w.get("reason", "")}
+                        for w in sh_copy["warnings"]
+                        if int(w.get("row", -1)) - skip >= 0
+                    ]
             if sh_copy.get("rows"):
                 combined_raw_sheets.append(sh_copy)
 
@@ -2002,6 +2256,280 @@ def _parse_model_json(text_out: str) -> Dict[str, Any]:
     return json.loads(repaired, strict=False)
 
 
+def _norm_compare_token(val: str) -> str:
+    """宽松比对键：忽略空格、大小写、全半角括号与连接符/斜杠，避免「红魔6」vs「红魔 6」、「MRO-W00 / MRO-W10」vs「MRO-W00 MRO-W10」等无害微差误报分歧。"""
+    s = str(val or "").strip().lower()
+    s = s.replace("（", "(").replace("）", ")").replace("＋", "+").replace("／", "/")
+    return re.sub(r"[\s\-_/·]+", "", s)
+
+
+def _norm_cap_compare(val: str) -> str:
+    """容量核验比对键：忽略空格/大小写及 256 vs 256G/GB、1T vs 1TB 写法差异，但严格区分 16+512 vs 16+1TB、8+128 vs 8+256。"""
+    s = _norm_cap_str(val)
+    s = s.replace("（", "(").replace("）", ")").replace("＋", "+").replace("／", "/")
+    # 统一内部 tb/gb 别名（如 16+1tb尊享版 -> 16+1t尊享版，12+256gb -> 12+256）
+    s = re.sub(r"(\d+(?:\.\d+)?)tb", r"\1t", s)
+    s = re.sub(r"(\d+)gb?", r"\1", s)
+    return re.sub(r"[\s\-_]+", "", s)
+
+
+def _norm_price_token(val: str) -> str:
+    return re.sub(r"[¥￥$€£,\s]", "", str(val or "").strip())
+
+
+def _call_single_gemini_model(
+    model_name: str,
+    instruction: str,
+    b64_data: str,
+    mime_type: str,
+    headers: Dict[str, str],
+    api_key: str,
+    req_timeout: int,
+    target_resolution: str = "ultra_high",
+) -> Tuple[Optional[Dict[str, Any]], str, bool]:
+    """
+    调用单个 Gemini 模型（锁定 temperature=0.0 降低随机幻觉，支持 generation_config 与 resolution 降级兼容）。
+    返回 (parsed_dict_or_None, error_msg, is_fatal_auth_or_4xx)。
+    """
+    image_block: Dict[str, Any] = {
+        "type": "image",
+        "data": b64_data,
+        "mime_type": mime_type,
+        "resolution": target_resolution,
+    }
+    payload: Dict[str, Any] = {
+        "model": model_name,
+        "store": False,
+        "generation_config": {"temperature": 0.0},
+        "input": [
+            {"type": "text", "text": instruction},
+            image_block,
+        ],
+        "response_format": {
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": TABLE_EXTRACTION_SCHEMA,
+        },
+    }
+
+    try:
+        resp = requests.post(
+            GEMINI_INTERACTIONS_URL,
+            json=payload,
+            headers=headers,
+            timeout=req_timeout,
+        )
+        # 兼容不接受 generation_config 或 resolution 的端点，按需降级重试
+        for _ in range(3):
+            if resp.status_code != 400:
+                break
+            err_low = resp.text.lower()
+            if "generation_config" in err_low or "temperature" in err_low:
+                if "generation_config" in payload:
+                    payload.pop("generation_config", None)
+                    resp = requests.post(GEMINI_INTERACTIONS_URL, json=payload, headers=headers, timeout=req_timeout)
+                    continue
+            if "resolution" in err_low:
+                if image_block.get("resolution") == "ultra_high":
+                    image_block["resolution"] = "high"
+                    resp = requests.post(GEMINI_INTERACTIONS_URL, json=payload, headers=headers, timeout=req_timeout)
+                    continue
+                if "resolution" in image_block:
+                    image_block.pop("resolution", None)
+                    resp = requests.post(GEMINI_INTERACTIONS_URL, json=payload, headers=headers, timeout=req_timeout)
+                    continue
+            break
+    except requests.RequestException as exc:
+        return None, f"连接 Gemini 视觉识别服务超时或网络异常：{type(exc).__name__}", False
+
+    if resp.status_code in (401, 403):
+        return None, "GEMINI_API_KEY 鉴权失败，请检查 Vercel 或 .env 中的密钥配置是否正确。", True
+    if resp.status_code in (429, 500, 502, 503, 504):
+        err_preview = resp.text[:240].replace(api_key, "***")
+        return None, f"Gemini 模型 {model_name} 暂不可用 (HTTP {resp.status_code})：{err_preview}", False
+    if resp.status_code != 200:
+        err_preview = resp.text[:240].replace(api_key, "***")
+        return None, f"Gemini 视觉识别接口返回异常 (HTTP {resp.status_code})：{err_preview}", True
+
+    try:
+        raw_json = resp.json()
+        text_out = _extract_text_from_interactions_response(raw_json).strip()
+        candidate_parsed = _parse_model_json(text_out)
+        sheets_val = candidate_parsed.get("sheets")
+        has_rows = isinstance(sheets_val, list) and any(
+            isinstance(s, dict) and isinstance(s.get("rows"), list) and len(s["rows"]) > 0
+            for s in sheets_val
+        )
+        if not has_rows:
+            return None, f"Gemini 模型 {model_name} 返回空表格，正在切换模型重试", False
+        return candidate_parsed, "", False
+    except Exception as exc:
+        return None, f"Gemini 模型 {model_name} 返回结构解析异常（{type(exc).__name__}），正在自动重试", False
+
+
+def _cross_verify_dual_sheets(
+    primary_sheets: List[Dict[str, Any]],
+    secondary_sheets: List[Dict[str, Any]],
+    primary_model: str,
+    secondary_model: str,
+) -> int:
+    """
+    双模型逐行逐格交叉核验（「宁愿留空也不瞎填」核心）：
+    - 按价格签名与局部行序精准对齐主副模型识别结果；
+    - 忽略纯空格/大小写/单位别名微差（如 红魔6 vs 红魔 6、1TB vs 1T、16+512尊享版 vs 16+512 尊享版）；
+    - 若主副模型在「型号 / 网络型号 / 容量 / 价格」出现实质分歧（如 16+1TB vs 16+512、8+128 vs 8+256、A80 vs A90 5G），
+      直接将该单元格置空 '' 并写入明确的分歧告警（导出 Excel 自动标黄 + 批注列出双方读数）。
+    返回共拦截并留空的实质分歧单元格数。
+    """
+    # 收集副模型全部有效数据行（带各自列角色）
+    sec_entries: List[Dict[str, Any]] = []
+    for ssh in secondary_sheets:
+        s_hdrs = ssh.get("headers") or []
+        s_roles = _detect_column_roles(s_hdrs)
+        s_m_col = s_roles.get("model_col")
+        s_cd_col = s_roles.get("code_col")
+        s_cap_col = s_roles.get("cap_col")
+        s_p_cols: List[int] = s_roles.get("price_cols") or []
+        for s_row in (ssh.get("rows") or []):
+            s_prices = tuple(
+                _norm_price_token(s_row[c])
+                for c in s_p_cols
+                if c < len(s_row) and _norm_price_token(s_row[c])
+            )
+            sec_entries.append(
+                {
+                    "row": s_row,
+                    "roles": s_roles,
+                    "model": str(s_row[s_m_col]).strip() if (s_m_col is not None and s_m_col < len(s_row)) else "",
+                    "code": str(s_row[s_cd_col]).strip() if (s_cd_col is not None and s_cd_col < len(s_row)) else "",
+                    "cap": str(s_row[s_cap_col]).strip() if (s_cap_col is not None and s_cap_col < len(s_row)) else "",
+                    "prices": s_prices,
+                    "price_list": [_norm_price_token(s_row[c]) if c < len(s_row) else "" for c in s_p_cols],
+                }
+            )
+
+    total_primary_rows = sum(len(sh.get("rows") or []) for sh in primary_sheets)
+    if total_primary_rows == 0 or len(sec_entries) < max(1, int(total_primary_rows * 0.55)):
+        # 若副模型疑似截断或漏大半内容，跳过交叉留空以免误伤完整主模型结果
+        return 0
+
+    used_sec: set = set()
+    conflict_count = 0
+    global_p_idx = 0
+
+    for psh in primary_sheets:
+        p_hdrs = psh.get("headers") or []
+        p_roles = _detect_column_roles(p_hdrs)
+        p_m_col = p_roles.get("model_col")
+        p_cd_col = p_roles.get("code_col")
+        p_cap_col = p_roles.get("cap_col")
+        p_p_cols: List[int] = p_roles.get("price_cols") or []
+        p_rows = psh.get("rows") or []
+        p_warns = psh.setdefault("warnings", [])
+        existing_warn_pos = {(int(w.get("row", -1)), int(w.get("col", -1))) for w in p_warns}
+
+        for r_i, p_row in enumerate(p_rows):
+            cur_g_idx = global_p_idx
+            global_p_idx += 1
+
+            p_m = str(p_row[p_m_col]).strip() if (p_m_col is not None and p_m_col < len(p_row)) else ""
+            p_cd = str(p_row[p_cd_col]).strip() if (p_cd_col is not None and p_cd_col < len(p_row)) else ""
+            p_cap = str(p_row[p_cap_col]).strip() if (p_cap_col is not None and p_cap_col < len(p_row)) else ""
+            p_prices = tuple(
+                _norm_price_token(p_row[c])
+                for c in p_p_cols
+                if c < len(p_row) and _norm_price_token(p_row[c])
+            )
+            p_price_list = [_norm_price_token(p_row[c]) if c < len(p_row) else "" for c in p_p_cols]
+
+            # 在局部窗口内寻找最匹配的副模型行（优先价格序列完全一致，其次同网码/同机型+同容量）
+            lo = max(0, cur_g_idx - 8)
+            hi = min(len(sec_entries), cur_g_idx + 9)
+            best_s_idx: Optional[int] = None
+            best_score = -1
+
+            p_m_norm = _norm_compare_token(p_m)
+            p_cd_norm = _norm_compare_token(p_cd)
+            p_cap_norm = _norm_cap_str(p_cap)
+
+            for s_idx in range(lo, hi):
+                if s_idx in used_sec:
+                    continue
+                se = sec_entries[s_idx]
+                dist = abs(s_idx - cur_g_idx)
+                score = 0
+                if len(p_prices) >= 3 and se["prices"] == p_prices:
+                    score += 100
+                elif len(p_prices) >= 2 and se["prices"] == p_prices and dist <= 4:
+                    score += 80
+                elif len(p_price_list) >= 3 and len(se["price_list"]) == len(p_price_list):
+                    same_p = sum(1 for a, b in zip(p_price_list, se["price_list"]) if a and a == b)
+                    if same_p >= len(p_price_list) - 1 and dist <= 3:
+                        score += 60
+
+                if p_cd_norm and _norm_compare_token(se["code"]) == p_cd_norm:
+                    score += 20
+                if p_m_norm and _norm_compare_token(se["model"]) == p_m_norm:
+                    score += 15
+                if p_cap_norm and _norm_cap_str(se["cap"]) == p_cap_norm:
+                    score += 15
+
+                if score >= 80:
+                    adj_score = score * 10 - dist
+                    if adj_score > best_score:
+                        best_score = adj_score
+                        best_s_idx = s_idx
+
+            if best_s_idx is None:
+                continue
+            used_sec.add(best_s_idx)
+            se = sec_entries[best_s_idx]
+
+            def _flag_conflict(col_i: int, label: str, v_primary: str, v_secondary: str) -> None:
+                nonlocal conflict_count
+                if col_i < len(p_row):
+                    p_row[col_i] = ""
+                if (r_i, col_i) not in existing_warn_pos:
+                    existing_warn_pos.add((r_i, col_i))
+                    p_warns.append(
+                        {
+                            "row": r_i,
+                            "col": col_i,
+                            "reason": f"双模型{label}分歧（{primary_model}: {v_primary or '空'} / {secondary_model}: {v_secondary or '空'}），已留空请对照原图确认",
+                        }
+                    )
+                    conflict_count += 1
+
+            # 1) 核验「型号」
+            if p_m_col is not None and se["roles"].get("model_col") is not None:
+                s_m = se["model"]
+                if (p_m or s_m) and _norm_compare_token(p_m) != _norm_compare_token(s_m):
+                    # 若主模型为空而副模型非空、或两者不同，一律留空并给出双候选供 1 秒核对
+                    _flag_conflict(p_m_col, "型号", p_m, s_m)
+
+            # 2) 核验「网络型号 / 具体型号 / 小型号」
+            if p_cd_col is not None and se["roles"].get("code_col") is not None:
+                s_cd = se["code"]
+                if (p_cd or s_cd) and _norm_compare_token(p_cd) != _norm_compare_token(s_cd):
+                    _flag_conflict(p_cd_col, "网络型号", p_cd, s_cd)
+
+            # 3) 核验「容量」（严格捕获 16+1TB vs 16+512、8+128 vs 8+256，忽略空格与 G/GB/T/TB 写法差异）
+            if p_cap_col is not None and se["roles"].get("cap_col") is not None:
+                s_cap = se["cap"]
+                if (p_cap or s_cap) and _norm_cap_compare(p_cap) != _norm_cap_compare(s_cap):
+                    _flag_conflict(p_cap_col, "容量", p_cap, s_cap)
+
+            # 4) 核验「价格列」（当列数一致且单格价格出现分歧）
+            if len(p_p_cols) == len(se["price_list"]) and len(p_p_cols) >= 2:
+                for p_col_pos, s_val in zip(p_p_cols, se["price_list"]):
+                    p_val_raw = str(p_row[p_col_pos]).strip() if p_col_pos < len(p_row) else ""
+                    p_val_n = _norm_price_token(p_val_raw)
+                    if (p_val_n or s_val) and p_val_n != s_val:
+                        _flag_conflict(p_col_pos, "价格", p_val_raw, s_val)
+
+    return conflict_count
+
+
 def extract_tables_from_image(
     image_bytes: bytes,
     filename: str,
@@ -2013,13 +2541,14 @@ def extract_tables_from_image(
     model_tier: str = "fast",
     prices_only: bool = False,
     doc_type: str = "auto",
+    dual_verify: bool = False,
 ) -> Dict[str, Any]:
     """
-    核心图像表格提取函数（双模式自适应 + 高可靠加固版）：
+    核心图像表格提取函数（双模式自适应 + 双模型并发交叉核验 + 高可靠加固版）：
     - 支持 doc_type='auto'（智能自动识别报价单/通用表格）、'quotation'（报价单专精）、'general'（通用多场景表格）；
-    - 默认锁定极速稳定模型 gemini-3.5-flash-lite / gemini-3.1-flash-lite（绝不擅自切换易 503 的 Hydrogen）；
-    - 超时预算严格控制在 Vercel 60s 函数上限内（22s + 16s + 12s <= 52s）；
-    - 除 429/5xx/超时自动切换外，对空输出、畸形 JSON 或 0 行结果同样触发自动跨模型兜底重试。
+    - 支持 dual_verify=True：并发调用 3.5-flash-lite 与 3.1-flash-lite（均锁 temperature=0）逐格交叉核验，
+      凡型号/网络型号/容量/价格出现实质分歧一律留空并标黄批注（「宁愿留空也不瞎填」）；
+    - 超时预算严格控制在 Vercel 60s 函数上限内，单模型异常时自动平滑降级兜底。
     """
     norm_doc_type = (doc_type or "auto").strip().lower()
     if norm_doc_type not in {"auto", "quotation", "general"}:
@@ -2087,6 +2616,7 @@ def extract_tables_from_image(
             "NEVER pull a model name UPWARD from a lower horizontal border box onto orphan rows above the border line! If a row at the very top edge has a blank model cell separated by a dark horizontal border from the model below, leave its model cell empty '' or omit the clipped orphan row rather than assigning the NEXT model's name to it. "
             "SINGLE-LINE MODEL NAME RULE: NEVER put newline characters or literal '\\n' inside model names, network codes, capacities, or prices! If a model name wraps across two lines inside a narrow cell (for example '15 PRO' over 'MAX', or '荣耀Robot' over 'Phone', or 'MATE XT2' over '非凡大师'), ALWAYS join them on ONE line with a single space ('15 PRO MAX', '荣耀Robot Phone', 'MATE XT2 非凡大师'). "
             "BRAND & WATERMARK PRECISION: Carefully distinguish English letters vs digits in brand names and network codes (e.g. 'iQOO' with letters OO NOT digits 00, 'OPPO', 'ROG', 'A3108', 'A2639', 'PMK110', 'LAP-AL10'). Completely IGNORE faint diagonal watermarks (such as '靓机汇报价单') overlapping numbers or capacities—never attach stray watermark letters to capacities or prices. "
+            "STRICT ANTI-HALLUCINATION RULE FOR CAPACITY & MODEL: Read EVERY SINGLE DIGIT of the capacity column directly from the image pixels (e.g. strictly distinguish '16+512' vs '16+1TB' and '8+256' vs '8+128'—NEVER auto-complete or extrapolate capacities from neighboring rows!). Read EVERY model name strictly from its own row/box—NEVER carry over the previous model name onto a row whose network code ('网络型号'/'具体型号') changed (e.g. do NOT copy 'A70S' onto 'C5560', or '14 PRO MAX' onto 'A2892'). If a cell is genuinely unreadable, output empty string '' instead of guessing! "
             "Do NOT include repeated sub-table header rows (like '型号 | 容量 | 靓机...') inside `rows`; instead represent each sub-block as an item in `sheets` with its exact `headers`. "
             "If a sub-table has '-' or blank placeholder columns (for example no highest price tier), KEEP that column slot so all blocks preserve consistent column structure and alignment. "
             + right_col_rule
@@ -2109,87 +2639,60 @@ def extract_tables_from_image(
     target_resolution = "ultra_high"
     used_model = primary_model
     parsed: Optional[Dict[str, Any]] = None
+    secondary_parsed: Optional[Dict[str, Any]] = None
+    secondary_model_used = ""
     last_error = ""
 
-    for attempt_idx, candidate in enumerate(candidate_models):
-        if attempt_idx > 0:
-            time.sleep(0.5 * attempt_idx)
-        req_timeout = timeout_budget[min(attempt_idx, len(timeout_budget) - 1)]
-        image_block: Dict[str, Any] = {
-            "type": "image",
-            "data": b64_data,
-            "mime_type": mime_type,
-            "resolution": target_resolution,
-        }
-        payload = {
-            "model": candidate,
-            "store": False,
-            "input": [
-                {"type": "text", "text": instruction},
-                image_block,
-            ],
-            "response_format": {
-                "type": "text",
-                "mime_type": "application/json",
-                "schema": TABLE_EXTRACTION_SCHEMA,
-            },
-        }
-        try:
-            resp = requests.post(
-                GEMINI_INTERACTIONS_URL,
-                json=payload,
-                headers=headers,
-                timeout=req_timeout,
-            )
-            # 若个别模型端点暂不支持 ultra_high，自动降级为 high，若仍 400 则剥离 resolution 重试
-            if resp.status_code == 400 and "resolution" in resp.text.lower():
-                image_block["resolution"] = "high"
-                resp = requests.post(
-                    GEMINI_INTERACTIONS_URL,
-                    json=payload,
-                    headers=headers,
-                    timeout=req_timeout,
-                )
-                if resp.status_code == 400 and "resolution" in resp.text.lower():
-                    image_block.pop("resolution", None)
-                    resp = requests.post(
-                        GEMINI_INTERACTIONS_URL,
-                        json=payload,
-                        headers=headers,
-                        timeout=req_timeout,
-                    )
-        except requests.RequestException as exc:
-            last_error = f"连接 Gemini 视觉识别服务超时或网络异常：{type(exc).__name__}"
-            continue
+    # 双模型并发交叉核验（3.5-flash-lite ∥ 3.1-flash-lite，并发耗时约等于单模型，几乎不增等待时间）
+    if dual_verify and mode == "excel":
+        m1 = candidate_models[0]
+        m2 = next((c for c in candidate_models[1:] if c != m1), "gemini-3.1-flash-lite" if m1 != "gemini-3.1-flash-lite" else "gemini-3.5-flash-lite")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f1 = pool.submit(_call_single_gemini_model, m1, instruction, b64_data, mime_type, headers, api_key, 26, target_resolution)
+            f2 = pool.submit(_call_single_gemini_model, m2, instruction, b64_data, mime_type, headers, api_key, 26, target_resolution)
+            p1, err1, fatal1 = f1.result()
+            p2, err2, fatal2 = f2.result()
 
-        if resp.status_code in (401, 403):
-            raise RuntimeError("GEMINI_API_KEY 鉴权失败，请检查 Vercel 或 .env 中的密钥配置是否正确。")
-        if resp.status_code in (429, 500, 502, 503, 504):
-            err_preview = resp.text[:240].replace(api_key, "***")
-            last_error = f"Gemini 模型 {candidate} 暂不可用 (HTTP {resp.status_code})：{err_preview}"
-            continue
-        if resp.status_code != 200:
-            err_preview = resp.text[:240].replace(api_key, "***")
-            raise RuntimeError(f"Gemini 视觉识别接口返回异常 (HTTP {resp.status_code})：{err_preview}")
-
-        try:
-            raw_json = resp.json()
-            text_out = _extract_text_from_interactions_response(raw_json).strip()
-            candidate_parsed = _parse_model_json(text_out)
-            sheets_val = candidate_parsed.get("sheets")
-            has_rows = isinstance(sheets_val, list) and any(
-                isinstance(s, dict) and isinstance(s.get("rows"), list) and len(s["rows"]) > 0
-                for s in sheets_val
+        if p1 is not None and p2 is not None:
+            parsed = p1
+            used_model = m1
+            secondary_parsed = p2
+            secondary_model_used = m2
+        elif p1 is not None:
+            parsed = p1
+            used_model = m1
+        elif p2 is not None:
+            parsed = p2
+            used_model = m2
+        else:
+            if fatal1:
+                raise RuntimeError(err1)
+            if fatal2:
+                raise RuntimeError(err2)
+            # 双方首次并发都偶发波动，再做 1 次快速兜底重试
+            p3, err3, fatal3 = _call_single_gemini_model(m1, instruction, b64_data, mime_type, headers, api_key, 18, target_resolution)
+            if p3 is not None:
+                parsed = p3
+                used_model = m1
+            else:
+                last_error = err3 or err1 or err2
+                if fatal3:
+                    raise RuntimeError(last_error)
+    else:
+        for attempt_idx, candidate in enumerate(candidate_models):
+            if attempt_idx > 0:
+                time.sleep(0.5 * attempt_idx)
+            req_timeout = timeout_budget[min(attempt_idx, len(timeout_budget) - 1)]
+            cand_parsed, err_msg, is_fatal = _call_single_gemini_model(
+                candidate, instruction, b64_data, mime_type, headers, api_key, req_timeout, target_resolution
             )
-            if not has_rows:
-                last_error = f"Gemini 模型 {candidate} 返回空表格，正在切换模型重试"
-                continue
-            parsed = candidate_parsed
-            used_model = candidate
-            break
-        except Exception as exc:
-            last_error = f"Gemini 模型 {candidate} 返回结构解析异常（{type(exc).__name__}），正在自动重试"
-            continue
+            if cand_parsed is not None:
+                parsed = cand_parsed
+                used_model = candidate
+                break
+            last_error = err_msg
+            if is_fatal:
+                raise RuntimeError(last_error)
 
     if parsed is None:
         raise RuntimeError(last_error or "Gemini 视觉识别服务暂时繁忙，请稍后重试。")
@@ -2236,6 +2739,28 @@ def extract_tables_from_image(
         rsh.setdefault("section_header_rows", [])
         rsh["style_preset"] = "quotation" if rsh_is_quote else "general"
 
+    # 若双模型均返回有效结果：先对副模型同步做规范化+合并继承清洗，再逐格交叉核验（分歧留空标黄！）
+    dual_verified = False
+    dual_conflicts = 0
+    if secondary_parsed is not None:
+        sec_norm = normalize_table_grid(secondary_parsed, fallback_name=stem)
+        sec_raw = (
+            [sh for sh in sec_norm["sheets"] if not _is_condition_legend_sheet(sh)] or sec_norm["sheets"]
+            if any_quote
+            else sec_norm["sheets"]
+        )
+        for ssh in sec_raw:
+            ssh_is_quote = _is_quotation_sheet(
+                ssh.get("headers") or [], ssh.get("rows") or [], quote_title or ssh.get("name", ""), norm_doc_type
+            )
+            s_rows, s_warns = _clean_quotation_rows(
+                ssh["headers"], ssh["rows"], ssh.get("warnings") or [], is_quotation=ssh_is_quote
+            )
+            ssh["rows"] = s_rows
+            ssh["warnings"] = s_warns
+        dual_conflicts = _cross_verify_dual_sheets(raw_sheets, sec_raw, used_model, secondary_model_used)
+        dual_verified = True
+
     merged_sheet = merge_sheets_into_single_quotation(raw_sheets, quote_title, stem, doc_type=norm_doc_type)
     suggest_split = _should_keep_multi_sheets_separate(raw_sheets, doc_type=norm_doc_type)
     detected_doc_type = "quotation" if any_quote else "general"
@@ -2244,12 +2769,17 @@ def extract_tables_from_image(
     normalized["raw_sheets"] = raw_sheets
     normalized["merged_sheet"] = merged_sheet
     normalized["sheets"] = [merged_sheet] if (merge_per_image and not suggest_split) else raw_sheets
-    normalized["engine"] = used_model
+    normalized["engine"] = f"{used_model} × {secondary_model_used}" if dual_verified else used_model
     normalized["is_demo"] = False
     normalized["detected_doc_type"] = detected_doc_type
     normalized["suggest_split_sheets"] = suggest_split
     mode_tag = "报价单模式" if any_quote else "通用表格模式"
-    if used_model != primary_model:
+    if dual_verified:
+        if dual_conflicts > 0:
+            normalized["notice"] = f"双模型交叉核验完成（{mode_tag} · 检出 {dual_conflicts} 处分歧已留空标黄）"
+        else:
+            normalized["notice"] = f"双模型交叉核验 100% 一致通过（{mode_tag}）"
+    elif used_model != primary_model:
         normalized["notice"] = f"主模型高峰限流，已自动切换 {used_model} 完成识别（{mode_tag}）"
     else:
         normalized["notice"] = f"已通过 {used_model} 多模态引擎完成识别（{mode_tag}）"

@@ -608,8 +608,9 @@ async def extract_single_slice(
     model_tier: str = Form("fast"),
     prices_only: bool = Form(False),
     doc_type: str = Form("auto"),
+    dual_verify: bool = Form(True),
 ) -> Dict[str, Any]:
-    """长图切片独立识别接口（仅返回结构化切片结果，待全部切片完成后再统一计费与入库）。"""
+    """长图切片独立识别接口（默认开启双模型并发交叉核验，待全部切片完成后再统一计费与入库）。"""
     raw_bytes = await file.read()
     fname = _validate_upload_image(file, raw_bytes, slice_index)
     try:
@@ -624,6 +625,7 @@ async def extract_single_slice(
             model_tier=model_tier,
             prices_only=prices_only,
             doc_type=doc_type,
+            dual_verify=dual_verify,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
@@ -691,6 +693,7 @@ async def process_batch_item(
     model_tier: str = Form("fast"),
     prices_only: bool = Form(False),
     doc_type: str = Form("auto"),
+    dual_verify: bool = Form(True),
     session: Session = Depends(get_session),
 ) -> Dict[str, Any]:
     job = session.exec(select(BatchJob).where(BatchJob.job_uid == job_uid)).first()
@@ -716,6 +719,7 @@ async def process_batch_item(
             model_tier=model_tier,
             prices_only=prices_only,
             doc_type=doc_type,
+            dual_verify=dual_verify,
         )
     except RuntimeError as exc:
         failed_item = BatchJobItem(

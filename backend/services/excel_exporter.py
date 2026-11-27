@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Tuple
 from urllib.parse import quote
 
 from openpyxl import Workbook
+from openpyxl.comments import Comment
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -194,6 +195,13 @@ def _populate_worksheet(ws: Any, sheet_data: Dict[str, Any]) -> None:
     final_widths = [min(max(w, 10), 40 if _is_note_column(headers[i]) else 28) for i, w in enumerate(col_widths)]
 
     section_header_rows = set(int(x) for x in (sheet_data.get("section_header_rows") or []))
+    warn_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+    warn_map: Dict[Tuple[int, int], str] = {}
+    for w in (sheet_data.get("warnings") or []):
+        try:
+            warn_map[(int(w["row"]), int(w["col"]))] = str(w.get("reason") or "需对照原图核对")
+        except Exception:
+            continue
 
     for r_idx, row in enumerate(rows, start=2):
         is_section_header = (r_idx - 2) in section_header_rows
@@ -241,7 +249,14 @@ def _populate_worksheet(ws: Any, sheet_data: Dict[str, Any]) -> None:
                 cell.font = summary_font if is_summary else body_font
                 cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-            if is_summary:
+            warn_reason = warn_map.get((r_idx - 2, c_idx - 1))
+            if warn_reason:
+                cell.fill = warn_fill
+                cmt = Comment(warn_reason, "AI 核验助手")
+                cmt.width = 280
+                cmt.height = 75
+                cell.comment = cmt
+            elif is_summary:
                 cell.fill = summary_fill
             elif r_idx % 2 == 1:
                 cell.fill = zebra_fill

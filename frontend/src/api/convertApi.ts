@@ -369,6 +369,7 @@ export async function processBatchJobItem(params: {
   modelTier?: "fast" | "accurate";
   pricesOnly?: boolean;
   docType?: DocScenarioType;
+  dualVerify?: boolean;
 }): Promise<{
   job_uid: string;
   item: BatchJobItem;
@@ -384,6 +385,7 @@ export async function processBatchJobItem(params: {
   formData.append("model_tier", params.modelTier || "fast");
   formData.append("prices_only", String(Boolean(params.pricesOnly)));
   formData.append("doc_type", params.docType || "auto");
+  formData.append("dual_verify", String(params.dualVerify ?? true));
   if (params.customHint?.trim()) {
     formData.append("custom_hint", params.customHint.trim());
   }
@@ -402,6 +404,7 @@ export async function extractSlice(params: {
   modelTier?: "fast" | "accurate";
   pricesOnly?: boolean;
   docType?: DocScenarioType;
+  dualVerify?: boolean;
 }): Promise<Record<string, unknown>> {
   const formData = new FormData();
   formData.append("file", params.file);
@@ -411,6 +414,7 @@ export async function extractSlice(params: {
   formData.append("model_tier", params.modelTier || "fast");
   formData.append("prices_only", String(Boolean(params.pricesOnly)));
   formData.append("doc_type", params.docType || "auto");
+  formData.append("dual_verify", String(params.dualVerify ?? true));
   if (params.customHint?.trim()) {
     formData.append("custom_hint", params.customHint.trim());
   }
