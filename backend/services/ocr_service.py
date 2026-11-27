@@ -764,15 +764,13 @@ def _code_family_key(val: str) -> str:
     if not first_tok or first_tok in {"-", "—", "不详", "无"}:
         return ""
     up = first_tok.upper()
-    if re.match(r"^A[1-4]\d{3}$", up):
+    if re.match(r"^[A-Z]\d{4}$", up):
+        # 苹果 A 码（A2896/A2892）与三星 5 位具体型号码（W9027/W7025/S9380/F9760/A9080/A8050/C5560）一码一机型，保留全码
         return up.lower()
     if "-" in up:
         prefix = up.split("-", 1)[0]
         if len(prefix) >= 2:
             return prefix.lower()
-    m_sam = re.match(r"^([A-Z])(\d{2})\d{2}$", up)
-    if m_sam:
-        return f"{m_sam.group(1)}{m_sam.group(2)}".lower()
     m_core = re.match(r"^([A-Z]{1,4}\d{3,5})[A-Z]*$", up)
     if m_core:
         return m_core.group(1).lower()
@@ -1267,16 +1265,18 @@ def _global_post_clean_and_audit(sheet: Dict[str, Any], doc_type: str = "auto") 
 
         down_model = str(new_rows[down_idx][model_col]).strip() if down_idx is not None else ""
         up_model = str(new_rows[up_idx][model_col]).strip() if up_idx is not None else ""
-        down_prefix = (
-            _extract_code_family_prefix(new_rows[down_idx][code_col])
+        down_code_raw = (
+            str(new_rows[down_idx][code_col]).strip()
             if (down_idx is not None and code_col is not None and code_col < len(new_rows[down_idx]))
             else ""
         )
-        up_prefix = (
-            _extract_code_family_prefix(new_rows[up_idx][code_col])
+        up_code_raw = (
+            str(new_rows[up_idx][code_col]).strip()
             if (up_idx is not None and code_col is not None and code_col < len(new_rows[up_idx]))
             else ""
         )
+        down_prefix = _extract_code_family_prefix(down_code_raw) if down_code_raw else ""
+        up_prefix = _extract_code_family_prefix(up_code_raw) if up_code_raw else ""
 
         # 收集占位段内全部小型号前缀，辅助判断整段归属
         run_prefixes = {
@@ -1285,17 +1285,29 @@ def _global_post_clean_and_audit(sheet: Dict[str, Any], doc_type: str = "auto") 
             if code_col is not None and code_col < len(new_rows[k])
         } - {""}
 
+        step16_blank_rows: List[Tuple[int, str, str]] = []
         for k in range(i_ph, j_ph):
-            cur_prefix = (
-                _extract_code_family_prefix(new_rows[k][code_col])
+            cur_code_raw = (
+                str(new_rows[k][code_col]).strip()
                 if (code_col is not None and code_col < len(new_rows[k]))
                 else ""
             )
+            cur_prefix = _extract_code_family_prefix(cur_code_raw) if cur_code_raw else ""
+            cur_fam = _code_family_key(cur_code_raw) if cur_code_raw else ""
+            down_fam = _code_family_key(down_code_raw) if down_code_raw else ""
+            up_fam = _code_family_key(up_code_raw) if up_code_raw else ""
+
             chosen_model = ""
-            if down_model and cur_prefix and down_prefix and cur_prefix == down_prefix:
+            if down_model and ((cur_prefix and down_prefix and cur_prefix == down_prefix) or (cur_fam and down_fam and cur_fam == down_fam)):
                 chosen_model = down_model
-            elif up_model and cur_prefix and up_prefix and cur_prefix == up_prefix:
+            elif up_model and ((cur_prefix and up_prefix and cur_prefix == up_prefix) or (cur_fam and up_fam and cur_fam == up_fam)):
                 chosen_model = up_model
+            elif cur_fam and (down_fam or up_fam):
+                # 当前「xxx系列」占位行带有明确网码，但与上下真实机型网码均不同族（如 W9027 vs W7025）-> 严禁瞎套邻行机型，留空标黄！
+                orig_ph = str(new_rows[k][model_col]).strip()
+                new_rows[k][model_col] = ""
+                new_sems[k] = _extract_row_semantics(new_rows[k], roles)
+                step16_blank_rows.append((k, orig_ph, cur_code_raw))
             elif down_model and (not up_prefix or down_prefix in run_prefixes or not run_prefixes):
                 chosen_model = down_model
             elif down_model:
@@ -1307,6 +1319,17 @@ def _global_post_clean_and_audit(sheet: Dict[str, Any], doc_type: str = "auto") 
                 new_rows[k][model_col] = chosen_model
                 new_sems[k] = _extract_row_semantics(new_rows[k], roles)
 
+        if step16_blank_rows:
+            for blk_r, orig_ph, blk_code in step16_blank_rows:
+                warnings.append(
+                    {
+                        "row": blk_r,
+                        "col": model_col,
+                        "reason": f"防错填拦截：原识别为系列占位「{orig_ph}」且网码「{blk_code}」与邻行不同，已留空请对照原图补录",
+                        "_already_mapped": True,
+                    }
+                )
+
         i_ph = j_ph
 
     # 映射原有 warnings
@@ -1314,13 +1337,17 @@ def _global_post_clean_and_audit(sheet: Dict[str, Any], doc_type: str = "auto") 
     warn_keys: set = set()
     for w in warnings:
         try:
-            orig_r = int(w["row"])
             col_c = int(w["col"])
-            if orig_r in idx_map:
+            if w.get("_already_mapped"):
+                nr = int(w["row"])
+            else:
+                orig_r = int(w["row"])
+                if orig_r not in idx_map:
+                    continue
                 nr = idx_map[orig_r]
-                if (nr, col_c) not in warn_keys:
-                    warn_keys.add((nr, col_c))
-                    new_warnings.append({"row": nr, "col": col_c, "reason": str(w.get("reason") or "")})
+            if (nr, col_c) not in warn_keys:
+                warn_keys.add((nr, col_c))
+                new_warnings.append({"row": nr, "col": col_c, "reason": str(w.get("reason") or "")})
         except Exception:
             continue
 
@@ -1386,9 +1413,13 @@ def _global_post_clean_and_audit(sheet: Dict[str, Any], doc_type: str = "auto") 
 
             def _run_affinity(g: Dict[str, Any]) -> int:
                 score = 0
-                # 1) 网码族前缀直接命中机型名（如 a80 in 'a80', a70 in 'a70s'）
-                if len(g["fam"]) >= 3 and g["fam"] in mn:
+                fam = g["fam"]
+                # 1) 网码族前缀直接命中机型名（如 a8050 -> a80 in 'a80', a7070 -> a70 in 'a70s', w7025 -> w25 in 'w25flip5g'）
+                if len(fam) >= 3 and fam in mn:
                     score += 3
+                elif re.match(r"^[a-z]\d{4}$", fam):
+                    if fam[:3] in mn or (fam[0] == "w" and f"w{fam[-2:]}" in mn):
+                        score += 3
                 # 2) 同网码族还出现过该机型的衍生版本（如 VER-AN10 同时出现 Magic V2 至臻版/RSR，剥离 4G/5G 后缀比对基名）
                 mn_base = re.sub(r"[45]g$", "", mn)
                 if any(
