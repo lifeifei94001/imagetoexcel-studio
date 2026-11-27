@@ -612,6 +612,14 @@ def _persist_completed_quotation(
     }
 
 
+def _ocr_error_status_code(err_msg: str) -> int:
+    """避免返回 502 被 Cloudflare 劫持替换为英文 HTML 页面，确保中文错误明细完整透传到前端。"""
+    s = str(err_msg or "")
+    if any(k in s for k in ("429", "RPD", "RPM", "速率限制", "今日额度")):
+        return 429
+    return 503
+
+
 @router.post("/extract-slice")
 async def extract_single_slice(
     file: UploadFile = File(...),
@@ -642,7 +650,7 @@ async def extract_single_slice(
             dual_verify=dual_verify,
         )
     except RuntimeError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+        raise HTTPException(status_code=_ocr_error_status_code(str(exc)), detail=str(exc))
     return result
 
 
@@ -751,7 +759,7 @@ async def process_batch_item(
         job.updated_at = utc_now_str()
         session.add(job)
         session.commit()
-        raise HTTPException(status_code=502, detail=str(exc))
+        raise HTTPException(status_code=_ocr_error_status_code(str(exc)), detail=str(exc))
 
     return _persist_completed_quotation(
         session=session,
@@ -1162,7 +1170,7 @@ async def extract_tables(
                 merge_per_image=merge_per_image,
             )
         except RuntimeError as exc:
-            raise HTTPException(status_code=502, detail=str(exc))
+            raise HTTPException(status_code=_ocr_error_status_code(str(exc)), detail=str(exc))
 
         used_engine = result.get("engine", "demo")
         is_demo = bool(result.get("is_demo", True))
