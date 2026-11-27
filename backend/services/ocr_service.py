@@ -1522,24 +1522,35 @@ def _global_post_clean_and_audit(sheet: Dict[str, Any], doc_type: str = "auto") 
             suspect_indices: List[int] = []
 
             if max_aff > 0:
-                # 有明确归属佐证的保留，无佐证的冲突段一律留空标黄
+                # 有明确网码字面/衍生款归属佐证（如 A8050->A80、VER-AN10->Magic V2 至臻版）：保留有佐证段，无佐证段留空标黄
                 suspect_indices = [idx for idx, af in enumerate(affinities) if af < max_aff]
+                is_ambiguous_all = False
             else:
-                # 无前缀字面佐证时（如 14 PRO MAX 跨 A2896 / A2892）：若后续段容量与前段重合，或紧贴前段无缝切换不同网码族 -> 判为串机型留空
+                # 无任何网码字面佐证时（如 BRT-AN00 vs AAK-AN00 都识别为 荣耀 WIN RT 5G，或 A2896 vs A2892 都识别为 14 PRO MAX）：
+                # 无法判断究竟是上段漏字还是下段串行，只要存在容量重合或紧邻无缝切换，将全部冲突段一律留空标黄（彻底 0 静默错填！）
                 seen_caps_in_model: set = set(runs[0]["caps"])
+                has_real_conflict = False
                 for idx in range(1, len(runs)):
                     g_cur = runs[idx]
                     g_prev = runs[idx - 1]
                     has_cap_overlap = bool(g_cur["caps"] & seen_caps_in_model)
                     is_adjacent_switch = g_cur["start"] == g_prev["end"]
                     if has_cap_overlap or is_adjacent_switch:
-                        suspect_indices.append(idx)
+                        has_real_conflict = True
+                        break
                     seen_caps_in_model |= g_cur["caps"]
+                suspect_indices = list(range(len(runs))) if has_real_conflict else []
+                is_ambiguous_all = has_real_conflict
 
             for s_idx in suspect_indices:
                 g_bad = runs[s_idx]
                 other_codes = sorted({g["raw_code"] for j, g in enumerate(runs) if j != s_idx and g["raw_code"] != g_bad["raw_code"]})
                 other_hint = " / ".join(other_codes[:2])
+                warn_reason = (
+                    f"防错填拦截：原识别「{g_bad['raw_model']}」同时出现在不同网码（{g_bad['raw_code']} / {other_hint}），无法自动判定归属，已全部留空请对照原图确认"
+                    if is_ambiguous_all
+                    else f"防错填拦截：原识别「{g_bad['raw_model']}」与网码「{g_bad['raw_code']}」跨族冲突（前序网码 {other_hint}），已留空请对照原图确认"
+                )
                 for row_k in range(g_bad["start"], g_bad["end"]):
                     new_rows[row_k][model_col] = ""
                     new_sems[row_k] = _extract_row_semantics(new_rows[row_k], roles)
@@ -1549,7 +1560,7 @@ def _global_post_clean_and_audit(sheet: Dict[str, Any], doc_type: str = "auto") 
                             {
                                 "row": row_k,
                                 "col": model_col,
-                                "reason": f"防错填拦截：原识别「{g_bad['raw_model']}」与网码「{g_bad['raw_code']}」跨族冲突（前序网码 {other_hint}），已留空请对照原图确认",
+                                "reason": warn_reason,
                             }
                         )
 
