@@ -243,9 +243,31 @@ http.interceptors.response.use(
 
 export function extractApiError(err: unknown): string {
   if (axios.isAxiosError(err)) {
-    const detail = err.response?.data?.detail || err.response?.data?.message;
-    if (typeof detail === "string" && detail.trim()) return detail;
-    if (err.code === "ECONNABORTED") return "单张长图识别超过 65 秒超时，请尝试适当裁剪后重试";
+    const status = err.response?.status;
+    const rawData = err.response?.data;
+    const detail =
+      typeof rawData === "object" && rawData !== null
+        ? (rawData as { detail?: unknown; message?: unknown }).detail ||
+          (rawData as { detail?: unknown; message?: unknown }).message
+        : undefined;
+    if (typeof detail === "string" && detail.trim()) {
+      const cleaned = detail.trim();
+      if (!cleaned.toLowerCase().includes("cloudflare") && !cleaned.toLowerCase().includes("origin web server")) {
+        return cleaned;
+      }
+    }
+    const rawText = typeof rawData === "string" ? rawData : "";
+    if (
+      status === 520 ||
+      status === 522 ||
+      status === 524 ||
+      status === 504 ||
+      rawText.toLowerCase().includes("cloudflare") ||
+      rawText.toLowerCase().includes("origin web server")
+    ) {
+      return `云端网关临时超时或高峰限流 (HTTP ${status || 520})，可点击「重试失败图片」单独补跑`;
+    }
+    if (err.code === "ECONNABORTED") return "单段识别超过 65 秒超时，请点击「重试失败图片」补跑或切单模型";
     return err.message || "网络请求失败";
   }
   return err instanceof Error ? err.message : "发生未知异常";

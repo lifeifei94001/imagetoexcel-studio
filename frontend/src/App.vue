@@ -463,12 +463,26 @@
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; flex-wrap: wrap; gap: 8px">
             <div style="display: flex; align-items: center; gap: 10px">
               <span style="font-weight: 700; font-size: 15px">批处理任务进度</span>
-              <span class="gem-pill" :class="extracting ? 'pill-sky' : 'pill-emerald'">
-                {{ extracting ? `处理中 ${doneCount} / ${progressItems.length}` : `全部完成 ${doneCount} / ${progressItems.length}` }}
+              <span class="gem-pill" :class="extracting ? 'pill-sky' : (failedCount > 0 ? 'pill-gold' : 'pill-emerald')">
+                {{
+                  extracting
+                    ? `处理中 ${doneCount} / ${progressItems.length}`
+                    : failedCount > 0
+                    ? `已完成 ${completedCount} / ${progressItems.length}（${failedCount} 份失败）`
+                    : `全部完成 ${completedCount} / ${progressItems.length}`
+                }}
               </span>
             </div>
-            <div style="display: flex; gap: 8px">
-              <el-button v-if="!extracting && lastBatchJobUid" size="small" type="primary" plain @click="downloadLastJobPackage">
+            <div style="display: flex; gap: 8px; flex-wrap: wrap">
+              <el-button
+                v-if="!extracting && failedCount > 0 && lastBatchJobUid && lastBatchSnapshot.length > 0"
+                size="small"
+                type="warning"
+                @click="retryFailedItems"
+              >
+                仅重试失败图片 ({{ failedCount }} 份)
+              </el-button>
+              <el-button v-if="!extracting && lastBatchJobUid && completedCount > 0" size="small" type="primary" plain @click="downloadLastJobPackage">
                 从 B2 下载本批成品
               </el-button>
               <el-button v-if="!extracting" size="small" text @click="progressItems = []">收起进度</el-button>
@@ -907,6 +921,8 @@ const queue = ref<QueuedImage[]>([]);
 const quotations = ref<QuotationGroup[]>([]);
 const progressItems = ref<ProgressEntry[]>([]);
 const lastBatchJobUid = ref("");
+const lastBatchSnapshot = ref<QueuedImage[]>([]);
+const lastBatchCollected = ref<Array<QuotationGroup | null>>([]);
 
 const geminiConfigured = ref(false);
 const b2Configured = ref(false);
@@ -954,6 +970,7 @@ const previewMap = computed<Record<string, string>>(() => {
   return map;
 });
 
+const completedCount = computed(() => progressItems.value.filter((i) => i.status === "completed").length);
 const doneCount = computed(
   () => progressItems.value.filter((i) => i.status === "completed" || i.status === "failed").length
 );
@@ -1166,6 +1183,259 @@ async function loadSampleImages(sampleNames: string[]) {
   }
 }
 
+function isFatalNonRetryableError(err: unknown): boolean {
+  if (!axios.isAxiosError(err)) return false;
+  const status = err.response?.status;
+  if (status === 400 || status === 401 || status === 403) return true;
+  if (status === 429) {
+    const detail = String(
+      (err.response?.data as { detail?: unknown } | undefined)?.detail || ""
+    );
+    // 仅本系统每日配额上限 429 立即终止；上游模型/代理限流允许冷却重试
+    if (detail.includes("今日额度已达上限") || detail.includes("每日额度")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function finalizeJobWithRetry(jobUid: string) {
+  let lastFinErr: unknown = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      await finalizeBatchJob({
+        jobUid,
+        quotations: [],
+        mergePerImage: mergePerImage.value,
+        outputMode: outputMode.value,
+      });
+      return;
+    } catch (err) {
+      lastFinErr = err;
+      if (attempt < 2) {
+        await sleep(1200);
+      }
+    }
+  }
+  throw lastFinErr;
+}
+
+async function runBatchIndices(
+  jobUid: string,
+  snapshot: QueuedImage[],
+  collected: Array<QuotationGroup | null>,
+  targetIndices: number[]
+) {
+  if (targetIndices.length === 0) return;
+
+  // 稳态限流：双模型交叉核验开启时，1 张图 × 2 切片 × 2 模型 = 最多 4 路并发（与单模型 2×2×1=4 路完全持平），避免撞爆 API 限流与 Cloudflare 520
+  const imageConcurrency = dualVerify.value ? 1 : Math.min(2, targetIndices.length);
+  let cursor = 0;
+
+  const worker = async () => {
+    while (cursor < targetIndices.length) {
+      const myIdx = targetIndices[cursor++];
+      const qItem = snapshot[myIdx];
+      if (!qItem || !progressItems.value[myIdx]) continue;
+
+      progressItems.value[myIdx].status = "processing";
+      progressItems.value[myIdx].message = dualVerify.value
+        ? "正在进行双模型交叉核验并归档 B2..."
+        : "正在进行长图 AI 结构识别并归档 B2...";
+
+      try {
+        const slicePlan = await splitLongImageSmart(qItem.file);
+        const slices = slicePlan.files;
+        if (slices.length <= 1) {
+          const targetFile = slices[0] || qItem.file;
+          let res: Awaited<ReturnType<typeof processBatchJobItem>> | null = null;
+          let lastSingleErr: unknown = null;
+          const maxSingleAttempts = 3;
+          const singleCooldowns = [0, 3000, 5500];
+
+          for (let attempt = 1; attempt <= maxSingleAttempts; attempt++) {
+            const useDual = dualVerify.value && attempt < maxSingleAttempts;
+            if (attempt > 1) {
+              progressItems.value[myIdx].message =
+                dualVerify.value && !useDual
+                  ? `高峰限流，已自动降级单模型保底重试 (${attempt}/${maxSingleAttempts})...`
+                  : `遇网络或模型波动，冷却后自动重试 (${attempt}/${maxSingleAttempts})...`;
+            }
+            try {
+              res = await processBatchJobItem({
+                jobUid,
+                file: targetFile,
+                itemIndex: myIdx,
+                mode: mode.value,
+                forceDemo: forceDemo.value,
+                customHint: customHint.value,
+                mergePerImage: mergePerImage.value,
+                modelTier: modelTier.value,
+                pricesOnly: docType.value === "general" ? false : pricesOnly.value,
+                docType: docType.value,
+                dualVerify: useDual,
+              });
+              break;
+            } catch (err) {
+              lastSingleErr = err;
+              if (isFatalNonRetryableError(err) || attempt >= maxSingleAttempts) {
+                throw err;
+              }
+              await sleep(singleCooldowns[attempt] || 4000);
+            }
+          }
+          if (!res) {
+            throw lastSingleErr instanceof Error ? lastSingleErr : new Error("图片提取失败");
+          }
+
+          collected[myIdx] = res.quotation;
+          if (res.quotation.suggest_split_sheets && snapshot.length === 1) {
+            mergePerImage.value = false;
+          }
+          if (!res.quotation.is_demo) {
+            geminiConfigured.value = true;
+            activeModel.value = res.quotation.engine;
+          }
+          quotaRemaining.value = res.quota.remaining;
+          quotaLimit.value = res.quota.daily_limit;
+          quotaUsed.value = res.quota.used_count;
+          quotaUnlimited.value = Boolean(res.quota.unlimited || res.quota.daily_limit <= 0);
+
+          progressItems.value[myIdx].status = "completed";
+          progressItems.value[myIdx].quoteTitle = res.quotation.quote_title;
+          progressItems.value[myIdx].message = `识别完成 (${res.quotation.merged_sheet.rows.length} 行 · 已存对象存储)`;
+        } else {
+          // 超长报价单智能找缝切片 + 第 1 段先提取精准列头，第 2..N 段双并发提取并带红线列头视觉锚定
+          const seamTag = slicePlan.seamMode === "smart_seam" ? "智能找缝" : "重叠防漏";
+          const anchorTag = slicePlan.hasHeaderAnchor ? "·列头锚定" : "";
+          const sliceResults: Array<Record<string, unknown> | null> = new Array(slices.length).fill(null);
+          let completedSlices = 0;
+
+          const runOneSlice = async (sIdx: number, hintStr: string): Promise<Record<string, unknown>> => {
+            let lastSliceErr: unknown = null;
+            const maxAttempts = 4;
+            const cooldowns = [0, 3000, 5500, 8000];
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+              // 前 2 次坚持双模型交叉核验；若第 3~4 次仍持续限流，仅该顽固切片自动降级单模型保底（三道防错填护栏仍生效）
+              const useDualForSlice = dualVerify.value && attempt <= 2;
+              if (attempt === 1) {
+                progressItems.value[myIdx].message = `${seamTag}分 ${slices.length} 段${anchorTag}，提取进度 (${completedSlices}/${slices.length})...`;
+              } else if (dualVerify.value && !useDualForSlice) {
+                progressItems.value[myIdx].message = `第 ${sIdx + 1}/${slices.length} 段持续限流，自动降级单模型保底重试 (${attempt}/${maxAttempts})...`;
+              } else {
+                progressItems.value[myIdx].message = `第 ${sIdx + 1}/${slices.length} 段遇模型波动，冷却重试 (${attempt}/${maxAttempts})...`;
+              }
+              try {
+                const res = await extractSlice({
+                  file: slices[sIdx],
+                  sliceIndex: sIdx,
+                  mode: mode.value,
+                  forceDemo: forceDemo.value,
+                  customHint: hintStr,
+                  modelTier: modelTier.value,
+                  pricesOnly: docType.value === "general" ? false : pricesOnly.value,
+                  docType: docType.value,
+                  dualVerify: useDualForSlice,
+                });
+                completedSlices++;
+                progressItems.value[myIdx].message = `${seamTag}分 ${slices.length} 段${anchorTag}，提取进度 (${completedSlices}/${slices.length})...`;
+                return res;
+              } catch (err) {
+                lastSliceErr = err;
+                if (isFatalNonRetryableError(err)) {
+                  throw err;
+                }
+                if (attempt < maxAttempts) {
+                  await sleep(cooldowns[attempt] || 6000);
+                }
+              }
+            }
+            throw lastSliceErr instanceof Error ? lastSliceErr : new Error(`第 ${sIdx + 1} 段识别失败`);
+          };
+
+          // 1. 先提取第 1 段以获得最准确的列头结构
+          const baseHint = customHint.value.trim();
+          const firstRes = await runOneSlice(0, baseHint);
+          sliceResults[0] = firstRes;
+
+          let inheritedHeaderHint = baseHint;
+          const rawList = (firstRes.raw_sheets as Array<{ headers?: string[] }> | undefined) || [];
+          const firstHeaders = rawList[0]?.headers;
+          if (firstHeaders?.length) {
+            const headerStr = firstHeaders.join(" | ");
+            const contNote =
+              `This slice continues the same table. Keep the EXACT ${firstHeaders.length} columns in order: [${headerStr}]. ` +
+              (slicePlan.hasHeaderAnchor
+                ? "The top strip above the red horizontal bar is ONLY a visual header reference—extract ONLY data rows below the red bar. "
+                : "") +
+              "Keep '-' or empty placeholder slots for blank cells and do NOT shift columns left or omit rightmost columns.";
+            inheritedHeaderHint = inheritedHeaderHint ? `${inheritedHeaderHint}\n${contNote}` : contNote;
+          }
+
+          // 2. 第 2..N 段采用 2 并发加速提取（双模型模式下每片间温和间隔 300ms 平滑 RPM 峰值）
+          let nextSliceIdx = 1;
+          const sliceWorker = async () => {
+            while (nextSliceIdx < slices.length) {
+              const curS = nextSliceIdx++;
+              sliceResults[curS] = await runOneSlice(curS, inheritedHeaderHint);
+              if (dualVerify.value && nextSliceIdx < slices.length) {
+                await sleep(300);
+              }
+            }
+          };
+          await Promise.all(
+            Array.from({ length: Math.min(2, slices.length - 1) }, () => sliceWorker())
+          );
+
+          progressItems.value[myIdx].message = `正在全局去重拼接 ${slices.length} 段并做异常自检...`;
+          const committed = await commitSlicedQuotation({
+            jobUid,
+            itemIndex: myIdx,
+            sourceFilename: qItem.file.name,
+            fileSizeBytes: qItem.file.size,
+            mode: mode.value,
+            mergePerImage: mergePerImage.value,
+            docType: docType.value,
+            sliceResults: sliceResults.filter((x): x is Record<string, unknown> => x !== null),
+          });
+          if (!committed.quotation) {
+            throw new Error("长图合并归档失败");
+          }
+          collected[myIdx] = committed.quotation;
+          if (committed.quotation.suggest_split_sheets && snapshot.length === 1) {
+            mergePerImage.value = false;
+          }
+          if (!committed.quotation.is_demo) {
+            geminiConfigured.value = true;
+            activeModel.value = committed.quotation.engine;
+          }
+          if (committed.quota) {
+            quotaRemaining.value = committed.quota.remaining;
+            quotaLimit.value = committed.quota.daily_limit;
+            quotaUsed.value = committed.quota.used_count;
+            quotaUnlimited.value = Boolean(committed.quota.unlimited || committed.quota.daily_limit <= 0);
+          }
+          const warnCnt = committed.quotation.merged_sheet.warnings?.length || 0;
+          progressItems.value[myIdx].status = "completed";
+          progressItems.value[myIdx].quoteTitle = committed.quotation.quote_title;
+          progressItems.value[myIdx].message =
+            warnCnt > 0
+              ? `${seamTag} ${slices.length} 段完成 (${committed.quotation.merged_sheet.rows.length} 行 · ${warnCnt} 处标黄核验)`
+              : `${seamTag} ${slices.length} 段完成 (${committed.quotation.merged_sheet.rows.length} 行 · 已存 B2)`;
+        }
+
+        // 实时把已完成报价单展示进工作台
+        quotations.value = collected.filter((x): x is QuotationGroup => x !== null);
+      } catch (err) {
+        progressItems.value[myIdx].status = "failed";
+        progressItems.value[myIdx].message = extractApiError(err);
+      }
+    }
+  };
+
+  await Promise.all(Array.from({ length: imageConcurrency }, () => worker()));
+}
+
 async function startBatchExtraction() {
   if (queue.value.length === 0 || extracting.value) return;
 
@@ -1196,6 +1466,9 @@ async function startBatchExtraction() {
   extracting.value = true;
   lastBatchJobUid.value = "";
   const snapshot = [...queue.value];
+  const collected: Array<QuotationGroup | null> = new Array(snapshot.length).fill(null);
+  lastBatchSnapshot.value = snapshot;
+  lastBatchCollected.value = collected;
 
   progressItems.value = snapshot.map((q) => ({
     id: q.id,
@@ -1227,210 +1500,64 @@ async function startBatchExtraction() {
       sendJobHeartbeat(createdJob.job_uid, clientSessionId).catch(() => {});
     }, 20000);
 
-    const collected: Array<QuotationGroup | null> = new Array(snapshot.length).fill(null);
-    let cursor = 0;
-    const concurrency = Math.min(2, snapshot.length);
-
-    const worker = async () => {
-      while (cursor < snapshot.length) {
-        const myIdx = cursor++;
-        const qItem = snapshot[myIdx];
-        progressItems.value[myIdx].status = "processing";
-        progressItems.value[myIdx].message = "正在进行长图 AI 结构识别并归档 B2...";
-        try {
-          const slicePlan = await splitLongImageSmart(qItem.file);
-          const slices = slicePlan.files;
-          if (slices.length <= 1) {
-            const targetFile = slices[0] || qItem.file;
-            const res = await processBatchJobItem({
-              jobUid: createdJob.job_uid,
-              file: targetFile,
-              itemIndex: myIdx,
-              mode: mode.value,
-              forceDemo: forceDemo.value,
-              customHint: customHint.value,
-              mergePerImage: mergePerImage.value,
-              modelTier: modelTier.value,
-              pricesOnly: docType.value === "general" ? false : pricesOnly.value,
-              docType: docType.value,
-              dualVerify: dualVerify.value,
-            });
-            collected[myIdx] = res.quotation;
-            if (res.quotation.suggest_split_sheets && snapshot.length === 1) {
-              mergePerImage.value = false;
-            }
-            if (!res.quotation.is_demo) {
-              geminiConfigured.value = true;
-              activeModel.value = res.quotation.engine;
-            }
-            quotaRemaining.value = res.quota.remaining;
-            quotaLimit.value = res.quota.daily_limit;
-            quotaUsed.value = res.quota.used_count;
-            quotaUnlimited.value = Boolean(res.quota.unlimited || res.quota.daily_limit <= 0);
-
-            progressItems.value[myIdx].status = "completed";
-            progressItems.value[myIdx].quoteTitle = res.quotation.quote_title;
-            progressItems.value[myIdx].message = `识别完成 (${res.quotation.merged_sheet.rows.length} 行 · 已存对象存储)`;
-          } else {
-            // 超长报价单智能找缝切片 + 第 1 段先提取精准列头，第 2..N 段双并发提取并带红线列头视觉锚定
-            const seamTag = slicePlan.seamMode === "smart_seam" ? "智能找缝" : "重叠防漏";
-            const anchorTag = slicePlan.hasHeaderAnchor ? "·列头锚定" : "";
-            const sliceResults: Array<Record<string, unknown> | null> = new Array(slices.length).fill(null);
-            let completedSlices = 0;
-
-            const runOneSlice = async (sIdx: number, hintStr: string): Promise<Record<string, unknown>> => {
-              let lastSliceErr: unknown = null;
-              const maxAttempts = 3;
-              for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-                progressItems.value[myIdx].message =
-                  attempt === 1
-                    ? `${seamTag}分 ${slices.length} 段${anchorTag}，并发提取 (${completedSlices}/${slices.length} 段已完成)...`
-                    : `第 ${sIdx + 1}/${slices.length} 段遇网络或模型波动，正在自动重试 (${attempt}/${maxAttempts})...`;
-                try {
-                  const res = await extractSlice({
-                    file: slices[sIdx],
-                    sliceIndex: sIdx,
-                    mode: mode.value,
-                    forceDemo: forceDemo.value,
-                    customHint: hintStr,
-                    modelTier: modelTier.value,
-                    pricesOnly: docType.value === "general" ? false : pricesOnly.value,
-                    docType: docType.value,
-                    dualVerify: dualVerify.value,
-                  });
-                  completedSlices++;
-                  progressItems.value[myIdx].message = `${seamTag}分 ${slices.length} 段${anchorTag}，提取进度 (${completedSlices}/${slices.length})...`;
-                  return res;
-                } catch (err) {
-                  lastSliceErr = err;
-                  const status = axios.isAxiosError(err) ? err.response?.status : undefined;
-                  if (status === 400 || status === 401 || status === 403 || status === 429) {
-                    throw err;
-                  }
-                  if (attempt < maxAttempts) {
-                    await sleep(1200 * attempt);
-                  }
-                }
-              }
-              throw lastSliceErr instanceof Error ? lastSliceErr : new Error(`第 ${sIdx + 1} 段识别失败`);
-            };
-
-            // 1. 先提取第 1 段以获得最准确的列头结构
-            const baseHint = customHint.value.trim();
-            const firstRes = await runOneSlice(0, baseHint);
-            sliceResults[0] = firstRes;
-
-            let inheritedHeaderHint = baseHint;
-            const rawList = (firstRes.raw_sheets as Array<{ headers?: string[] }> | undefined) || [];
-            const firstHeaders = rawList[0]?.headers;
-            if (firstHeaders?.length) {
-              const headerStr = firstHeaders.join(" | ");
-              const contNote =
-                `This slice continues the same table. Keep the EXACT ${firstHeaders.length} columns in order: [${headerStr}]. ` +
-                (slicePlan.hasHeaderAnchor
-                  ? "The top strip above the red horizontal bar is ONLY a visual header reference—extract ONLY data rows below the red bar. "
-                  : "") +
-                "Keep '-' or empty placeholder slots for blank cells and do NOT shift columns left or omit rightmost columns.";
-              inheritedHeaderHint = inheritedHeaderHint ? `${inheritedHeaderHint}\n${contNote}` : contNote;
-            }
-
-            // 2. 第 2..N 段采用 2 并发加速提取
-            let nextSliceIdx = 1;
-            const sliceWorker = async () => {
-              while (nextSliceIdx < slices.length) {
-                const curS = nextSliceIdx++;
-                sliceResults[curS] = await runOneSlice(curS, inheritedHeaderHint);
-              }
-            };
-            await Promise.all(
-              Array.from({ length: Math.min(2, slices.length - 1) }, () => sliceWorker())
-            );
-
-            progressItems.value[myIdx].message = `正在全局去重拼接 ${slices.length} 段并做异常自检...`;
-            const committed = await commitSlicedQuotation({
-              jobUid: createdJob.job_uid,
-              itemIndex: myIdx,
-              sourceFilename: qItem.file.name,
-              fileSizeBytes: qItem.file.size,
-              mode: mode.value,
-              mergePerImage: mergePerImage.value,
-              docType: docType.value,
-              sliceResults: sliceResults.filter((x): x is Record<string, unknown> => x !== null),
-            });
-            if (!committed.quotation) {
-              throw new Error("长图合并归档失败");
-            }
-            collected[myIdx] = committed.quotation;
-            if (committed.quotation.suggest_split_sheets && snapshot.length === 1) {
-              mergePerImage.value = false;
-            }
-            if (!committed.quotation.is_demo) {
-              geminiConfigured.value = true;
-              activeModel.value = committed.quotation.engine;
-            }
-            if (committed.quota) {
-              quotaRemaining.value = committed.quota.remaining;
-              quotaLimit.value = committed.quota.daily_limit;
-              quotaUsed.value = committed.quota.used_count;
-              quotaUnlimited.value = Boolean(committed.quota.unlimited || committed.quota.daily_limit <= 0);
-            }
-            const warnCnt = committed.quotation.merged_sheet.warnings?.length || 0;
-            progressItems.value[myIdx].status = "completed";
-            progressItems.value[myIdx].quoteTitle = committed.quotation.quote_title;
-            progressItems.value[myIdx].message =
-              warnCnt > 0
-                ? `${seamTag} ${slices.length} 段完成 (${committed.quotation.merged_sheet.rows.length} 行 · ${warnCnt} 处自检提醒)`
-                : `${seamTag} ${slices.length} 段完成 (${committed.quotation.merged_sheet.rows.length} 行 · 已存 B2)`;
-          }
-
-          // 实时把已完成报价单展示进工作台
-          quotations.value = collected.filter((x): x is QuotationGroup => x !== null);
-        } catch (err) {
-          progressItems.value[myIdx].status = "failed";
-          progressItems.value[myIdx].message = extractApiError(err);
-        }
-      }
-    };
-
-    await Promise.all(Array.from({ length: concurrency }, () => worker()));
+    const allIndices = snapshot.map((_, i) => i);
+    await runBatchIndices(createdJob.job_uid, snapshot, collected, allIndices);
 
     const validQuotations = collected.filter((x): x is QuotationGroup => x !== null);
     quotations.value = validQuotations;
 
-    const finalizeWithRetry = async () => {
-      let lastFinErr: unknown = null;
-      for (let attempt = 1; attempt <= 2; attempt++) {
-        try {
-          await finalizeBatchJob({
-            jobUid: createdJob.job_uid,
-            quotations: [],
-            mergePerImage: mergePerImage.value,
-            outputMode: outputMode.value,
-          });
-          return;
-        } catch (err) {
-          lastFinErr = err;
-          if (attempt < 2) {
-            await sleep(1000);
-          }
-        }
-      }
-      throw lastFinErr;
-    };
-
     if (validQuotations.length > 0) {
-      // 轻量级 finalize：不再上传几 MB 整批 JSON（避免撞 Vercel 4.5MB 413），由后端直接从 B2 现存单表 .xlsx 打包 .zip！
-      await finalizeWithRetry();
+      await finalizeJobWithRetry(createdJob.job_uid);
       ElMessage.success(
         validQuotations.length === snapshot.length
           ? `全部 ${validQuotations.length} 份表格已提取并打包归档！`
-          : `已完成 ${validQuotations.length}/${snapshot.length} 份（已自动归档已完成文件）`
+          : `已完成 ${validQuotations.length}/${snapshot.length} 份，可点击「仅重试失败图片」补齐剩余文件`
       );
       await nextTick();
       editorAnchorRef.value?.scrollIntoView({ behavior: "smooth", block: "start" });
     } else {
-      await finalizeWithRetry();
-      ElMessage.error("本批次图片均未能提取成功，请检查进度栏错误原因");
+      await finalizeJobWithRetry(createdJob.job_uid);
+      ElMessage.error("本批次图片均未能提取成功，可稍候点击「仅重试失败图片」重试");
+    }
+  } catch (err) {
+    ElMessage.error(extractApiError(err));
+  } finally {
+    stopHeartbeat();
+    extracting.value = false;
+    checkOtherActiveJobs();
+  }
+}
+
+async function retryFailedItems() {
+  if (extracting.value || !lastBatchJobUid.value || lastBatchSnapshot.value.length === 0) return;
+  const failedIndices: number[] = [];
+  for (let i = 0; i < progressItems.value.length; i++) {
+    if (progressItems.value[i].status === "failed" && lastBatchSnapshot.value[i]) {
+      failedIndices.push(i);
+      progressItems.value[i].status = "pending";
+      progressItems.value[i].message = "排队等待补跑重试...";
+    }
+  }
+  if (failedIndices.length === 0) return;
+
+  extracting.value = true;
+  const jobUid = lastBatchJobUid.value;
+  stopHeartbeat();
+  heartbeatTimer = window.setInterval(() => {
+    sendJobHeartbeat(jobUid, clientSessionId).catch(() => {});
+  }, 20000);
+
+  try {
+    await runBatchIndices(jobUid, lastBatchSnapshot.value, lastBatchCollected.value, failedIndices);
+    const validQuotations = lastBatchCollected.value.filter((x): x is QuotationGroup => x !== null);
+    quotations.value = validQuotations;
+    await finalizeJobWithRetry(jobUid);
+
+    const stillFailed = progressItems.value.filter((p) => p.status === "failed").length;
+    if (stillFailed === 0) {
+      ElMessage.success(`补跑全部成功！整批 ${validQuotations.length} 份已自动重新打包至 B2`);
+    } else {
+      ElMessage.warning(`本次补跑完成，当前已完成 ${validQuotations.length}/${lastBatchSnapshot.value.length} 份（仍有 ${stillFailed} 份失败）`);
     }
   } catch (err) {
     ElMessage.error(extractApiError(err));

@@ -543,6 +543,17 @@ def _persist_completed_quotation(
     except Exception:
         pass
 
+    # 若该 item_index 此前有失败占位记录（如点击「仅重试失败图片」补跑成功），先清除旧失败行避免重复计数
+    old_items = session.exec(
+        select(BatchJobItem).where(
+            BatchJobItem.job_uid == job.job_uid,
+            BatchJobItem.item_index == item_index,
+        )
+    ).all()
+    for old_it in old_items:
+        session.delete(old_it)
+    session.flush()
+
     job_item = BatchJobItem(
         job_uid=job.job_uid,
         item_index=item_index,

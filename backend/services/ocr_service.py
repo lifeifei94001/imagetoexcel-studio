@@ -2308,6 +2308,10 @@ def _norm_price_token(val: str) -> str:
     return re.sub(r"[¥￥$€£,\s]", "", str(val or "").strip())
 
 
+_API_REJECTS_GEN_CONFIG = False
+_API_MAX_RESOLUTION = "ultra_high"
+
+
 def _call_single_gemini_model(
     model_name: str,
     instruction: str,
@@ -2317,21 +2321,36 @@ def _call_single_gemini_model(
     api_key: str,
     req_timeout: int,
     target_resolution: str = "ultra_high",
+    deadline: Optional[float] = None,
 ) -> Tuple[Optional[Dict[str, Any]], str, bool]:
     """
     调用单个 Gemini 模型（锁定 temperature=0.0 降低随机幻觉，支持 generation_config 与 resolution 降级兼容）。
+    严格受 deadline 墙钟预算约束，杜绝超时撞穿 Vercel 60s 导致 Cloudflare 520。
     返回 (parsed_dict_or_None, error_msg, is_fatal_auth_or_4xx)。
     """
+    global _API_REJECTS_GEN_CONFIG, _API_MAX_RESOLUTION
+
+    def _effective_timeout() -> Optional[Tuple[float, float]]:
+        if deadline is None:
+            return (6.0, float(max(5, req_timeout)))
+        rem = deadline - time.monotonic()
+        if rem < 4.0:
+            return None
+        read_t = min(float(max(5, req_timeout)), rem)
+        return (min(6.0, max(2.0, read_t * 0.4)), read_t)
+
+    eff_res = _API_MAX_RESOLUTION if target_resolution == "ultra_high" else target_resolution
     image_block: Dict[str, Any] = {
         "type": "image",
         "data": b64_data,
         "mime_type": mime_type,
-        "resolution": target_resolution,
     }
+    if eff_res:
+        image_block["resolution"] = eff_res
+
     payload: Dict[str, Any] = {
         "model": model_name,
         "store": False,
-        "generation_config": {"temperature": 0.0},
         "input": [
             {"type": "text", "text": instruction},
             image_block,
@@ -2342,34 +2361,44 @@ def _call_single_gemini_model(
             "schema": TABLE_EXTRACTION_SCHEMA,
         },
     }
+    if not _API_REJECTS_GEN_CONFIG:
+        payload["generation_config"] = {"temperature": 0.0}
 
     try:
+        t_pair = _effective_timeout()
+        if t_pair is None:
+            return None, f"Gemini 模型 {model_name} 接近单次安全耗时上限，已快速中止交由重试", False
         resp = requests.post(
             GEMINI_INTERACTIONS_URL,
             json=payload,
             headers=headers,
-            timeout=req_timeout,
+            timeout=t_pair,
         )
-        # 兼容不接受 generation_config 或 resolution 的端点，按需降级重试
+        # 兼容不接受 generation_config 或 resolution 的端点，按需降级重试并缓存能力避免重复 400 往返
         for _ in range(3):
             if resp.status_code != 400:
                 break
             err_low = resp.text.lower()
-            if "generation_config" in err_low or "temperature" in err_low:
-                if "generation_config" in payload:
-                    payload.pop("generation_config", None)
-                    resp = requests.post(GEMINI_INTERACTIONS_URL, json=payload, headers=headers, timeout=req_timeout)
-                    continue
-            if "resolution" in err_low:
+            retried = False
+            if ("generation_config" in err_low or "temperature" in err_low) and "generation_config" in payload:
+                _API_REJECTS_GEN_CONFIG = True
+                payload.pop("generation_config", None)
+                retried = True
+            elif "resolution" in err_low:
                 if image_block.get("resolution") == "ultra_high":
+                    _API_MAX_RESOLUTION = "high"
                     image_block["resolution"] = "high"
-                    resp = requests.post(GEMINI_INTERACTIONS_URL, json=payload, headers=headers, timeout=req_timeout)
-                    continue
-                if "resolution" in image_block:
+                    retried = True
+                elif "resolution" in image_block:
+                    _API_MAX_RESOLUTION = ""
                     image_block.pop("resolution", None)
-                    resp = requests.post(GEMINI_INTERACTIONS_URL, json=payload, headers=headers, timeout=req_timeout)
-                    continue
-            break
+                    retried = True
+            if not retried:
+                break
+            t_pair = _effective_timeout()
+            if t_pair is None:
+                return None, f"Gemini 模型 {model_name} 接近单次安全耗时上限，已快速中止交由重试", False
+            resp = requests.post(GEMINI_INTERACTIONS_URL, json=payload, headers=headers, timeout=t_pair)
     except requests.RequestException as exc:
         return None, f"连接 Gemini 视觉识别服务超时或网络异常：{type(exc).__name__}", False
 
@@ -2684,13 +2713,16 @@ def extract_tables_from_image(
     secondary_model_used = ""
     last_error = ""
 
+    # 严格控制单次请求墙钟预算在 38 秒内（远低于 Vercel 60s 硬超时，彻底杜绝 Cloudflare 520 断连）
+    wall_deadline = time.monotonic() + 38.0
+
     # 双模型并发交叉核验（3.5-flash-lite ∥ 3.1-flash-lite，并发耗时约等于单模型，几乎不增等待时间）
     if dual_verify and mode == "excel":
         m1 = candidate_models[0]
         m2 = next((c for c in candidate_models[1:] if c != m1), "gemini-3.1-flash-lite" if m1 != "gemini-3.1-flash-lite" else "gemini-3.5-flash-lite")
         with ThreadPoolExecutor(max_workers=2) as pool:
-            f1 = pool.submit(_call_single_gemini_model, m1, instruction, b64_data, mime_type, headers, api_key, 26, target_resolution)
-            f2 = pool.submit(_call_single_gemini_model, m2, instruction, b64_data, mime_type, headers, api_key, 26, target_resolution)
+            f1 = pool.submit(_call_single_gemini_model, m1, instruction, b64_data, mime_type, headers, api_key, 22, target_resolution, wall_deadline)
+            f2 = pool.submit(_call_single_gemini_model, m2, instruction, b64_data, mime_type, headers, api_key, 22, target_resolution, wall_deadline)
             p1, err1, fatal1 = f1.result()
             p2, err2, fatal2 = f2.result()
 
@@ -2710,22 +2742,34 @@ def extract_tables_from_image(
                 raise RuntimeError(err1)
             if fatal2:
                 raise RuntimeError(err2)
-            # 双方首次并发都偶发波动，再做 1 次快速兜底重试
-            p3, err3, fatal3 = _call_single_gemini_model(m1, instruction, b64_data, mime_type, headers, api_key, 18, target_resolution)
-            if p3 is not None:
-                parsed = p3
-                used_model = m1
+            # 双方首次并发都偶发波动：仅在剩余安全预算 >= 9 秒时做 1 次快速兜底重试，且避开刚才 429/503/超时的主模型优先切备用模型
+            rem_sec = wall_deadline - time.monotonic()
+            if rem_sec >= 9.0:
+                m1_throttled = any(k in (err1 or "") for k in ("429", "503", "超时", "Timeout"))
+                fallback_m = m2 if m1_throttled else m1
+                p3, err3, fatal3 = _call_single_gemini_model(
+                    fallback_m, instruction, b64_data, mime_type, headers, api_key, min(14, int(rem_sec)), target_resolution, wall_deadline
+                )
+                if p3 is not None:
+                    parsed = p3
+                    used_model = fallback_m
+                else:
+                    last_error = err3 or err1 or err2
+                    if fatal3:
+                        raise RuntimeError(last_error)
             else:
-                last_error = err3 or err1 or err2
-                if fatal3:
-                    raise RuntimeError(last_error)
+                last_error = err1 or err2
     else:
+        single_budget = [18, 12, 8] if model_tier != "accurate" else [20, 12, 8]
         for attempt_idx, candidate in enumerate(candidate_models):
+            rem_sec = wall_deadline - time.monotonic()
+            if rem_sec < 5.0:
+                break
             if attempt_idx > 0:
-                time.sleep(0.5 * attempt_idx)
-            req_timeout = timeout_budget[min(attempt_idx, len(timeout_budget) - 1)]
+                time.sleep(min(0.6 * attempt_idx, max(0.0, rem_sec - 5.0)))
+            req_timeout = min(single_budget[min(attempt_idx, len(single_budget) - 1)], int(max(5.0, wall_deadline - time.monotonic())))
             cand_parsed, err_msg, is_fatal = _call_single_gemini_model(
-                candidate, instruction, b64_data, mime_type, headers, api_key, req_timeout, target_resolution
+                candidate, instruction, b64_data, mime_type, headers, api_key, req_timeout, target_resolution, wall_deadline
             )
             if cand_parsed is not None:
                 parsed = cand_parsed
