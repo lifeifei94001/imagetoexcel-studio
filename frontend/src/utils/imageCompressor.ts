@@ -367,7 +367,7 @@ export async function splitLongImageSmart(file: File): Promise<SmartSlicePlan> {
       const origH = img.height;
 
       // 常规尺寸图片无需切片
-      if (origH <= 1400 || origH / Math.max(1, origW) < 1.35) {
+      if (origH <= 1450 || origH / Math.max(1, origW) < 1.35) {
         resolve({
           files: [await prepareImageForUpload(file)],
           seamMode: "single",
@@ -387,7 +387,8 @@ export async function splitLongImageSmart(file: File): Promise<SmartSlicePlan> {
       const maxSlices = 30;
       const dataStartY = headerBand ? headerBand.firstDataY : 0;
       const dataTotalH = Math.max(1, targetH - dataStartY);
-      const desiredSliceH = Math.max(850, Math.ceil(dataTotalH / maxSlices));
+      // 1250px 单段（原图 1:1 清晰度不变，单段约 28~32 行）：比 850px 立省约 35% API 请求次数且显著减少切缝！
+      const desiredSliceH = Math.max(1250, Math.ceil(dataTotalH / maxSlices));
       const fallbackOverlap = 160;
 
       const ranges: Array<{ startY: number; endY: number }> = [];
@@ -407,8 +408,8 @@ export async function splitLongImageSmart(file: File): Promise<SmartSlicePlan> {
         }
 
         const idealY = effectiveStart + desiredSliceH;
-        const minSearchY = Math.max(effectiveStart + 420, idealY - 280);
-        const maxSearchY = Math.min(targetH - 220, idealY + 260);
+        const minSearchY = Math.max(effectiveStart + 650, idealY - 320);
+        const maxSearchY = Math.min(targetH - 220, idealY + 280);
         const { cutY, isCleanSeam } = findBestModelBoundaryCut(metrics, targetH, idealY, minSearchY, maxSearchY);
 
         if (isCleanSeam) {

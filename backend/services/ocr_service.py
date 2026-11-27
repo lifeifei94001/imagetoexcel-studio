@@ -78,12 +78,95 @@ TABLE_EXTRACTION_SCHEMA: Dict[str, Any] = {
 }
 
 
+import threading
+
+
+_KEY_STATE_LOCK = threading.Lock()
+_KEY_COOLDOWN_UNTIL: Dict[Tuple[str, str], float] = {}
+_KEY_RR_IDX = 0
+
+
+def _get_gemini_api_keys() -> List[str]:
+    """
+    获取全部可用的 Gemini API Key（支持多 Key 自动轮换，彻底突破单 Key 免费 RPD/RPM 上限）：
+    - 优先读取逗号/分号/换行分隔的 GEMINI_API_KEYS；
+    - 兼容单个 GEMINI_API_KEY / GOOGLE_API_KEY 及 GEMINI_API_KEY_2..5；
+    - 自动去重并保留配置顺序。
+    """
+    keys: List[str] = []
+    seen: set = set()
+
+    def _add(raw_val: str) -> None:
+        if not raw_val:
+            return
+        for part in re.split(r"[,;\s\r\n]+", raw_val):
+            tok = part.strip().strip('"').strip("'")
+            if tok and tok not in seen:
+                seen.add(tok)
+                keys.append(tok)
+
+    _add(_get_clean_env("GEMINI_API_KEYS"))
+    _add(_get_clean_env("GEMINI_API_KEY"))
+    _add(_get_clean_env("GOOGLE_API_KEY"))
+    for idx in range(2, 6):
+        _add(_get_clean_env(f"GEMINI_API_KEY_{idx}"))
+    return keys
+
+
 def _get_gemini_api_key() -> str:
-    return _get_clean_env("GEMINI_API_KEY") or _get_clean_env("GOOGLE_API_KEY")
+    keys = _get_gemini_api_keys()
+    return keys[0] if keys else ""
 
 
 def has_gemini_key() -> bool:
-    return bool(_get_gemini_api_key())
+    return bool(_get_gemini_api_keys())
+
+
+def get_gemini_key_count() -> int:
+    return len(_get_gemini_api_keys())
+
+
+def _pick_ordered_keys(all_keys: List[str], model_name: str) -> List[str]:
+    """优先返回当前未处于冷却期的 Key（多把健康 Key 轮询负载均衡），冷却中 Key 放末尾兜底。"""
+    global _KEY_RR_IDX
+    if len(all_keys) <= 1:
+        return list(all_keys)
+    now = time.monotonic()
+    with _KEY_STATE_LOCK:
+        start = _KEY_RR_IDX % len(all_keys)
+        _KEY_RR_IDX += 1
+        rotated = all_keys[start:] + all_keys[:start]
+        healthy = [k for k in rotated if _KEY_COOLDOWN_UNTIL.get((k, model_name), 0.0) <= now]
+        cooling = [k for k in rotated if _KEY_COOLDOWN_UNTIL.get((k, model_name), 0.0) > now]
+    return healthy + cooling
+
+
+def _mark_key_cooldown(api_key: str, model_name: str, seconds: float) -> None:
+    with _KEY_STATE_LOCK:
+        _KEY_COOLDOWN_UNTIL[(api_key, model_name)] = max(
+            _KEY_COOLDOWN_UNTIL.get((api_key, model_name), 0.0),
+            time.monotonic() + max(1.0, seconds),
+        )
+
+
+def _classify_429_reason(resp_text: str) -> str:
+    """精准区分 Google AI Studio 的每分钟限速(RPM)与当日免费总次数耗尽(RPD)。"""
+    low = (resp_text or "").lower()
+    rpd_markers = (
+        "perday",
+        "per_day",
+        "per day",
+        "requestsperday",
+        "requests_per_day",
+        "daily",
+        "rpd",
+        "free_tier_requests",
+    )
+    if any(m in low for m in rpd_markers) and not any(m in low for m in ("perminute", "per_minute", "per minute", "rpm")):
+        return "rpd"
+    if "perday" in low or "per_day" in low or "requestsperday" in low:
+        return "rpd"
+    return "rpm"
 
 
 def get_active_model() -> str:
@@ -2312,6 +2395,14 @@ _API_REJECTS_GEN_CONFIG = False
 _API_MAX_RESOLUTION = "ultra_high"
 
 
+def _redact_keys(text: str, api_keys: List[str]) -> str:
+    out = str(text or "")
+    for k in api_keys:
+        if k:
+            out = out.replace(k, "***")
+    return out
+
+
 def _call_single_gemini_model(
     model_name: str,
     instruction: str,
@@ -2322,13 +2413,19 @@ def _call_single_gemini_model(
     req_timeout: int,
     target_resolution: str = "ultra_high",
     deadline: Optional[float] = None,
+    api_keys: Optional[List[str]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], str, bool]:
     """
-    调用单个 Gemini 模型（锁定 temperature=0.0 降低随机幻觉，支持 generation_config 与 resolution 降级兼容）。
+    调用单个 Gemini 模型（锁定 temperature=0.0 降低随机幻觉，支持多 Key 自动轮换、400 参数能力缓存与 RPM/RPD 精准区分）。
     严格受 deadline 墙钟预算约束，杜绝超时撞穿 Vercel 60s 导致 Cloudflare 520。
     返回 (parsed_dict_or_None, error_msg, is_fatal_auth_or_4xx)。
     """
     global _API_REJECTS_GEN_CONFIG, _API_MAX_RESOLUTION
+
+    key_pool = [k for k in (api_keys or ([api_key] if api_key else [])) if k]
+    if not key_pool:
+        return None, "未配置 GEMINI_API_KEY，请检查环境变量。", True
+    ordered_keys = _pick_ordered_keys(key_pool, model_name)
 
     def _effective_timeout() -> Optional[Tuple[float, float]]:
         if deadline is None:
@@ -2339,92 +2436,128 @@ def _call_single_gemini_model(
         read_t = min(float(max(5, req_timeout)), rem)
         return (min(6.0, max(2.0, read_t * 0.4)), read_t)
 
-    eff_res = _API_MAX_RESOLUTION if target_resolution == "ultra_high" else target_resolution
-    image_block: Dict[str, Any] = {
-        "type": "image",
-        "data": b64_data,
-        "mime_type": mime_type,
-    }
-    if eff_res:
-        image_block["resolution"] = eff_res
+    last_err = ""
+    all_auth_failed = True
 
-    payload: Dict[str, Any] = {
-        "model": model_name,
-        "store": False,
-        "input": [
-            {"type": "text", "text": instruction},
-            image_block,
-        ],
-        "response_format": {
-            "type": "text",
-            "mime_type": "application/json",
-            "schema": TABLE_EXTRACTION_SCHEMA,
-        },
-    }
-    if not _API_REJECTS_GEN_CONFIG:
-        payload["generation_config"] = {"temperature": 0.0}
+    for key_idx, active_key in enumerate(ordered_keys):
+        req_headers = dict(headers)
+        req_headers["x-goog-api-key"] = active_key
 
-    try:
-        t_pair = _effective_timeout()
-        if t_pair is None:
-            return None, f"Gemini 模型 {model_name} 接近单次安全耗时上限，已快速中止交由重试", False
-        resp = requests.post(
-            GEMINI_INTERACTIONS_URL,
-            json=payload,
-            headers=headers,
-            timeout=t_pair,
-        )
-        # 兼容不接受 generation_config 或 resolution 的端点，按需降级重试并缓存能力避免重复 400 往返
-        for _ in range(3):
-            if resp.status_code != 400:
-                break
-            err_low = resp.text.lower()
-            retried = False
-            if ("generation_config" in err_low or "temperature" in err_low) and "generation_config" in payload:
-                _API_REJECTS_GEN_CONFIG = True
-                payload.pop("generation_config", None)
-                retried = True
-            elif "resolution" in err_low:
-                if image_block.get("resolution") == "ultra_high":
-                    _API_MAX_RESOLUTION = "high"
-                    image_block["resolution"] = "high"
-                    retried = True
-                elif "resolution" in image_block:
-                    _API_MAX_RESOLUTION = ""
-                    image_block.pop("resolution", None)
-                    retried = True
-            if not retried:
-                break
+        eff_res = _API_MAX_RESOLUTION if target_resolution == "ultra_high" else target_resolution
+        image_block: Dict[str, Any] = {
+            "type": "image",
+            "data": b64_data,
+            "mime_type": mime_type,
+        }
+        if eff_res:
+            image_block["resolution"] = eff_res
+
+        payload: Dict[str, Any] = {
+            "model": model_name,
+            "store": False,
+            "input": [
+                {"type": "text", "text": instruction},
+                image_block,
+            ],
+            "response_format": {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": TABLE_EXTRACTION_SCHEMA,
+            },
+        }
+        if not _API_REJECTS_GEN_CONFIG:
+            payload["generation_config"] = {"temperature": 0.0}
+
+        try:
             t_pair = _effective_timeout()
             if t_pair is None:
-                return None, f"Gemini 模型 {model_name} 接近单次安全耗时上限，已快速中止交由重试", False
-            resp = requests.post(GEMINI_INTERACTIONS_URL, json=payload, headers=headers, timeout=t_pair)
-    except requests.RequestException as exc:
-        return None, f"连接 Gemini 视觉识别服务超时或网络异常：{type(exc).__name__}", False
+                return None, last_err or f"Gemini 模型 {model_name} 接近单次安全耗时上限，已快速中止交由重试", False
+            resp = requests.post(
+                GEMINI_INTERACTIONS_URL,
+                json=payload,
+                headers=req_headers,
+                timeout=t_pair,
+            )
+            # 兼容不接受 generation_config 或 resolution 的端点，按需降级重试并缓存能力避免重复 400 往返
+            for _ in range(3):
+                if resp.status_code != 400:
+                    break
+                err_low = resp.text.lower()
+                retried = False
+                if ("generation_config" in err_low or "temperature" in err_low) and "generation_config" in payload:
+                    _API_REJECTS_GEN_CONFIG = True
+                    payload.pop("generation_config", None)
+                    retried = True
+                elif "resolution" in err_low:
+                    if image_block.get("resolution") == "ultra_high":
+                        _API_MAX_RESOLUTION = "high"
+                        image_block["resolution"] = "high"
+                        retried = True
+                    elif "resolution" in image_block:
+                        _API_MAX_RESOLUTION = ""
+                        image_block.pop("resolution", None)
+                        retried = True
+                if not retried:
+                    break
+                t_pair = _effective_timeout()
+                if t_pair is None:
+                    return None, last_err or f"Gemini 模型 {model_name} 接近单次安全耗时上限，已快速中止交由重试", False
+                resp = requests.post(GEMINI_INTERACTIONS_URL, json=payload, headers=req_headers, timeout=t_pair)
+        except requests.RequestException as exc:
+            all_auth_failed = False
+            last_err = f"连接 Gemini 视觉识别服务超时或网络异常：{type(exc).__name__}"
+            continue
 
-    if resp.status_code in (401, 403):
-        return None, "GEMINI_API_KEY 鉴权失败，请检查 Vercel 或 .env 中的密钥配置是否正确。", True
-    if resp.status_code in (429, 500, 502, 503, 504):
-        err_preview = resp.text[:240].replace(api_key, "***")
-        return None, f"Gemini 模型 {model_name} 暂不可用 (HTTP {resp.status_code})：{err_preview}", False
-    if resp.status_code != 200:
-        err_preview = resp.text[:240].replace(api_key, "***")
-        return None, f"Gemini 视觉识别接口返回异常 (HTTP {resp.status_code})：{err_preview}", True
+        if resp.status_code in (401, 403):
+            last_err = "GEMINI_API_KEY 鉴权失败，请检查 Vercel 或 .env 中的密钥配置是否正确。"
+            if key_idx < len(ordered_keys) - 1:
+                _mark_key_cooldown(active_key, model_name, 3600.0)
+                continue
+            return None, last_err, all_auth_failed
 
-    try:
-        raw_json = resp.json()
-        text_out = _extract_text_from_interactions_response(raw_json).strip()
-        candidate_parsed = _parse_model_json(text_out)
-        sheets_val = candidate_parsed.get("sheets")
-        has_rows = isinstance(sheets_val, list) and any(
-            isinstance(s, dict) and isinstance(s.get("rows"), list) and len(s["rows"]) > 0
-            for s in sheets_val
-        )
-        if not has_rows:
-            return None, f"Gemini 模型 {model_name} 返回空表格，正在切换模型重试", False
-        return candidate_parsed, "", False
-    except Exception as exc:
-        return None, f"Gemini 模型 {model_name} 返回结构解析异常（{type(exc).__name__}），正在自动重试", False
+        all_auth_failed = False
+
+        if resp.status_code == 429:
+            limit_kind = _classify_429_reason(resp.text)
+            if limit_kind == "rpd":
+                _mark_key_cooldown(active_key, model_name, 900.0)
+                last_err = (
+                    f"Google 免费 API 今日额度(RPD)已耗尽（模型 {model_name}），"
+                    "每日北京时间 16:00 自动重置；或在 Vercel 配置 GEMINI_API_KEYS 添加备用 Key 轮换。"
+                )
+            else:
+                _mark_key_cooldown(active_key, model_name, 25.0)
+                last_err = f"Google API 触发每分钟速率限制(RPM 429，模型 {model_name})，系统将冷却后自动重试。"
+            # 若还有其它备用 Key 且剩余预算充足，立即无感切换下一把 Key！
+            if key_idx < len(ordered_keys) - 1 and (deadline is None or (deadline - time.monotonic()) >= 8.0):
+                continue
+            return None, last_err, False
+
+        if resp.status_code in (500, 502, 503, 504):
+            err_preview = _redact_keys(resp.text[:240], key_pool)
+            last_err = f"Gemini 模型 {model_name} 暂不可用 (HTTP {resp.status_code})：{err_preview}"
+            return None, last_err, False
+
+        if resp.status_code != 200:
+            err_preview = _redact_keys(resp.text[:240], key_pool)
+            return None, f"Gemini 视觉识别接口返回异常 (HTTP {resp.status_code})：{err_preview}", True
+
+        try:
+            raw_json = resp.json()
+            text_out = _extract_text_from_interactions_response(raw_json).strip()
+            candidate_parsed = _parse_model_json(text_out)
+            sheets_val = candidate_parsed.get("sheets")
+            has_rows = isinstance(sheets_val, list) and any(
+                isinstance(s, dict) and isinstance(s.get("rows"), list) and len(s["rows"]) > 0
+                for s in sheets_val
+            )
+            if not has_rows:
+                return None, f"Gemini 模型 {model_name} 返回空表格，正在切换模型重试", False
+            return candidate_parsed, "", False
+        except Exception as exc:
+            return None, f"Gemini 模型 {model_name} 返回结构解析异常（{type(exc).__name__}），正在自动重试", False
+
+    return None, last_err or f"Gemini 模型 {model_name} 暂时不可用", False
 
 
 def _cross_verify_dual_sheets(
@@ -2625,8 +2758,9 @@ def extract_tables_from_image(
         norm_doc_type = "auto"
     effective_prices_only = bool(prices_only) and norm_doc_type != "general"
 
-    api_key = _get_gemini_api_key()
-    if force_demo or not api_key:
+    api_keys = _get_gemini_api_keys()
+    api_key = api_keys[0] if api_keys else ""
+    if force_demo or not api_keys:
         demo_res = _build_demo_result(filename, mode)
         demo_res["detected_doc_type"] = "general"
         demo_res["suggest_split_sheets"] = False
@@ -2721,8 +2855,8 @@ def extract_tables_from_image(
         m1 = candidate_models[0]
         m2 = next((c for c in candidate_models[1:] if c != m1), "gemini-3.1-flash-lite" if m1 != "gemini-3.1-flash-lite" else "gemini-3.5-flash-lite")
         with ThreadPoolExecutor(max_workers=2) as pool:
-            f1 = pool.submit(_call_single_gemini_model, m1, instruction, b64_data, mime_type, headers, api_key, 22, target_resolution, wall_deadline)
-            f2 = pool.submit(_call_single_gemini_model, m2, instruction, b64_data, mime_type, headers, api_key, 22, target_resolution, wall_deadline)
+            f1 = pool.submit(_call_single_gemini_model, m1, instruction, b64_data, mime_type, headers, api_key, 22, target_resolution, wall_deadline, api_keys)
+            f2 = pool.submit(_call_single_gemini_model, m2, instruction, b64_data, mime_type, headers, api_key, 22, target_resolution, wall_deadline, api_keys)
             p1, err1, fatal1 = f1.result()
             p2, err2, fatal2 = f2.result()
 
@@ -2742,13 +2876,14 @@ def extract_tables_from_image(
                 raise RuntimeError(err1)
             if fatal2:
                 raise RuntimeError(err2)
-            # 双方首次并发都偶发波动：仅在剩余安全预算 >= 9 秒时做 1 次快速兜底重试，且避开刚才 429/503/超时的主模型优先切备用模型
+            # 若两个模型均已触发 RPD 当日免费上限耗尽，立即返回清晰提示，避免做无效兜底重试
+            both_rpd = ("今日额度(RPD)" in (err1 or "")) and ("今日额度(RPD)" in (err2 or ""))
             rem_sec = wall_deadline - time.monotonic()
-            if rem_sec >= 9.0:
-                m1_throttled = any(k in (err1 or "") for k in ("429", "503", "超时", "Timeout"))
+            if not both_rpd and rem_sec >= 9.0:
+                m1_throttled = any(k in (err1 or "") for k in ("429", "503", "超时", "Timeout", "RPD"))
                 fallback_m = m2 if m1_throttled else m1
                 p3, err3, fatal3 = _call_single_gemini_model(
-                    fallback_m, instruction, b64_data, mime_type, headers, api_key, min(14, int(rem_sec)), target_resolution, wall_deadline
+                    fallback_m, instruction, b64_data, mime_type, headers, api_key, min(14, int(rem_sec)), target_resolution, wall_deadline, api_keys
                 )
                 if p3 is not None:
                     parsed = p3
@@ -2769,7 +2904,7 @@ def extract_tables_from_image(
                 time.sleep(min(0.6 * attempt_idx, max(0.0, rem_sec - 5.0)))
             req_timeout = min(single_budget[min(attempt_idx, len(single_budget) - 1)], int(max(5.0, wall_deadline - time.monotonic())))
             cand_parsed, err_msg, is_fatal = _call_single_gemini_model(
-                candidate, instruction, b64_data, mime_type, headers, api_key, req_timeout, target_resolution, wall_deadline
+                candidate, instruction, b64_data, mime_type, headers, api_key, req_timeout, target_resolution, wall_deadline, api_keys
             )
             if cand_parsed is not None:
                 parsed = cand_parsed

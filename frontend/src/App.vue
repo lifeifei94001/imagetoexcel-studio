@@ -1187,16 +1187,23 @@ function isFatalNonRetryableError(err: unknown): boolean {
   if (!axios.isAxiosError(err)) return false;
   const status = err.response?.status;
   if (status === 400 || status === 401 || status === 403) return true;
-  if (status === 429) {
-    const detail = String(
-      (err.response?.data as { detail?: unknown } | undefined)?.detail || ""
-    );
-    // 仅本系统每日配额上限 429 立即终止；上游模型/代理限流允许冷却重试
-    if (detail.includes("今日额度已达上限") || detail.includes("每日额度")) {
-      return true;
-    }
+  const detail = String(
+    (err.response?.data as { detail?: unknown } | undefined)?.detail || ""
+  );
+  // 1) 本系统每日配额上限 429；2) Google 免费 API 今日总次数(RPD)耗尽 -> 无需白费时间重复重试，直接清晰提示
+  if (
+    detail.includes("今日额度已达上限") ||
+    detail.includes("每日额度") ||
+    detail.includes("今日额度(RPD)已耗尽")
+  ) {
+    return true;
   }
   return false;
+}
+
+function isRateLimitRpmError(err: unknown): boolean {
+  const msg = extractApiError(err).toLowerCase();
+  return msg.includes("rpm") || msg.includes("429") || msg.includes("速率限制") || msg.includes("限流");
 }
 
 async function finalizeJobWithRetry(jobUid: string) {
@@ -1228,8 +1235,11 @@ async function runBatchIndices(
 ) {
   if (targetIndices.length === 0) return;
 
-  // 稳态限流：双模型交叉核验开启时，1 张图 × 2 切片 × 2 模型 = 最多 4 路并发（与单模型 2×2×1=4 路完全持平），避免撞爆 API 限流与 Cloudflare 520
-  const imageConcurrency = dualVerify.value ? 1 : Math.min(2, targetIndices.length);
+  // 「慢稳准」节流策略：
+  // - 双模型交叉核验开启：严格 1 张图 × 1 切片匀速串行（单片周期 >= 4.5s，每个模型 <= 13 次/分，稳压在 Google 免费 15 RPM 以内！）
+  // - 单模型模式：1 张图 × 2 切片温和并发 + 600ms 间隔，兼顾效率与防 429
+  const imageConcurrency = 1;
+  const MIN_DUAL_SLICE_CYCLE_MS = 4500;
   let cursor = 0;
 
   const worker = async () => {
@@ -1238,10 +1248,19 @@ async function runBatchIndices(
       const qItem = snapshot[myIdx];
       if (!qItem || !progressItems.value[myIdx]) continue;
 
+      let imageAborted = false;
+      const setItemProgressMsg = (msg: string) => {
+        if (!imageAborted && progressItems.value[myIdx]) {
+          progressItems.value[myIdx].message = msg;
+        }
+      };
+
       progressItems.value[myIdx].status = "processing";
-      progressItems.value[myIdx].message = dualVerify.value
-        ? "正在进行双模型交叉核验并归档 B2..."
-        : "正在进行长图 AI 结构识别并归档 B2...";
+      setItemProgressMsg(
+        dualVerify.value
+          ? "正在进行双模型交叉核验（慢速稳准模式）并归档 B2..."
+          : "正在进行长图 AI 结构识别并归档 B2..."
+      );
 
       try {
         const slicePlan = await splitLongImageSmart(qItem.file);
@@ -1250,16 +1269,17 @@ async function runBatchIndices(
           const targetFile = slices[0] || qItem.file;
           let res: Awaited<ReturnType<typeof processBatchJobItem>> | null = null;
           let lastSingleErr: unknown = null;
-          const maxSingleAttempts = 3;
-          const singleCooldowns = [0, 3000, 5500];
+          const maxSingleAttempts = 4;
 
           for (let attempt = 1; attempt <= maxSingleAttempts; attempt++) {
-            const useDual = dualVerify.value && attempt < maxSingleAttempts;
+            const useDual = dualVerify.value && attempt <= 2;
+            const startedAt = Date.now();
             if (attempt > 1) {
-              progressItems.value[myIdx].message =
+              setItemProgressMsg(
                 dualVerify.value && !useDual
                   ? `高峰限流，已自动降级单模型保底重试 (${attempt}/${maxSingleAttempts})...`
-                  : `遇网络或模型波动，冷却后自动重试 (${attempt}/${maxSingleAttempts})...`;
+                  : `遇网络或限流波动，冷却后自动重试 (${attempt}/${maxSingleAttempts})...`
+              );
             }
             try {
               res = await processBatchJobItem({
@@ -1275,13 +1295,26 @@ async function runBatchIndices(
                 docType: docType.value,
                 dualVerify: useDual,
               });
+              // 双模型匀速节拍：确保每张请求周期 >= 4.5s，不撞每分钟 RPM 墙
+              if (dualVerify.value) {
+                const elapsed = Date.now() - startedAt;
+                if (elapsed < MIN_DUAL_SLICE_CYCLE_MS) {
+                  await sleep(MIN_DUAL_SLICE_CYCLE_MS - elapsed);
+                }
+              }
               break;
             } catch (err) {
               lastSingleErr = err;
               if (isFatalNonRetryableError(err) || attempt >= maxSingleAttempts) {
                 throw err;
               }
-              await sleep(singleCooldowns[attempt] || 4000);
+              const waitMs = isRateLimitRpmError(err)
+                ? [0, 10000, 20000, 30000][attempt] || 20000
+                : [0, 3500, 7000, 12000][attempt] || 6000;
+              setItemProgressMsg(
+                `触发限流或波动，冷却 ${Math.round(waitMs / 1000)} 秒后自动重试 (${attempt + 1}/${maxSingleAttempts})...`
+              );
+              await sleep(waitMs);
             }
           }
           if (!res) {
@@ -1305,7 +1338,7 @@ async function runBatchIndices(
           progressItems.value[myIdx].quoteTitle = res.quotation.quote_title;
           progressItems.value[myIdx].message = `识别完成 (${res.quotation.merged_sheet.rows.length} 行 · 已存对象存储)`;
         } else {
-          // 超长报价单智能找缝切片 + 第 1 段先提取精准列头，第 2..N 段双并发提取并带红线列头视觉锚定
+          // 超长报价单 1250px 智能找缝切片 + 第 1 段先提取精准列头，后续段按「慢稳准」匀速提取并带红线列头视觉锚定
           const seamTag = slicePlan.seamMode === "smart_seam" ? "智能找缝" : "重叠防漏";
           const anchorTag = slicePlan.hasHeaderAnchor ? "·列头锚定" : "";
           const sliceResults: Array<Record<string, unknown> | null> = new Array(slices.length).fill(null);
@@ -1314,16 +1347,25 @@ async function runBatchIndices(
           const runOneSlice = async (sIdx: number, hintStr: string): Promise<Record<string, unknown>> => {
             let lastSliceErr: unknown = null;
             const maxAttempts = 4;
-            const cooldowns = [0, 3000, 5500, 8000];
             for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+              if (imageAborted) {
+                throw new Error("当前图片已中止");
+              }
               // 前 2 次坚持双模型交叉核验；若第 3~4 次仍持续限流，仅该顽固切片自动降级单模型保底（三道防错填护栏仍生效）
               const useDualForSlice = dualVerify.value && attempt <= 2;
+              const sliceStart = Date.now();
               if (attempt === 1) {
-                progressItems.value[myIdx].message = `${seamTag}分 ${slices.length} 段${anchorTag}，提取进度 (${completedSlices}/${slices.length})...`;
+                setItemProgressMsg(
+                  `${seamTag}分 ${slices.length} 段${anchorTag}，${dualVerify.value ? "匀速核验" : "提取进度"} (${completedSlices}/${slices.length})...`
+                );
               } else if (dualVerify.value && !useDualForSlice) {
-                progressItems.value[myIdx].message = `第 ${sIdx + 1}/${slices.length} 段持续限流，自动降级单模型保底重试 (${attempt}/${maxAttempts})...`;
+                setItemProgressMsg(
+                  `第 ${sIdx + 1}/${slices.length} 段持续限流，自动降级单模型保底重试 (${attempt}/${maxAttempts})...`
+                );
               } else {
-                progressItems.value[myIdx].message = `第 ${sIdx + 1}/${slices.length} 段遇模型波动，冷却重试 (${attempt}/${maxAttempts})...`;
+                setItemProgressMsg(
+                  `第 ${sIdx + 1}/${slices.length} 段遇模型波动，冷却重试 (${attempt}/${maxAttempts})...`
+                );
               }
               try {
                 const res = await extractSlice({
@@ -1338,7 +1380,16 @@ async function runBatchIndices(
                   dualVerify: useDualForSlice,
                 });
                 completedSlices++;
-                progressItems.value[myIdx].message = `${seamTag}分 ${slices.length} 段${anchorTag}，提取进度 (${completedSlices}/${slices.length})...`;
+                setItemProgressMsg(
+                  `${seamTag}分 ${slices.length} 段${anchorTag}，${dualVerify.value ? "匀速核验" : "提取进度"} (${completedSlices}/${slices.length})...`
+                );
+                // 双模型匀速节拍保护：每段总耗时不足 4.5s 时补足间隔，稳控单模型 RPM <= 13 次/分
+                if (dualVerify.value && completedSlices < slices.length) {
+                  const elapsed = Date.now() - sliceStart;
+                  if (elapsed < MIN_DUAL_SLICE_CYCLE_MS) {
+                    await sleep(MIN_DUAL_SLICE_CYCLE_MS - elapsed);
+                  }
+                }
                 return res;
               } catch (err) {
                 lastSliceErr = err;
@@ -1346,7 +1397,14 @@ async function runBatchIndices(
                   throw err;
                 }
                 if (attempt < maxAttempts) {
-                  await sleep(cooldowns[attempt] || 6000);
+                  const isRpm = isRateLimitRpmError(err);
+                  const waitMs = isRpm
+                    ? [0, 10000, 20000, 30000][attempt] || 20000
+                    : [0, 3500, 7000, 12000][attempt] || 7000;
+                  setItemProgressMsg(
+                    `第 ${sIdx + 1}/${slices.length} 段${isRpm ? "触发每分钟限速(429)" : "遇模型波动"}，冷却 ${Math.round(waitMs / 1000)} 秒后续跑 (${attempt + 1}/${maxAttempts})...`
+                  );
+                  await sleep(waitMs);
                 }
               }
             }
@@ -1372,22 +1430,23 @@ async function runBatchIndices(
             inheritedHeaderHint = inheritedHeaderHint ? `${inheritedHeaderHint}\n${contNote}` : contNote;
           }
 
-          // 2. 第 2..N 段采用 2 并发加速提取（双模型模式下每片间温和间隔 300ms 平滑 RPM 峰值）
+          // 2. 第 2..N 段：双模型严格单段串行匀速（零 RPM 撞车），单模型 2 并发+600ms 平滑间隔
+          const sliceConcurrency = dualVerify.value ? 1 : Math.min(2, slices.length - 1);
           let nextSliceIdx = 1;
           const sliceWorker = async () => {
-            while (nextSliceIdx < slices.length) {
+            while (nextSliceIdx < slices.length && !imageAborted) {
               const curS = nextSliceIdx++;
               sliceResults[curS] = await runOneSlice(curS, inheritedHeaderHint);
-              if (dualVerify.value && nextSliceIdx < slices.length) {
-                await sleep(300);
+              if (!dualVerify.value && nextSliceIdx < slices.length && !imageAborted) {
+                await sleep(600);
               }
             }
           };
           await Promise.all(
-            Array.from({ length: Math.min(2, slices.length - 1) }, () => sliceWorker())
+            Array.from({ length: Math.max(1, sliceConcurrency) }, () => sliceWorker())
           );
 
-          progressItems.value[myIdx].message = `正在全局去重拼接 ${slices.length} 段并做异常自检...`;
+          setItemProgressMsg(`正在全局去重拼接 ${slices.length} 段并做异常自检...`);
           const committed = await commitSlicedQuotation({
             jobUid,
             itemIndex: myIdx,
@@ -1427,6 +1486,7 @@ async function runBatchIndices(
         // 实时把已完成报价单展示进工作台
         quotations.value = collected.filter((x): x is QuotationGroup => x !== null);
       } catch (err) {
+        imageAborted = true;
         progressItems.value[myIdx].status = "failed";
         progressItems.value[myIdx].message = extractApiError(err);
       }

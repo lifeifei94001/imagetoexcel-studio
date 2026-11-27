@@ -258,6 +258,7 @@ export function extractApiError(err: unknown): string {
     }
     const rawText = typeof rawData === "string" ? rawData : "";
     if (
+      status === 502 ||
       status === 520 ||
       status === 522 ||
       status === 524 ||
@@ -265,7 +266,7 @@ export function extractApiError(err: unknown): string {
       rawText.toLowerCase().includes("cloudflare") ||
       rawText.toLowerCase().includes("origin web server")
     ) {
-      return `云端网关临时超时或高峰限流 (HTTP ${status || 520})，可点击「重试失败图片」单独补跑`;
+      return `模型通道临时限流或网关超时 (HTTP ${status || 502})，可稍等片刻后点「仅重试失败图片」补跑`;
     }
     if (err.code === "ECONNABORTED") return "单段识别超过 65 秒超时，请点击「重试失败图片」补跑或切单模型";
     return err.message || "网络请求失败";

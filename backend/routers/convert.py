@@ -35,6 +35,7 @@ from services.excel_exporter import (
 from services.ocr_service import (
     extract_tables_from_image,
     get_active_model,
+    get_gemini_key_count,
     has_gemini_key,
     merge_quotation_slices,
 )
@@ -296,6 +297,7 @@ def get_quota(session: Session = Depends(get_session)) -> Dict[str, Any]:
     return {
         **_format_quota_payload(quota),
         "gemini_configured": has_gemini_key(),
+        "gemini_key_count": get_gemini_key_count(),
         "model": get_active_model(),
         "b2_configured": b2_is_enabled(),
     }
@@ -345,6 +347,7 @@ def update_quota_config(req: UpdateQuotaRequest, session: Session = Depends(get_
     return {
         **_format_quota_payload(quota),
         "gemini_configured": has_gemini_key(),
+        "gemini_key_count": get_gemini_key_count(),
         "model": get_active_model(),
         "b2_configured": b2_is_enabled(),
     }
