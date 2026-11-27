@@ -2504,8 +2504,18 @@ def _cross_verify_dual_sheets(
             if p_m_col is not None and se["roles"].get("model_col") is not None:
                 s_m = se["model"]
                 if (p_m or s_m) and _norm_compare_token(p_m) != _norm_compare_token(s_m):
-                    # 若主模型为空而副模型非空、或两者不同，一律留空并给出双候选供 1 秒核对
-                    _flag_conflict(p_m_col, "型号", p_m, s_m)
+                    p_is_ph = bool(p_m) and _is_series_or_header_model(p_m)
+                    s_is_ph = bool(s_m) and _is_series_or_header_model(s_m)
+                    if s_is_ph and p_m and not p_is_ph:
+                        # 副模型误将「A系列/W系列/C系列」分组表头填入型号列，采信主模型真实机型名，不误伤留空
+                        pass
+                    elif p_is_ph and s_m and not s_is_ph:
+                        # 主模型误填「xxx系列」占位而副模型读出真实机型名，自动采纳真实机型名
+                        if p_m_col < len(p_row):
+                            p_row[p_m_col] = s_m
+                    else:
+                        # 实质型号分歧（如 14 PRO MAX vs 14 PRO、A80 vs A90 5G），一律留空并给出双候选供 1 秒核对
+                        _flag_conflict(p_m_col, "型号", p_m, s_m)
 
             # 2) 核验「网络型号 / 具体型号 / 小型号」
             if p_cd_col is not None and se["roles"].get("code_col") is not None:
