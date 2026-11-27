@@ -44,18 +44,25 @@ def _display_width(text: str) -> int:
     return width
 
 
+_PURE_SHORT_NUMBER_RE = re.compile(r"^-?(?:0|[1-9]\d{0,10})(?:\.\d+)?$")
+
+
 def _parse_typed_cell(raw_val: str, col_type: str) -> Tuple[Any, str]:
     """
-    R2 数值与货币保真：
-    - 对 number / currency / percent 列尽力转为真实数字并保留 Excel 格式；
+    R2 数值与货币保真（全表智能数值化，彻底消除 Excel/WPS「数字为文本类型」绿三角，方便 XLOOKUP/VLOOKUP 匹配）：
+    - 所有不含前导零且 <=11 位的纯数字（包含容量列 64/128/256/512、苹果型号列 13/14/15/16/17、价格列）一律存为真正的 Excel 数值；
     - 保留原始货币符号（¥ / $ / € / £）与千分位格式（如 ¥#,##0.00），不把财务金额退化成裸整数；
-    - 含前导零编码（如 001042）保持文本，防止丢失前缀零。
+    - 含前导零编码（001042）、12 位以上长单号/税号、+50、3200-3300、1T、12+256 等保持文本原样。
     """
     text = (raw_val or "").strip()
     if not text:
         return "", "@"
 
     if col_type == "text":
+        if _PURE_SHORT_NUMBER_RE.match(text):
+            if "." in text:
+                return float(text), "0.##"
+            return int(text), "0"
         return text, "@"
 
     if col_type == "percent":
@@ -77,7 +84,10 @@ def _parse_typed_cell(raw_val: str, col_type: str) -> Tuple[Any, str]:
         has_comma = "," in text
         has_decimal = "." in text
         cleaned = re.sub(r"[¥￥$€£,\s]", "", text)
-        if re.match(r"^0\d+$", cleaned):
+        digits_only = cleaned.lstrip("-")
+        if re.match(r"^0\d+$", digits_only):
+            return text, "@"
+        if not cur_sym and not has_comma and digits_only.isdigit() and len(digits_only) >= 12:
             return text, "@"
         try:
             num = float(cleaned)
@@ -93,6 +103,10 @@ def _parse_typed_cell(raw_val: str, col_type: str) -> Tuple[Any, str]:
         except ValueError:
             return text, "@"
 
+    if _PURE_SHORT_NUMBER_RE.match(text):
+        if "." in text:
+            return float(text), "0.##"
+        return int(text), "0"
     return text, "@"
 
 
@@ -155,6 +169,11 @@ def _populate_worksheet(ws: Any, sheet_data: Dict[str, Any]) -> None:
     def _is_capacity_column(header_text: str) -> bool:
         return any(k in header_text for k in ("容量", "内存", "配置", "规格"))
 
+    def _is_non_bold_id_column(header_text: str) -> bool:
+        return _is_capacity_column(header_text) or any(
+            k in header_text for k in ("型号", "机型", "系列", "编码", "代号", "序号", "编号")
+        )
+
     # 写入第 1 行苹果绿表头
     for c_idx, h_text in enumerate(headers, start=1):
         cell = ws.cell(row=1, column=c_idx, value=h_text)
@@ -200,7 +219,12 @@ def _populate_worksheet(ws: Any, sheet_data: Dict[str, Any]) -> None:
 
             if num_fmt and num_fmt != "@":
                 cell.number_format = num_fmt
-                cell.font = summary_font if is_summary else price_font
+                if is_summary:
+                    cell.font = summary_font
+                elif _is_non_bold_id_column(h_name):
+                    cell.font = body_font
+                else:
+                    cell.font = price_font
                 cell.alignment = Alignment(
                     horizontal="right" if (style_preset == "general" and ("," in num_fmt or any(s in num_fmt for s in ("¥", "$", "€", "£", "%")))) else "center",
                     vertical="center",
