@@ -466,6 +466,54 @@ def job_heartbeat(
     return {"ok": False, "status": job.status}
 
 
+@router.post("/jobs/{job_uid}/resume")
+def resume_batch_job(
+    job_uid: str,
+    req: HeartbeatRequest,
+    session: Session = Depends(get_session),
+) -> Dict[str, Any]:
+    """
+    断点续传恢复接口：
+    - 校验云端批次仍存在，返回已在服务端归档完成的 item_index 列表及标题（避免重复识别已成功图片）；
+    - 将批次状态重新置回 running 并续期客户端运行锁，续跑完成后与旧文件一起打包成同一份 .zip。
+    """
+    job = session.exec(select(BatchJob).where(BatchJob.job_uid == job_uid)).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="原云端批次记录已不存在，将自动新建批次继续")
+
+    items = list(
+        session.exec(
+            select(BatchJobItem).where(BatchJobItem.job_uid == job_uid).order_by(BatchJobItem.item_index)
+        ).all()
+    )
+    completed_items = [it for it in items if it.status == "completed"]
+    completed_indices = sorted({int(it.item_index) for it in completed_items})
+    completed_meta = {
+        str(int(it.item_index)): {
+            "quote_title": it.quote_title,
+            "row_count": int(it.row_count),
+            "warning_count": int(it.warning_count),
+        }
+        for it in completed_items
+    }
+
+    job.status = "running"
+    job.completed_items = len(completed_indices)
+    job.updated_at = utc_now_str()
+    if req.client_id:
+        _save_client_lock(session, job_uid, req.client_id)
+    session.add(job)
+    session.commit()
+
+    return {
+        "job_uid": job.job_uid,
+        "title": job.title,
+        "total_items": int(job.total_items),
+        "completed_indices": completed_indices,
+        "completed_meta": completed_meta,
+    }
+
+
 class CommitQuotationRequest(BaseModel):
     item_index: int = 0
     source_filename: str

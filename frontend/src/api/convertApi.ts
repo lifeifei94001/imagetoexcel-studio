@@ -241,7 +241,35 @@ http.interceptors.response.use(
   }
 );
 
+export function isRequestCanceledError(err: unknown): boolean {
+  if (axios.isCancel(err)) return true;
+  if (err instanceof Error && (err.name === "AbortError" || err.name === "CanceledError" || err.name === "TaskAbortedError")) {
+    return true;
+  }
+  if (axios.isAxiosError(err) && err.code === "ERR_CANCELED") {
+    return true;
+  }
+  return false;
+}
+
+export function isNetworkOfflineError(err: unknown): boolean {
+  if (typeof navigator !== "undefined" && navigator.onLine === false) {
+    return true;
+  }
+  if (axios.isAxiosError(err)) {
+    if (err.code === "ERR_CANCELED") return false;
+    // 无 HTTP 响应对象（断网 / DNS 失败 / Wi-Fi 切换断开）
+    if (!err.response && (err.code === "ERR_NETWORK" || err.message.toLowerCase().includes("network error"))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function extractApiError(err: unknown): string {
+  if (isRequestCanceledError(err)) {
+    return "任务已手动停止";
+  }
   if (axios.isAxiosError(err)) {
     const status = err.response?.status;
     const rawData = err.response?.data;
@@ -381,6 +409,22 @@ export async function sendJobHeartbeat(jobUid: string, clientId?: string): Promi
   });
 }
 
+export async function resumeBatchJob(
+  jobUid: string,
+  clientId?: string
+): Promise<{
+  job_uid: string;
+  title: string;
+  total_items: number;
+  completed_indices: number[];
+  completed_meta: Record<string, { quote_title: string; row_count: number; warning_count: number }>;
+}> {
+  const { data } = await http.post(`/jobs/${jobUid}/resume`, {
+    client_id: clientId || getClientSessionId(),
+  });
+  return data;
+}
+
 export async function processBatchJobItem(params: {
   jobUid: string;
   file: File;
@@ -393,6 +437,7 @@ export async function processBatchJobItem(params: {
   pricesOnly?: boolean;
   docType?: DocScenarioType;
   dualVerify?: boolean;
+  signal?: AbortSignal;
 }): Promise<{
   job_uid: string;
   item: BatchJobItem;
@@ -414,6 +459,7 @@ export async function processBatchJobItem(params: {
   }
   const { data } = await http.post(`/jobs/${params.jobUid}/process-item`, formData, {
     headers: { "Content-Type": "multipart/form-data" },
+    signal: params.signal,
   });
   return data;
 }
@@ -428,6 +474,7 @@ export async function extractSlice(params: {
   pricesOnly?: boolean;
   docType?: DocScenarioType;
   dualVerify?: boolean;
+  signal?: AbortSignal;
 }): Promise<Record<string, unknown>> {
   const formData = new FormData();
   formData.append("file", params.file);
@@ -443,6 +490,7 @@ export async function extractSlice(params: {
   }
   const { data } = await http.post("/extract-slice", formData, {
     headers: { "Content-Type": "multipart/form-data" },
+    signal: params.signal,
   });
   return data;
 }
@@ -457,22 +505,27 @@ export async function commitSlicedQuotation(params: {
   docType?: DocScenarioType;
   sliceResults: Record<string, unknown>[];
   failedError?: string;
+  signal?: AbortSignal;
 }): Promise<{
   job_uid: string;
   item: BatchJobItem;
   quotation?: QuotationGroup;
   quota?: QuotaInfo;
 }> {
-  const { data } = await http.post(`/jobs/${params.jobUid}/commit-quotation`, {
-    item_index: params.itemIndex,
-    source_filename: params.sourceFilename,
-    file_size_bytes: params.fileSizeBytes,
-    mode: params.mode,
-    merge_per_image: params.mergePerImage,
-    doc_type: params.docType || "auto",
-    slice_results: params.sliceResults,
-    failed_error: params.failedError || "",
-  });
+  const { data } = await http.post(
+    `/jobs/${params.jobUid}/commit-quotation`,
+    {
+      item_index: params.itemIndex,
+      source_filename: params.sourceFilename,
+      file_size_bytes: params.fileSizeBytes,
+      mode: params.mode,
+      merge_per_image: params.mergePerImage,
+      doc_type: params.docType || "auto",
+      slice_results: params.sliceResults,
+      failed_error: params.failedError || "",
+    },
+    { signal: params.signal }
+  );
   return data;
 }
 

@@ -217,6 +217,32 @@
           </template>
         </el-alert>
 
+        <!-- 断点续传恢复横幅（意外中断、浏览器休眠被杀或上次手动暂停后，下次打开一键接着跑剩余图片） -->
+        <el-alert
+          v-if="pendingCheckpoint && pendingCheckpointSummary.remaining > 0 && !extracting"
+          type="info"
+          show-icon
+          :closable="false"
+          style="margin-bottom: 16px; border-radius: var(--glass-radius-sm)"
+        >
+          <template #title>
+            <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap">
+              <span>
+                检测到未完成的断点任务「<strong>{{ pendingCheckpoint.title }}</strong>」：已完成
+                <strong>{{ pendingCheckpointSummary.completed }}/{{ pendingCheckpointSummary.total }}</strong> 份，剩余
+                <strong>{{ pendingCheckpointSummary.remaining }}</strong> 份<template v-if="pendingCheckpointSummary.cachedSliceCount > 0">（已缓存 {{ pendingCheckpointSummary.cachedSliceCount }} 段切片进度）</template>·
+                {{ pendingCheckpoint.stoppedByUser ? "上次已手动停止" : "上次意外中断/休眠" }}，续跑将直接合并进同一个压缩包。
+              </span>
+              <div style="display: flex; gap: 8px; flex-wrap: wrap">
+                <el-button size="small" type="primary" @click="resumeFromCheckpoint">
+                  继续接着跑剩余 {{ pendingCheckpointSummary.remaining }} 份
+                </el-button>
+                <el-button size="small" type="danger" plain @click="discardCheckpoint">丢弃断点</el-button>
+              </div>
+            </div>
+          </template>
+        </el-alert>
+
         <!-- 双栏队列式上传工作台 -->
         <section class="glass-strong uploader-shell">
           <div class="uploader-grid">
@@ -458,15 +484,32 @@
           </div>
         </section>
 
-        <!-- 实时批处理进度条面板（多张报价单时无需干等，可查看每张进度与 B2 归档状态） -->
+        <!-- 实时批处理进度条面板（多张报价单时无需干等，可查看每张进度、防休眠状态与断点操作） -->
         <section v-if="progressItems.length > 0" class="glass-strong" style="padding: 18px 20px; margin-bottom: 22px">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; flex-wrap: wrap; gap: 8px">
-            <div style="display: flex; align-items: center; gap: 10px">
+            <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
               <span style="font-weight: 700; font-size: 15px">批处理任务进度</span>
-              <span class="gem-pill" :class="extracting ? 'pill-sky' : (failedCount > 0 ? 'pill-gold' : 'pill-emerald')">
+              <span
+                class="gem-pill"
+                :class="
+                  networkPaused
+                    ? 'pill-gold'
+                    : extracting
+                    ? 'pill-sky'
+                    : (failedCount > 0 || (stoppedByUser && unfinishedCount > 0))
+                    ? 'pill-gold'
+                    : 'pill-emerald'
+                "
+              >
                 {{
-                  extracting
-                    ? `处理中 ${doneCount} / ${progressItems.length}`
+                  networkPaused
+                    ? `网络已断开 · 自动暂停等待重连 (${networkPausedSec}s)`
+                    : autoRescuing
+                    ? `自动补跑偶发失败项 (${completedCount} / ${progressItems.length})`
+                    : extracting
+                    ? `处理中 ${doneCount} / ${progressItems.length} · 防休眠保活中`
+                    : stoppedByUser && unfinishedCount > 0
+                    ? `已手动停止 · 完成 ${completedCount} / ${progressItems.length}`
                     : failedCount > 0
                     ? `已完成 ${completedCount} / ${progressItems.length}（${failedCount} 份失败）`
                     : `全部完成 ${completedCount} / ${progressItems.length}`
@@ -475,18 +518,49 @@
             </div>
             <div style="display: flex; gap: 8px; flex-wrap: wrap">
               <el-button
-                v-if="!extracting && failedCount > 0 && lastBatchJobUid && lastBatchSnapshot.length > 0"
+                v-if="extracting"
+                size="small"
+                type="danger"
+                plain
+                :disabled="stopRequested"
+                @click="stopCurrentBatch"
+              >
+                {{ stopRequested ? "正在停止..." : "停止任务" }}
+              </el-button>
+              <el-button
+                v-if="!extracting && stoppedByUser && unfinishedCount > 0 && lastBatchJobUid && lastBatchSnapshot.length > 0"
+                size="small"
+                type="primary"
+                @click="resumeFromCheckpoint"
+              >
+                继续接着跑剩余 {{ unfinishedCount }} 份
+              </el-button>
+              <el-button
+                v-if="!extracting && !stoppedByUser && failedCount > 0 && lastBatchJobUid && lastBatchSnapshot.length > 0"
                 size="small"
                 type="warning"
                 @click="retryFailedItems"
               >
                 仅重试失败图片 ({{ failedCount }} 份)
               </el-button>
+              <el-button
+                v-if="!extracting && (stoppedByUser || failedCount > 0) && pendingCheckpoint"
+                size="small"
+                type="danger"
+                plain
+                @click="discardCheckpoint"
+              >
+                彻底作废清空断点
+              </el-button>
               <el-button v-if="!extracting && lastBatchJobUid && completedCount > 0" size="small" type="primary" plain @click="downloadLastJobPackage">
                 从 B2 下载本批成品
               </el-button>
               <el-button v-if="!extracting" size="small" text @click="progressItems = []">收起进度</el-button>
             </div>
+          </div>
+
+          <div v-if="extracting" class="glass-muted" style="font-size: 12px; margin-bottom: 10px; line-height: 1.5">
+            已启用后台抗降频计时器、防休眠锁与断网自动暂停续跑；切片进度实时落盘，即使浏览器标签页休眠或意外关闭，下次打开也可一键从断点接着跑（若长期切后台运行，建议在浏览器设置中将本域名加入「永不休眠站点」）。
           </div>
 
           <el-progress
@@ -840,6 +914,22 @@ import TableEditorPanel from "./components/TableEditorPanel.vue";
 import { useTheme } from "./composables/useTheme";
 import { splitLongImageSmart } from "./utils/imageCompressor";
 import {
+  checkpointEntryToFile,
+  clearBatchCheckpoint,
+  loadBatchCheckpoint,
+  saveBatchCheckpoint,
+  summarizeCheckpoint,
+  type BatchCheckpointRecord,
+  type SliceCheckpoint,
+} from "./utils/batchCheckpoint";
+import {
+  acquireBatchKeepAlive,
+  TaskAbortedError,
+  waitForNetworkRecovery,
+  workerSleep,
+  type BatchKeepAliveHandle,
+} from "./utils/keepAlive";
+import {
   clearAllRecords,
   clearStoredAuthToken,
   commitSlicedQuotation,
@@ -858,10 +948,13 @@ import {
   fetchStorageStats,
   finalizeBatchJob,
   getClientSessionId,
+  isNetworkOfflineError,
+  isRequestCanceledError,
   loadJobIntoEditor,
   loginWithPassword,
   processBatchJobItem,
   purgeB2Storage,
+  resumeBatchJob,
   sendJobHeartbeat,
   setUnauthorizedHandler,
   updateQuotaConfig,
@@ -924,6 +1017,17 @@ const lastBatchJobUid = ref("");
 const lastBatchSnapshot = ref<QueuedImage[]>([]);
 const lastBatchCollected = ref<Array<QuotationGroup | null>>([]);
 
+// 断点续传 + 手动停止 + 断网自动暂停 + 防休眠保活状态
+const pendingCheckpoint = ref<BatchCheckpointRecord | null>(null);
+const stopRequested = ref(false);
+const stoppedByUser = ref(false);
+const networkPaused = ref(false);
+const networkPausedSec = ref(0);
+const autoRescuing = ref(false);
+let batchAbortController: AbortController | null = null;
+let activeKeepAlive: BatchKeepAliveHandle | null = null;
+let activeCheckpointRef: BatchCheckpointRecord | null = null;
+
 const geminiConfigured = ref(false);
 const b2Configured = ref(false);
 const activeModel = ref("gemini-3.5-flash-lite");
@@ -971,10 +1075,16 @@ const previewMap = computed<Record<string, string>>(() => {
 });
 
 const completedCount = computed(() => progressItems.value.filter((i) => i.status === "completed").length);
+const unfinishedCount = computed(() => progressItems.value.filter((i) => i.status !== "completed").length);
 const doneCount = computed(
   () => progressItems.value.filter((i) => i.status === "completed" || i.status === "failed").length
 );
 const failedCount = computed(() => progressItems.value.filter((i) => i.status === "failed").length);
+const pendingCheckpointSummary = computed(() =>
+  pendingCheckpoint.value
+    ? summarizeCheckpoint(pendingCheckpoint.value)
+    : { total: 0, completed: 0, remaining: 0, cachedSliceCount: 0 }
+);
 const progressPercent = computed(() => {
   if (progressItems.value.length === 0) return 0;
   return Math.round((doneCount.value / progressItems.value.length) * 100);
@@ -1227,11 +1337,112 @@ async function finalizeJobWithRetry(jobUid: string) {
   throw lastFinErr;
 }
 
+function isNonAutoRescuableErrorMessage(msg: string): boolean {
+  const s = String(msg || "");
+  return (
+    s.includes("今日额度已达上限") ||
+    s.includes("每日额度") ||
+    s.includes("今日额度(RPD)已耗尽") ||
+    s.includes("鉴权失败") ||
+    s.includes("不支持的文件格式") ||
+    s.includes("超过 10MB")
+  );
+}
+
+async function refreshPendingCheckpoint() {
+  try {
+    const cp = await loadBatchCheckpoint();
+    if (!cp) {
+      pendingCheckpoint.value = null;
+      return;
+    }
+    const summary = summarizeCheckpoint(cp);
+    if (summary.remaining <= 0) {
+      await clearBatchCheckpoint();
+      pendingCheckpoint.value = null;
+      return;
+    }
+    pendingCheckpoint.value = cp;
+  } catch {
+    pendingCheckpoint.value = null;
+  }
+}
+
+async function persistActiveCheckpoint(stoppedFlag?: boolean) {
+  if (!activeCheckpointRef) return;
+  activeCheckpointRef.itemStatuses = progressItems.value.map((p) => p.status);
+  activeCheckpointRef.itemMessages = progressItems.value.map((p) => p.message);
+  activeCheckpointRef.itemQuoteTitles = progressItems.value.map((p) => p.quoteTitle);
+  if (stoppedFlag !== undefined) {
+    activeCheckpointRef.stoppedByUser = stoppedFlag;
+  }
+  activeCheckpointRef.updatedAt = Date.now();
+  await saveBatchCheckpoint(activeCheckpointRef);
+  pendingCheckpoint.value = {
+    ...activeCheckpointRef,
+    itemStatuses: [...activeCheckpointRef.itemStatuses],
+    itemMessages: [...activeCheckpointRef.itemMessages],
+    itemQuoteTitles: [...activeCheckpointRef.itemQuoteTitles],
+    sliceProgress: { ...activeCheckpointRef.sliceProgress },
+  };
+}
+
+function stopCurrentBatch() {
+  if (!extracting.value || stopRequested.value) return;
+  stopRequested.value = true;
+  stoppedByUser.value = true;
+  batchAbortController?.abort();
+  ElMessage.info("正在安全停止任务并保存当前断点，已完成的表格已安全归档至 B2");
+}
+
+async function discardCheckpoint() {
+  if (extracting.value) return;
+  await clearBatchCheckpoint();
+  activeCheckpointRef = null;
+  pendingCheckpoint.value = null;
+  stoppedByUser.value = false;
+  progressItems.value = [];
+  lastBatchSnapshot.value = [];
+  lastBatchCollected.value = [];
+  ElMessage.success("已清空本地断点缓存");
+}
+
+async function waitForOnlineIfNeeded(
+  myIdx: number,
+  setItemMsg: (m: string) => void,
+  signal: AbortSignal
+): Promise<boolean> {
+  networkPaused.value = true;
+  networkPausedSec.value = 0;
+  try {
+    const recovered = await waitForNetworkRecovery({
+      probeHealth: async () => {
+        try {
+          await fetchHealth();
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      onTick: (sec) => {
+        networkPausedSec.value = sec;
+        setItemMsg(`网络已断开，自动暂停等待联网恢复 (${sec}s)...`);
+      },
+      signal,
+    });
+    return recovered;
+  } finally {
+    networkPaused.value = false;
+    networkPausedSec.value = 0;
+  }
+}
+
 async function runBatchIndices(
   jobUid: string,
   snapshot: QueuedImage[],
   collected: Array<QuotationGroup | null>,
-  targetIndices: number[]
+  targetIndices: number[],
+  signal: AbortSignal
 ) {
   if (targetIndices.length === 0) return;
 
@@ -1244,6 +1455,7 @@ async function runBatchIndices(
 
   const worker = async () => {
     while (cursor < targetIndices.length) {
+      if (signal.aborted || stopRequested.value) break;
       const myIdx = targetIndices[cursor++];
       const qItem = snapshot[myIdx];
       if (!qItem || !progressItems.value[myIdx]) continue;
@@ -1264,6 +1476,9 @@ async function runBatchIndices(
 
       try {
         const slicePlan = await splitLongImageSmart(qItem.file);
+        if (signal.aborted || stopRequested.value) {
+          throw new TaskAbortedError();
+        }
         const slices = slicePlan.files;
         if (slices.length <= 1) {
           const targetFile = slices[0] || qItem.file;
@@ -1272,6 +1487,7 @@ async function runBatchIndices(
           const maxSingleAttempts = 4;
 
           for (let attempt = 1; attempt <= maxSingleAttempts; attempt++) {
+            if (signal.aborted || stopRequested.value) throw new TaskAbortedError();
             const useDual = dualVerify.value && attempt <= 2;
             const startedAt = Date.now();
             if (attempt > 1) {
@@ -1294,16 +1510,27 @@ async function runBatchIndices(
                 pricesOnly: docType.value === "general" ? false : pricesOnly.value,
                 docType: docType.value,
                 dualVerify: useDual,
+                signal,
               });
-              // 双模型匀速节拍：确保每张请求周期 >= 4.5s，不撞每分钟 RPM 墙
-              if (dualVerify.value) {
+              // 双模型匀速节拍：使用 Web Worker 抗后台降频计时器确保每张请求周期 >= 4.5s
+              if (dualVerify.value && !signal.aborted) {
                 const elapsed = Date.now() - startedAt;
                 if (elapsed < MIN_DUAL_SLICE_CYCLE_MS) {
-                  await sleep(MIN_DUAL_SLICE_CYCLE_MS - elapsed);
+                  await workerSleep(MIN_DUAL_SLICE_CYCLE_MS - elapsed, signal);
                 }
               }
               break;
             } catch (err) {
+              if (isRequestCanceledError(err) || signal.aborted || stopRequested.value) {
+                throw new TaskAbortedError();
+              }
+              if (isNetworkOfflineError(err)) {
+                const ok = await waitForOnlineIfNeeded(myIdx, setItemProgressMsg, signal);
+                if (ok) {
+                  attempt--;
+                  continue;
+                }
+              }
               lastSingleErr = err;
               if (isFatalNonRetryableError(err) || attempt >= maxSingleAttempts) {
                 throw err;
@@ -1314,7 +1541,7 @@ async function runBatchIndices(
               setItemProgressMsg(
                 `触发限流或波动，冷却 ${Math.round(waitMs / 1000)} 秒后自动重试 (${attempt + 1}/${maxSingleAttempts})...`
               );
-              await sleep(waitMs);
+              await workerSleep(waitMs, signal);
             }
           }
           if (!res) {
@@ -1337,21 +1564,51 @@ async function runBatchIndices(
           progressItems.value[myIdx].status = "completed";
           progressItems.value[myIdx].quoteTitle = res.quotation.quote_title;
           progressItems.value[myIdx].message = `识别完成 (${res.quotation.merged_sheet.rows.length} 行 · 已存对象存储)`;
+          if (activeCheckpointRef?.sliceProgress) {
+            delete activeCheckpointRef.sliceProgress[myIdx];
+          }
+          await persistActiveCheckpoint();
         } else {
-          // 超长报价单 1250px 智能找缝切片 + 第 1 段先提取精准列头，后续段按「慢稳准」匀速提取并带红线列头视觉锚定
+          // 超长报价单 1250px 智能找缝切片 + 切片级 IndexedDB 断点复用（中断重开后跳过已识别段！）
           const seamTag = slicePlan.seamMode === "smart_seam" ? "智能找缝" : "重叠防漏";
           const anchorTag = slicePlan.hasHeaderAnchor ? "·列头锚定" : "";
           const sliceResults: Array<Record<string, unknown> | null> = new Array(slices.length).fill(null);
+
+          const existingSliceCp: SliceCheckpoint | undefined = activeCheckpointRef?.sliceProgress?.[myIdx];
           let completedSlices = 0;
+          if (existingSliceCp && existingSliceCp.totalSlices === slices.length && existingSliceCp.completedSlices) {
+            for (const [kStr, v] of Object.entries(existingSliceCp.completedSlices)) {
+              const kIdx = Number(kStr);
+              if (Number.isInteger(kIdx) && kIdx >= 0 && kIdx < slices.length && v) {
+                sliceResults[kIdx] = v;
+                completedSlices++;
+              }
+            }
+          }
+
+          const saveSliceResultToCheckpoint = async (sIdx: number, resObj: Record<string, unknown>, headerHintStr: string) => {
+            if (!activeCheckpointRef) return;
+            const prev = activeCheckpointRef.sliceProgress[myIdx] || {
+              totalSlices: slices.length,
+              seamMode: slicePlan.seamMode,
+              hasHeaderAnchor: slicePlan.hasHeaderAnchor,
+              inheritedHeaderHint: headerHintStr,
+              completedSlices: {},
+            };
+            prev.totalSlices = slices.length;
+            prev.inheritedHeaderHint = headerHintStr || prev.inheritedHeaderHint;
+            prev.completedSlices[sIdx] = resObj;
+            activeCheckpointRef.sliceProgress[myIdx] = prev;
+            await persistActiveCheckpoint();
+          };
 
           const runOneSlice = async (sIdx: number, hintStr: string): Promise<Record<string, unknown>> => {
             let lastSliceErr: unknown = null;
             const maxAttempts = 4;
             for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-              if (imageAborted) {
-                throw new Error("当前图片已中止");
+              if (imageAborted || signal.aborted || stopRequested.value) {
+                throw new TaskAbortedError();
               }
-              // 前 2 次坚持双模型交叉核验；若第 3~4 次仍持续限流，仅该顽固切片自动降级单模型保底（三道防错填护栏仍生效）
               const useDualForSlice = dualVerify.value && attempt <= 2;
               const sliceStart = Date.now();
               if (attempt === 1) {
@@ -1378,20 +1635,32 @@ async function runBatchIndices(
                   pricesOnly: docType.value === "general" ? false : pricesOnly.value,
                   docType: docType.value,
                   dualVerify: useDualForSlice,
+                  signal,
                 });
                 completedSlices++;
                 setItemProgressMsg(
                   `${seamTag}分 ${slices.length} 段${anchorTag}，${dualVerify.value ? "匀速核验" : "提取进度"} (${completedSlices}/${slices.length})...`
                 );
-                // 双模型匀速节拍保护：每段总耗时不足 4.5s 时补足间隔，稳控单模型 RPM <= 13 次/分
-                if (dualVerify.value && completedSlices < slices.length) {
+                await saveSliceResultToCheckpoint(sIdx, res, hintStr);
+                // 双模型匀速节拍保护：用 Web Worker 抗降频计时器补足 4.5s 周期
+                if (dualVerify.value && completedSlices < slices.length && !signal.aborted) {
                   const elapsed = Date.now() - sliceStart;
                   if (elapsed < MIN_DUAL_SLICE_CYCLE_MS) {
-                    await sleep(MIN_DUAL_SLICE_CYCLE_MS - elapsed);
+                    await workerSleep(MIN_DUAL_SLICE_CYCLE_MS - elapsed, signal);
                   }
                 }
                 return res;
               } catch (err) {
+                if (isRequestCanceledError(err) || signal.aborted || stopRequested.value) {
+                  throw new TaskAbortedError();
+                }
+                if (isNetworkOfflineError(err)) {
+                  const ok = await waitForOnlineIfNeeded(myIdx, setItemProgressMsg, signal);
+                  if (ok) {
+                    attempt--;
+                    continue;
+                  }
+                }
                 lastSliceErr = err;
                 if (isFatalNonRetryableError(err)) {
                   throw err;
@@ -1404,60 +1673,90 @@ async function runBatchIndices(
                   setItemProgressMsg(
                     `第 ${sIdx + 1}/${slices.length} 段${isRpm ? "触发每分钟限速(429)" : "遇模型波动"}，冷却 ${Math.round(waitMs / 1000)} 秒后续跑 (${attempt + 1}/${maxAttempts})...`
                   );
-                  await sleep(waitMs);
+                  await workerSleep(waitMs, signal);
                 }
               }
             }
             throw lastSliceErr instanceof Error ? lastSliceErr : new Error(`第 ${sIdx + 1} 段识别失败`);
           };
 
-          // 1. 先提取第 1 段以获得最准确的列头结构
+          // 1. 先提取（或复用断点中已缓存的）第 1 段以获得最准确的列头结构
           const baseHint = customHint.value.trim();
-          const firstRes = await runOneSlice(0, baseHint);
+          const firstRes = sliceResults[0] || (await runOneSlice(0, baseHint));
           sliceResults[0] = firstRes;
 
-          let inheritedHeaderHint = baseHint;
-          const rawList = (firstRes.raw_sheets as Array<{ headers?: string[] }> | undefined) || [];
-          const firstHeaders = rawList[0]?.headers;
-          if (firstHeaders?.length) {
-            const headerStr = firstHeaders.join(" | ");
-            const contNote =
-              `This slice continues the same table. Keep the EXACT ${firstHeaders.length} columns in order: [${headerStr}]. ` +
-              (slicePlan.hasHeaderAnchor
-                ? "The top strip above the red horizontal bar is ONLY a visual header reference—extract ONLY data rows below the red bar. "
-                : "") +
-              "Keep '-' or empty placeholder slots for blank cells and do NOT shift columns left or omit rightmost columns.";
-            inheritedHeaderHint = inheritedHeaderHint ? `${inheritedHeaderHint}\n${contNote}` : contNote;
+          let inheritedHeaderHint = existingSliceCp?.inheritedHeaderHint || baseHint;
+          if (!existingSliceCp?.inheritedHeaderHint) {
+            const rawList = (firstRes.raw_sheets as Array<{ headers?: string[] }> | undefined) || [];
+            const firstHeaders = rawList[0]?.headers;
+            if (firstHeaders?.length) {
+              const headerStr = firstHeaders.join(" | ");
+              const contNote =
+                `This slice continues the same table. Keep the EXACT ${firstHeaders.length} columns in order: [${headerStr}]. ` +
+                (slicePlan.hasHeaderAnchor
+                  ? "The top strip above the red horizontal bar is ONLY a visual header reference—extract ONLY data rows below the red bar. "
+                  : "") +
+                "Keep '-' or empty placeholder slots for blank cells and do NOT shift columns left or omit rightmost columns.";
+              inheritedHeaderHint = inheritedHeaderHint ? `${inheritedHeaderHint}\n${contNote}` : contNote;
+            }
           }
 
-          // 2. 第 2..N 段：双模型严格单段串行匀速（零 RPM 撞车），单模型 2 并发+600ms 平滑间隔
-          const sliceConcurrency = dualVerify.value ? 1 : Math.min(2, slices.length - 1);
-          let nextSliceIdx = 1;
+          // 2. 第 2..N 段：仅跑尚未缓存的切片，双模型严格单段串行匀速，单模型 2 并发+600ms 间隔
+          const remainingSliceIndices: number[] = [];
+          for (let s = 1; s < slices.length; s++) {
+            if (!sliceResults[s]) remainingSliceIndices.push(s);
+          }
+
+          const sliceConcurrency = dualVerify.value ? 1 : Math.min(2, Math.max(1, remainingSliceIndices.length));
+          let sliceCursor = 0;
           const sliceWorker = async () => {
-            while (nextSliceIdx < slices.length && !imageAborted) {
-              const curS = nextSliceIdx++;
+            while (sliceCursor < remainingSliceIndices.length && !imageAborted && !signal.aborted && !stopRequested.value) {
+              const curS = remainingSliceIndices[sliceCursor++];
               sliceResults[curS] = await runOneSlice(curS, inheritedHeaderHint);
-              if (!dualVerify.value && nextSliceIdx < slices.length && !imageAborted) {
-                await sleep(600);
+              if (!dualVerify.value && sliceCursor < remainingSliceIndices.length && !imageAborted && !signal.aborted) {
+                await workerSleep(600, signal);
               }
             }
           };
-          await Promise.all(
-            Array.from({ length: Math.max(1, sliceConcurrency) }, () => sliceWorker())
-          );
+          if (remainingSliceIndices.length > 0) {
+            await Promise.all(Array.from({ length: sliceConcurrency }, () => sliceWorker()));
+          }
+          if (signal.aborted || stopRequested.value) {
+            throw new TaskAbortedError();
+          }
 
           setItemProgressMsg(`正在全局去重拼接 ${slices.length} 段并做异常自检...`);
-          const committed = await commitSlicedQuotation({
-            jobUid,
-            itemIndex: myIdx,
-            sourceFilename: qItem.file.name,
-            fileSizeBytes: qItem.file.size,
-            mode: mode.value,
-            mergePerImage: mergePerImage.value,
-            docType: docType.value,
-            sliceResults: sliceResults.filter((x): x is Record<string, unknown> => x !== null),
-          });
-          if (!committed.quotation) {
+          let committed: Awaited<ReturnType<typeof commitSlicedQuotation>> | null = null;
+          for (let cAttempt = 1; cAttempt <= 3; cAttempt++) {
+            try {
+              committed = await commitSlicedQuotation({
+                jobUid,
+                itemIndex: myIdx,
+                sourceFilename: qItem.file.name,
+                fileSizeBytes: qItem.file.size,
+                mode: mode.value,
+                mergePerImage: mergePerImage.value,
+                docType: docType.value,
+                sliceResults: sliceResults.filter((x): x is Record<string, unknown> => x !== null),
+                signal,
+              });
+              break;
+            } catch (err) {
+              if (isRequestCanceledError(err) || signal.aborted || stopRequested.value) {
+                throw new TaskAbortedError();
+              }
+              if (isNetworkOfflineError(err)) {
+                const ok = await waitForOnlineIfNeeded(myIdx, setItemProgressMsg, signal);
+                if (ok) {
+                  cAttempt--;
+                  continue;
+                }
+              }
+              if (cAttempt >= 3) throw err;
+              await workerSleep(2000 * cAttempt, signal);
+            }
+          }
+          if (!committed?.quotation) {
             throw new Error("长图合并归档失败");
           }
           collected[myIdx] = committed.quotation;
@@ -1481,19 +1780,140 @@ async function runBatchIndices(
             warnCnt > 0
               ? `${seamTag} ${slices.length} 段完成 (${committed.quotation.merged_sheet.rows.length} 行 · ${warnCnt} 处标黄核验)`
               : `${seamTag} ${slices.length} 段完成 (${committed.quotation.merged_sheet.rows.length} 行 · 已存 B2)`;
+          if (activeCheckpointRef?.sliceProgress) {
+            delete activeCheckpointRef.sliceProgress[myIdx];
+          }
+          await persistActiveCheckpoint();
         }
 
         // 实时把已完成报价单展示进工作台
         quotations.value = collected.filter((x): x is QuotationGroup => x !== null);
       } catch (err) {
         imageAborted = true;
+        if (isRequestCanceledError(err) || signal.aborted || stopRequested.value) {
+          if (progressItems.value[myIdx].status !== "completed") {
+            progressItems.value[myIdx].status = "pending";
+            progressItems.value[myIdx].message = "已手动停止（断点已保存，可随时继续）";
+          }
+          await persistActiveCheckpoint(true);
+          break;
+        }
         progressItems.value[myIdx].status = "failed";
         progressItems.value[myIdx].message = extractApiError(err);
+        await persistActiveCheckpoint();
       }
     }
   };
 
   await Promise.all(Array.from({ length: imageConcurrency }, () => worker()));
+}
+
+async function executeManagedBatchRun(params: {
+  jobUid: string;
+  snapshot: QueuedImage[];
+  collected: Array<QuotationGroup | null>;
+  targetIndices: number[];
+  enableAutoRescue: boolean;
+}) {
+  const { jobUid, snapshot, collected, targetIndices, enableAutoRescue } = params;
+  extracting.value = true;
+  stopRequested.value = false;
+  stoppedByUser.value = false;
+  networkPaused.value = false;
+  autoRescuing.value = false;
+
+  batchAbortController = new AbortController();
+  const signal = batchAbortController.signal;
+
+  activeKeepAlive?.release();
+  activeKeepAlive = await acquireBatchKeepAlive();
+
+  stopHeartbeat();
+  heartbeatTimer = window.setInterval(() => {
+    sendJobHeartbeat(jobUid, clientSessionId).catch(() => {});
+  }, 20000);
+
+  try {
+    await runBatchIndices(jobUid, snapshot, collected, targetIndices, signal);
+
+    // 无人值守尾声静默自动补跑 1 轮：仅针对非 RPD 耗尽/非致命错误的偶发失败项
+    if (enableAutoRescue && !stopRequested.value && !signal.aborted) {
+      const autoRescueIndices: number[] = [];
+      for (let i = 0; i < progressItems.value.length; i++) {
+        const p = progressItems.value[i];
+        if (p.status === "failed" && snapshot[i] && !isNonAutoRescuableErrorMessage(p.message)) {
+          autoRescueIndices.push(i);
+        }
+      }
+      if (autoRescueIndices.length > 0) {
+        autoRescuing.value = true;
+        for (const idx of autoRescueIndices) {
+          progressItems.value[idx].status = "pending";
+          progressItems.value[idx].message = "首轮偶发波动，冷却 15 秒后自动静默补跑...";
+        }
+        try {
+          await workerSleep(15000, signal);
+          if (!stopRequested.value && !signal.aborted) {
+            await runBatchIndices(jobUid, snapshot, collected, autoRescueIndices, signal);
+          }
+        } catch (err) {
+          if (!isRequestCanceledError(err)) {
+            throw err;
+          }
+        } finally {
+          autoRescuing.value = false;
+        }
+      }
+    }
+
+    const validQuotations = collected.filter((x): x is QuotationGroup => x !== null);
+    quotations.value = validQuotations;
+
+    // 无论是否手动停止，均执行轻量级 finalize 释放多机锁并将已完成表格打包进 B2
+    try {
+      await finalizeJobWithRetry(jobUid);
+    } catch {
+      // 网络断开时保留断点，待下次续跑再收尾
+    }
+
+    const allCompleted = progressItems.value.length > 0 && progressItems.value.every((p) => p.status === "completed");
+    if (allCompleted) {
+      await clearBatchCheckpoint();
+      activeCheckpointRef = null;
+      pendingCheckpoint.value = null;
+      stoppedByUser.value = false;
+      ElMessage.success(`全部 ${validQuotations.length} 份表格已提取并打包归档！`);
+      await nextTick();
+      editorAnchorRef.value?.scrollIntoView({ behavior: "smooth", block: "start" });
+    } else if (stopRequested.value) {
+      stoppedByUser.value = true;
+      await persistActiveCheckpoint(true);
+      const rem = progressItems.value.filter((p) => p.status !== "completed").length;
+      ElMessage.warning(`任务已停止：已完成 ${validQuotations.length}/${snapshot.length} 份（已归档 B2），剩余 ${rem} 份已保留断点`);
+    } else if (validQuotations.length > 0) {
+      await persistActiveCheckpoint(false);
+      ElMessage.warning(`已完成 ${validQuotations.length}/${snapshot.length} 份，可点击「仅重试失败图片」补齐剩余文件`);
+      await nextTick();
+      editorAnchorRef.value?.scrollIntoView({ behavior: "smooth", block: "start" });
+    } else {
+      await persistActiveCheckpoint(false);
+      ElMessage.error("本批次图片未能提取成功，请查看卡片具体提示或点击「仅重试失败图片」");
+    }
+  } catch (err) {
+    if (!isRequestCanceledError(err)) {
+      ElMessage.error(extractApiError(err));
+    }
+  } finally {
+    stopHeartbeat();
+    activeKeepAlive?.release();
+    activeKeepAlive = null;
+    batchAbortController = null;
+    extracting.value = false;
+    stopRequested.value = false;
+    networkPaused.value = false;
+    autoRescuing.value = false;
+    checkOtherActiveJobs();
+  }
 }
 
 async function startBatchExtraction() {
@@ -1523,12 +1943,12 @@ async function startBatchExtraction() {
     // 忽略检测网络抖动，不阻断正常使用
   }
 
-  extracting.value = true;
-  lastBatchJobUid.value = "";
   const snapshot = [...queue.value];
   const collected: Array<QuotationGroup | null> = new Array(snapshot.length).fill(null);
   lastBatchSnapshot.value = snapshot;
   lastBatchCollected.value = collected;
+  lastBatchJobUid.value = "";
+  stoppedByUser.value = false;
 
   progressItems.value = snapshot.map((q) => ({
     id: q.id,
@@ -1554,38 +1974,188 @@ async function startBatchExtraction() {
     });
     lastBatchJobUid.value = createdJob.job_uid;
 
-    // 启动每 20 秒心跳，让其他电脑实时看到本机运行进度，断线 2 分钟自动释放
-    stopHeartbeat();
-    heartbeatTimer = window.setInterval(() => {
-      sendJobHeartbeat(createdJob.job_uid, clientSessionId).catch(() => {});
-    }, 20000);
+    // 立即将全部原图与任务配置落盘至 IndexedDB，确保任何中断/休眠/刷新均可一键续跑！
+    activeCheckpointRef = {
+      version: 1,
+      jobUid: createdJob.job_uid,
+      title: batchTitle,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      stoppedByUser: false,
+      settings: {
+        mode: mode.value,
+        docType: docType.value,
+        outputMode: outputMode.value,
+        mergePerImage: mergePerImage.value,
+        pricesOnly: pricesOnly.value,
+        dualVerify: dualVerify.value,
+        modelTier: modelTier.value,
+        forceDemo: forceDemo.value,
+        customHint: customHint.value,
+      },
+      files: snapshot.map((q) => ({
+        id: q.id,
+        name: q.file.name,
+        type: q.file.type || "image/png",
+        size: q.file.size,
+        blob: q.file,
+      })),
+      itemStatuses: progressItems.value.map((p) => p.status),
+      itemMessages: progressItems.value.map((p) => p.message),
+      itemQuoteTitles: progressItems.value.map((p) => p.quoteTitle),
+      sliceProgress: {},
+    };
+    await persistActiveCheckpoint(false);
 
     const allIndices = snapshot.map((_, i) => i);
-    await runBatchIndices(createdJob.job_uid, snapshot, collected, allIndices);
-
-    const validQuotations = collected.filter((x): x is QuotationGroup => x !== null);
-    quotations.value = validQuotations;
-
-    if (validQuotations.length > 0) {
-      await finalizeJobWithRetry(createdJob.job_uid);
-      ElMessage.success(
-        validQuotations.length === snapshot.length
-          ? `全部 ${validQuotations.length} 份表格已提取并打包归档！`
-          : `已完成 ${validQuotations.length}/${snapshot.length} 份，可点击「仅重试失败图片」补齐剩余文件`
-      );
-      await nextTick();
-      editorAnchorRef.value?.scrollIntoView({ behavior: "smooth", block: "start" });
-    } else {
-      await finalizeJobWithRetry(createdJob.job_uid);
-      ElMessage.error("本批次图片均未能提取成功，可稍候点击「仅重试失败图片」重试");
-    }
+    await executeManagedBatchRun({
+      jobUid: createdJob.job_uid,
+      snapshot,
+      collected,
+      targetIndices: allIndices,
+      enableAutoRescue: true,
+    });
   } catch (err) {
     ElMessage.error(extractApiError(err));
-  } finally {
-    stopHeartbeat();
-    extracting.value = false;
-    checkOtherActiveJobs();
   }
+}
+
+async function resumeFromCheckpoint() {
+  if (extracting.value) return;
+  const cp = activeCheckpointRef || pendingCheckpoint.value || (await loadBatchCheckpoint());
+  if (!cp || cp.files.length === 0) {
+    ElMessage.info("当前没有可恢复的断点任务");
+    return;
+  }
+
+  // 还原任务配置与原图队列
+  mode.value = cp.settings.mode;
+  docType.value = cp.settings.docType;
+  outputMode.value = cp.settings.outputMode;
+  mergePerImage.value = cp.settings.mergePerImage;
+  pricesOnly.value = cp.settings.pricesOnly;
+  dualVerify.value = cp.settings.dualVerify;
+  modelTier.value = cp.settings.modelTier;
+  forceDemo.value = cp.settings.forceDemo;
+  customHint.value = cp.settings.customHint;
+
+  const restoredSnapshot: QueuedImage[] = cp.files.map((entry, idx) => {
+    const existing = lastBatchSnapshot.value[idx];
+    if (existing && existing.id === entry.id) {
+      return existing;
+    }
+    const f = checkpointEntryToFile(entry);
+    return {
+      id: entry.id,
+      file: f,
+      previewUrl: URL.createObjectURL(f),
+    };
+  });
+
+  const collected: Array<QuotationGroup | null> = new Array(restoredSnapshot.length).fill(null);
+  // 优先复用当前内存里已有的已完成表格
+  for (let i = 0; i < restoredSnapshot.length; i++) {
+    if (lastBatchCollected.value[i]) {
+      collected[i] = lastBatchCollected.value[i];
+    }
+  }
+
+  progressItems.value = restoredSnapshot.map((q, idx) => ({
+    id: q.id,
+    filename: q.file.name,
+    quoteTitle: cp.itemQuoteTitles[idx] || "",
+    status: cp.itemStatuses[idx] === "completed" ? "completed" : "pending",
+    message: cp.itemStatuses[idx] === "completed" ? (cp.itemMessages[idx] || "已完成 · 已存 B2") : "等待从断点续跑...",
+  }));
+
+  let activeJobUid = cp.jobUid;
+  try {
+    // 与云端批次对齐：确认服务端已实际落盘的 completed_indices，避免重复消耗 API
+    const resumedInfo = await resumeBatchJob(cp.jobUid, clientSessionId);
+    for (const doneIdx of resumedInfo.completed_indices || []) {
+      if (doneIdx >= 0 && doneIdx < progressItems.value.length) {
+        progressItems.value[doneIdx].status = "completed";
+        const meta = resumedInfo.completed_meta?.[String(doneIdx)];
+        if (meta?.quote_title) {
+          progressItems.value[doneIdx].quoteTitle = meta.quote_title;
+        }
+        progressItems.value[doneIdx].message = meta
+          ? `已完成 (${meta.row_count} 行 · 已存 B2)`
+          : "已完成 · 已存 B2";
+      }
+    }
+    // 若内存缺少已完成表格，顺便从云端载回以便跑完后编辑器展示完整列表
+    const hasLoadedInMem = collected.some((c) => c !== null);
+    if ((resumedInfo.completed_indices || []).length > 0 && !hasLoadedInMem) {
+      try {
+        const loaded = await loadJobIntoEditor(cp.jobUid);
+        const byName = new Map<string, QuotationGroup>();
+        for (const qg of loaded.quotations || []) {
+          byName.set(qg.source_filename, qg);
+        }
+        for (let i = 0; i < restoredSnapshot.length; i++) {
+          const hit = byName.get(restoredSnapshot[i].file.name);
+          if (hit) collected[i] = hit;
+        }
+        quotations.value = collected.filter((x): x is QuotationGroup => x !== null);
+      } catch {
+        // 即使回载失败，也不阻断剩余图片的续跑与最终 B2 打包
+      }
+    }
+  } catch (err) {
+    // 若原云端批次已被用户在转换记录里删除，自动建新批次跑剩余图片
+    if (axios.isAxiosError(err) && err.response?.status === 404) {
+      const remCount = progressItems.value.filter((p) => p.status !== "completed").length;
+      const newJob = await createBatchJob({
+        title: `${cp.title}_续跑`,
+        mode: mode.value,
+        outputMode: outputMode.value,
+        mergePerImage: mergePerImage.value,
+        totalItems: remCount,
+        clientId: clientSessionId,
+      });
+      activeJobUid = newJob.job_uid;
+      cp.jobUid = activeJobUid;
+    } else {
+      ElMessage.error(extractApiError(err));
+      return;
+    }
+  }
+
+  const remainingIndices: number[] = [];
+  for (let i = 0; i < progressItems.value.length; i++) {
+    if (progressItems.value[i].status !== "completed") {
+      remainingIndices.push(i);
+    }
+  }
+
+  lastBatchJobUid.value = activeJobUid;
+  lastBatchSnapshot.value = restoredSnapshot;
+  lastBatchCollected.value = collected;
+  activeCheckpointRef = {
+    ...cp,
+    jobUid: activeJobUid,
+    stoppedByUser: false,
+  };
+  await persistActiveCheckpoint(false);
+
+  if (remainingIndices.length === 0) {
+    await finalizeJobWithRetry(activeJobUid);
+    await clearBatchCheckpoint();
+    activeCheckpointRef = null;
+    pendingCheckpoint.value = null;
+    ElMessage.success("断点任务中的所有图片均已完成并归档至 B2！");
+    return;
+  }
+
+  ElMessage.success(`已从断点恢复，继续处理剩余 ${remainingIndices.length} 份表格...`);
+  await executeManagedBatchRun({
+    jobUid: activeJobUid,
+    snapshot: restoredSnapshot,
+    collected,
+    targetIndices: remainingIndices,
+    enableAutoRescue: true,
+  });
 }
 
 async function retryFailedItems() {
@@ -1600,32 +2170,19 @@ async function retryFailedItems() {
   }
   if (failedIndices.length === 0) return;
 
-  extracting.value = true;
-  const jobUid = lastBatchJobUid.value;
-  stopHeartbeat();
-  heartbeatTimer = window.setInterval(() => {
-    sendJobHeartbeat(jobUid, clientSessionId).catch(() => {});
-  }, 20000);
-
   try {
-    await runBatchIndices(jobUid, lastBatchSnapshot.value, lastBatchCollected.value, failedIndices);
-    const validQuotations = lastBatchCollected.value.filter((x): x is QuotationGroup => x !== null);
-    quotations.value = validQuotations;
-    await finalizeJobWithRetry(jobUid);
-
-    const stillFailed = progressItems.value.filter((p) => p.status === "failed").length;
-    if (stillFailed === 0) {
-      ElMessage.success(`补跑全部成功！整批 ${validQuotations.length} 份已自动重新打包至 B2`);
-    } else {
-      ElMessage.warning(`本次补跑完成，当前已完成 ${validQuotations.length}/${lastBatchSnapshot.value.length} 份（仍有 ${stillFailed} 份失败）`);
-    }
-  } catch (err) {
-    ElMessage.error(extractApiError(err));
-  } finally {
-    stopHeartbeat();
-    extracting.value = false;
-    checkOtherActiveJobs();
+    await resumeBatchJob(lastBatchJobUid.value, clientSessionId);
+  } catch {
+    // 若续期失败仍继续尝试补跑
   }
+
+  await executeManagedBatchRun({
+    jobUid: lastBatchJobUid.value,
+    snapshot: lastBatchSnapshot.value,
+    collected: lastBatchCollected.value,
+    targetIndices: failedIndices,
+    enableAutoRescue: false,
+  });
 }
 
 async function downloadLastJobPackage() {
@@ -1816,6 +2373,7 @@ async function loadWorkspaceBootstrap() {
   if (activeTab.value === "history") {
     loadHistory();
   }
+  await refreshPendingCheckpoint();
 }
 
 function openQuotaDialog() {
@@ -2010,6 +2568,9 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+  batchAbortController?.abort();
+  activeKeepAlive?.release();
+  activeKeepAlive = null;
   stopHeartbeat();
   stopActiveJobsPolling();
 });
