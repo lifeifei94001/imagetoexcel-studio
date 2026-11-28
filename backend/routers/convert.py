@@ -35,9 +35,11 @@ from services.excel_exporter import (
 )
 from services.model_dict_service import (
     apply_model_dict_to_result,
+    canonicalize_brand_label,
     clear_all_mappings,
     count_mappings,
     delete_mapping,
+    list_brand_summary,
     list_mappings,
     upsert_mappings,
 )
@@ -379,15 +381,23 @@ class ModelDictUpsertRequest(BaseModel):
 @router.get("/model-dict")
 def get_model_dict(
     q: str = Query(default=""),
+    brand: str = Query(default=""),
     limit: int = Query(default=500, ge=1, le=2000),
     session: Session = Depends(get_session),
 ) -> Dict[str, Any]:
-    """查询云端「机型 ↔ 网络型号」记忆库（支持关键字模糊搜索）。"""
-    rows = list_mappings(session, query=q, limit=limit)
+    """查询云端「机型 ↔ 网络型号」记忆库（支持关键字模糊搜索与按标准品牌筛选）。"""
+    rows = list_mappings(session, query=q, brand=brand, limit=limit)
     total = count_mappings(session)
     return {
         "total": total,
-        "items": [r.model_dump() for r in rows],
+        "brands": list_brand_summary(session),
+        "items": [
+            {
+                **r.model_dump(),
+                "canonical_brand": canonicalize_brand_label(r.brand_hint, r.model_name, r.network_code),
+            }
+            for r in rows
+        ],
     }
 
 
@@ -864,8 +874,8 @@ def commit_sliced_quotation(
         merge_per_image=req.merge_per_image,
         doc_type=req.doc_type,
     )
-    # 零 AI Token 本地查表：仅对存在分歧/留空的机型或网络型号做唯一消歧，正常单元格绝不触碰
-    apply_model_dict_to_result(session, merged_result)
+    # 零 AI Token 本地查表（按品牌严格隔离）：仅对存在分歧/留空的机型或网络型号做唯一消歧，正常单元格绝不触碰
+    apply_model_dict_to_result(session, merged_result, source_filename=req.source_filename)
     return _persist_completed_quotation(
         session=session,
         job=job,
@@ -929,7 +939,7 @@ async def process_batch_item(
         )
         raise HTTPException(status_code=_ocr_error_status_code(str(exc)), detail=str(exc))
 
-    apply_model_dict_to_result(session, result)
+    apply_model_dict_to_result(session, result, source_filename=fname)
     return _persist_completed_quotation(
         session=session,
         job=job,
@@ -1341,7 +1351,7 @@ async def extract_tables(
         except RuntimeError as exc:
             raise HTTPException(status_code=_ocr_error_status_code(str(exc)), detail=str(exc))
 
-        apply_model_dict_to_result(session, result)
+        apply_model_dict_to_result(session, result, source_filename=fname)
         used_engine = result.get("engine", "demo")
         is_demo = bool(result.get("is_demo", True))
         if result.get("notice"):

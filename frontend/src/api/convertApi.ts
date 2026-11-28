@@ -63,9 +63,15 @@ export interface ModelCodeMappingItem {
   norm_model: string;
   norm_code: string;
   brand_hint: string;
+  canonical_brand?: string;
   source: string;
   hit_count: number;
   updated_at?: string;
+}
+
+export interface ModelDictBrandSummary {
+  brand: string;
+  count: number;
 }
 
 export interface ExtractResponse {
@@ -387,10 +393,17 @@ export async function fetchHistory(): Promise<ConversionRecord[]> {
   return data;
 }
 
-export async function fetchModelDict(query = ""): Promise<{ total: number; items: ModelCodeMappingItem[] }> {
-  const { data } = await http.get<{ total: number; items: ModelCodeMappingItem[] }>("/model-dict", {
-    params: query.trim() ? { q: query.trim() } : undefined,
-  });
+export async function fetchModelDict(
+  query = "",
+  brand = ""
+): Promise<{ total: number; brands: ModelDictBrandSummary[]; items: ModelCodeMappingItem[] }> {
+  const params: Record<string, string> = {};
+  if (query.trim()) params.q = query.trim();
+  if (brand.trim()) params.brand = brand.trim();
+  const { data } = await http.get<{ total: number; brands: ModelDictBrandSummary[]; items: ModelCodeMappingItem[] }>(
+    "/model-dict",
+    { params: Object.keys(params).length > 0 ? params : undefined }
+  );
   return data;
 }
 

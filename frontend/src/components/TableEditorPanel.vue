@@ -649,9 +649,9 @@ async function handleCellBlur(rIdx: number, cIdx: number) {
     }
   }
 
-  // 自动写入云端「机型 ↔ 网络型号」记忆库（零阻塞，静默记住下次直接消歧）
+  // 自动写入云端「机型 ↔ 网络型号」记忆库（零阻塞，传入完整标题供后端自动归一化标准品牌）
   try {
-    const brandHint = (activeQuotation.value?.quote_title || "").split(/\s+/)[0]?.slice(0, 12) || "";
+    const brandHint = (activeQuotation.value?.quote_title || activeQuotation.value?.source_filename || "").slice(0, 48);
     const res = await upsertModelDict({
       items: [{ model_name: modelVal, network_code: codeVal, brand_hint: brandHint }],
       source: "auto_edit",
@@ -692,7 +692,7 @@ function collectCleanPairsFromSheet(sh: ExtractedSheet, brandHint: string): Arra
 async function importCurrentSheetToDict() {
   const sh = activeSheet.value;
   if (!sh || importingDict.value) return;
-  const brandHint = (activeQuotation.value?.quote_title || "").split(/\s+/)[0]?.slice(0, 12) || "";
+  const brandHint = (activeQuotation.value?.quote_title || activeQuotation.value?.source_filename || "").slice(0, 48);
   const pairs = collectCleanPairsFromSheet(sh, brandHint);
   if (pairs.length === 0) {
     ElMessage.warning("当前表没有可收录的「机型 + 网络型号」完整记录");
@@ -715,7 +715,7 @@ async function importAllSheetsToDict() {
   const allPairs: Array<{ model_name: string; network_code: string; brand_hint: string }> = [];
   const seen = new Set<string>();
   for (const q of props.quotations) {
-    const brandHint = (q.quote_title || "").split(/\s+/)[0]?.slice(0, 12) || "";
+    const brandHint = (q.quote_title || q.source_filename || "").slice(0, 48);
     for (const pair of collectCleanPairsFromSheet(q.merged_sheet, brandHint)) {
       const k = `${pair.model_name.toLowerCase()}||${pair.network_code.toLowerCase()}`;
       if (!seen.has(k)) {
