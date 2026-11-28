@@ -143,6 +143,14 @@
         >
           FAQ
         </button>
+        <button
+          type="button"
+          class="nav-pill-btn"
+          title="查看或批量维护云端「机型 ↔ 网络型号」记忆库（零 AI Token 自动消歧）"
+          @click="modelDictDialogVisible = true"
+        >
+          机型字典<template v-if="modelDictCount > 0"> ({{ modelDictCount }})</template>
+        </button>
       </nav>
 
       <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap">
@@ -615,6 +623,7 @@
             :preview-map="previewMap"
             :mode="mode"
             @clear-draft="clearDraft"
+            @dict-updated="(total: number) => (modelDictCount = total)"
           />
         </div>
       </template>
@@ -820,6 +829,11 @@
 
     <CommandPalette v-model:visible="paletteVisible" :commands="commandItems" />
 
+    <ModelDictDialog
+      v-model:visible="modelDictDialogVisible"
+      @count-changed="(total: number) => (modelDictCount = total)"
+    />
+
     <!-- 自定义每日额度设置弹窗 -->
     <el-dialog
       v-model="quotaDialogVisible"
@@ -910,6 +924,7 @@ import { Grid, Lock, UploadFilled } from "@element-plus/icons-vue";
 
 import SpotlightCard from "./components/SpotlightCard.vue";
 import CommandPalette, { type CommandItem } from "./components/CommandPalette.vue";
+import ModelDictDialog from "./components/ModelDictDialog.vue";
 import TableEditorPanel from "./components/TableEditorPanel.vue";
 import { useTheme } from "./composables/useTheme";
 import { splitLongImageSmart } from "./utils/imageCompressor";
@@ -1039,6 +1054,8 @@ const quotaDialogVisible = ref(false);
 const quotaFormLimit = ref(50);
 const quotaFormUnlimited = ref(false);
 const savingQuota = ref(false);
+const modelDictDialogVisible = ref(false);
+const modelDictCount = ref(0);
 
 // 多设备并发运行检测 + 防误关拦截
 const clientSessionId = getClientSessionId();
@@ -2366,6 +2383,9 @@ async function loadWorkspaceBootstrap() {
     quotaLimit.value = quota.daily_limit;
     quotaUsed.value = quota.used_count;
     quotaUnlimited.value = Boolean(quota.unlimited || quota.daily_limit <= 0);
+    if (typeof quota.model_dict_count === "number") {
+      modelDictCount.value = quota.model_dict_count;
+    }
   } catch {
     // 后端未启动或未授权时保持界面可用
   }

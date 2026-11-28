@@ -2571,6 +2571,38 @@ def _call_single_gemini_model(
     return None, last_err or f"Gemini 模型 {model_name} 暂时不可用", False
 
 
+def _extract_code_tokens(val: str) -> List[str]:
+    """提取单元格内的独立入网小型号词元（如 'ABR-AL60 ABR-AL90' -> ['abral60', 'abral90']）。"""
+    raw = str(val or "").strip()
+    if not raw:
+        return []
+    parts = re.split(r"[\s/、,;，]+", raw)
+    tokens: List[str] = []
+    for p in parts:
+        clean = re.sub(r"[^A-Za-z0-9]", "", p).lower()
+        if len(clean) >= 4 and re.search(r"[a-z]", clean) and re.search(r"\d", clean):
+            tokens.append(clean)
+    return tokens
+
+
+def _is_same_family_code_superset(big_raw: str, small_raw: str) -> bool:
+    """
+    判断一方是否完整保留了无横线合并格内的全部同族多码（如 'BAL-AL00 BAL-AL80' / 'ABR-AL60 ABR-AL90'），
+    而另一方误将其拆成了单个子码（如 'BAL-AL00' / 'ABR-AL60'）。
+    仅当大集合含 >=2 个同族网码、且小集合是其非空真子集时返回 True，绝不放过异族错码（如 A2896 vs A2892）。
+    """
+    big_toks = _extract_code_tokens(big_raw)
+    small_toks = _extract_code_tokens(small_raw)
+    big_set = set(big_toks)
+    small_set = set(small_toks)
+    if len(big_set) < 2 or not small_set or not (small_set < big_set):
+        return False
+    # 校验大集合内所有原始子码属于同一网码族（如 bal / abr / jad / hbn / mro / lya）
+    raw_parts = [p for p in re.split(r"[\s/、,;，]+", str(big_raw or "").strip()) if re.search(r"[A-Za-z]", p) and re.search(r"\d", p)]
+    fams = {_code_family_key(p) for p in raw_parts} - {""}
+    return len(fams) == 1
+
+
 def _cross_verify_dual_sheets(
     primary_sheets: List[Dict[str, Any]],
     secondary_sheets: List[Dict[str, Any]],
@@ -2725,7 +2757,16 @@ def _cross_verify_dual_sheets(
             if p_cd_col is not None and se["roles"].get("code_col") is not None:
                 s_cd = se["code"]
                 if (p_cd or s_cd) and _norm_compare_token(p_cd) != _norm_compare_token(s_cd):
-                    _flag_conflict(p_cd_col, "网络型号", p_cd, s_cd)
+                    same_model_ok = (p_m_col is None) or (_norm_compare_token(p_m) == _norm_compare_token(se["model"]))
+                    if same_model_ok and _is_same_family_code_superset(p_cd, s_cd):
+                        # 主模型完整保留了合并格内的全部同族多码（如 BAL-AL00 BAL-AL80），副模型误拆成单码 -> 采纳完整合并格
+                        pass
+                    elif same_model_ok and _is_same_family_code_superset(s_cd, p_cd):
+                        # 副模型完整保留了合并格内的全部同族多码，主模型误拆成单码 -> 自动采纳完整合并格
+                        if p_cd_col < len(p_row):
+                            p_row[p_cd_col] = s_cd
+                    else:
+                        _flag_conflict(p_cd_col, "网络型号", p_cd, s_cd)
 
             # 3) 核验「容量」（严格捕获 16+1TB vs 16+512、8+128 vs 8+256，忽略空格与 G/GB/T/TB 写法差异）
             if p_cap_col is not None and se["roles"].get("cap_col") is not None:
@@ -2827,6 +2868,7 @@ def extract_tables_from_image(
             + "VISUAL HEADER ANCHOR RULE: If there is a bright RED horizontal divider bar near the top of the image, the strip ABOVE the red bar is a copied visual column-header reference from the top of the sheet—use it ONLY to keep exact column names and left-to-right column alignment, and put ONLY the data rows BELOW the red bar into `rows`. "
             "EXACT HEADER COUNT RULE: Count EVERY visible column header from left to right and NEVER omit columns such as '小型号', '网络型号', '地区/行货', '网络/WIFI版', or '备注'! For example, Huawei/Honor tablet sheets have 10 columns ('Mate pad Air系列 | 小型号 | 容量 | 充新 | 靓机 | 小花 | 大花 | 外爆 | 内爆可测 | 备注') and iPad sheets have 12 columns ('型号 | 网络型号 | 地区 | 版本 | 容量 | 充新 | 靓机 | 小花 | 大花 | 外爆 | 内爆可测 | 备注'). Every row MUST align 1-to-1 with every header column! "
             "IMPORTANT: When left-hand columns are nested vertically merged cells (for example a tablet series spanning 8 rows containing multiple '小型号' blocks like 'AST-W00 WIFI' / 'AST-W10 WIFI 柔光版', or an iPad model spanning 12 rows containing '行货' and 'WIFI版' / 'WIFI版 纳米' / '插卡版'), REPEAT EVERY left-hand column value onto EVERY row belonging to its horizontal grid box! "
+            "MERGED NETWORK-CODE CELL RULE (NEVER SPLIT ONE BOX): Treat EVERY single vertically-merged '网络型号'/'小型号'/'具体型号' box (with NO horizontal dividing line inside the cell) as ONE indivisible cell value! When ONE merged box displays 2 or more stacked codes on multiple lines (e.g. 'ABR-AL60' over 'ABR-AL90' for P50 E 4G, 'ABR-AL00' over 'ABR-AL80' for P50 4G, 'BAL-AL00' over 'BAL-AL80' for P50 Pocket 4G, 'HBN-AL10' over 'HBN-AL80', or 'JAD-AL50' over 'JAD-AL60' over '麒麟9000'), NEVER split those lines across different capacity rows! Join ALL lines inside that single box with a single space (e.g. 'ABR-AL60 ABR-AL90', 'BAL-AL00 BAL-AL80') and repeat that EXACT complete string onto EVERY row belonging to that merged box! Only output different codes on different rows when there is an actual horizontal grid border separating them into separate boxes. "
             "NEVER COPY SECTION HEADER AS MODEL NAME: Repeated green sub-header labels ending in '系列' (such as 'Mate pad系列', 'Mate pad Air系列', 'Pro系列', 'Air系列') are COLUMN HEADERS ONLY—NEVER put them into a data row's model column! When a tall vertically merged model cell starts right below a green 'xxx系列' header and its centered model name (e.g. 'Mate pad Pro 2024年 12.2寸' or 'Mate pad Pro 23年 13.2寸') is printed lower down in the middle of the box, ALWAYS read downward inside that same merged box and fill that real model name onto the top rows too! "
             "NEVER pull a model name UPWARD from a lower horizontal border box onto orphan rows above the border line! If a row at the very top edge has a blank model cell separated by a dark horizontal border from the model below, leave its model cell empty '' or omit the clipped orphan row rather than assigning the NEXT model's name to it. "
             "SINGLE-LINE MODEL NAME RULE: NEVER put newline characters or literal '\\n' inside model names, network codes, capacities, or prices! If a model name wraps across two lines inside a narrow cell (for example '15 PRO' over 'MAX', or '荣耀Robot' over 'Phone', or 'MATE XT2' over '非凡大师'), ALWAYS join them on ONE line with a single space ('15 PRO MAX', '荣耀Robot Phone', 'MATE XT2 非凡大师'). "

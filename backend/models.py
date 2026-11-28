@@ -79,3 +79,17 @@ class BatchJobItem(SQLModel, table=True):
     status: str = Field(default="pending")  # completed | failed
     error_message: str = Field(default="")
     created_at: Optional[str] = Field(default_factory=utc_now_str)
+
+
+class ModelCodeMapping(SQLModel, table=True):
+    """云端「机型名称 ↔ 网络型号/入网小型号」双向记忆字典（零 AI Token、仅在歧义/留空时本地 O(1) 自动消歧）。"""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    model_name: str = Field(index=True)
+    network_code: str = Field(index=True)
+    norm_model: str = Field(index=True)
+    norm_code: str = Field(index=True)
+    brand_hint: str = Field(default="")
+    source: str = Field(default="manual")  # auto_edit | sheet_import | manual
+    hit_count: int = Field(default=0)
+    updated_at: Optional[str] = Field(default_factory=utc_now_str)

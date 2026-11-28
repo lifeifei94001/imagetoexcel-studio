@@ -50,8 +50,22 @@ export interface QuotaInfo {
   unlimited?: boolean;
   remaining: number;
   gemini_configured?: boolean;
+  gemini_key_count?: number;
   model?: string;
   b2_configured?: boolean;
+  model_dict_count?: number;
+}
+
+export interface ModelCodeMappingItem {
+  id: number;
+  model_name: string;
+  network_code: string;
+  norm_model: string;
+  norm_code: string;
+  brand_hint: string;
+  source: string;
+  hit_count: number;
+  updated_at?: string;
 }
 
 export interface ExtractResponse {
@@ -370,6 +384,34 @@ export async function updateQuotaConfig(params: {
 
 export async function fetchHistory(): Promise<ConversionRecord[]> {
   const { data } = await http.get<ConversionRecord[]>("/history");
+  return data;
+}
+
+export async function fetchModelDict(query = ""): Promise<{ total: number; items: ModelCodeMappingItem[] }> {
+  const { data } = await http.get<{ total: number; items: ModelCodeMappingItem[] }>("/model-dict", {
+    params: query.trim() ? { q: query.trim() } : undefined,
+  });
+  return data;
+}
+
+export async function upsertModelDict(params: {
+  items: Array<{ model_name: string; network_code: string; brand_hint?: string }>;
+  source?: "manual" | "auto_edit" | "sheet_import";
+}): Promise<{ created: number; updated: number; skipped: number; total: number }> {
+  const { data } = await http.post("/model-dict/upsert", {
+    items: params.items,
+    source: params.source || "manual",
+  });
+  return data;
+}
+
+export async function deleteModelDictItem(id: number): Promise<{ deleted: boolean; id: number; total: number }> {
+  const { data } = await http.delete(`/model-dict/${id}`);
+  return data;
+}
+
+export async function clearModelDict(): Promise<{ cleared: boolean; deleted: number; total: number }> {
+  const { data } = await http.delete("/model-dict");
   return data;
 }
 

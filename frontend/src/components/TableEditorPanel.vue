@@ -187,6 +187,28 @@
       </div>
 
       <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap">
+        <el-button
+          v-if="hasModelAndCodeCols"
+          size="small"
+          type="success"
+          plain
+          :loading="importingDict"
+          title="将当前表格中已核对无误的「机型 ↔ 网络型号」批量写入云端记忆字典，下次遇到歧义自动消歧"
+          @click="importCurrentSheetToDict"
+        >
+          收录当前表到字典
+        </el-button>
+        <el-button
+          v-if="hasModelAndCodeCols && quotations.length > 1"
+          size="small"
+          type="primary"
+          plain
+          :loading="importingDict"
+          title="一次性将本批全部已加载表格的无误机型映射收录进云端字典"
+          @click="importAllSheetsToDict"
+        >
+          收录全部表 ({{ quotations.length }})
+        </el-button>
         <el-button size="small" @click="showPreview = !showPreview">
           {{ showPreview ? "隐藏原图对照" : "显示原图对照" }}
         </el-button>
@@ -352,6 +374,7 @@
                       fontWeight: isSectionHeaderRow(rIdx) ? '700' : undefined,
                     }"
                     @input="updateCell(rIdx, cIdx, ($event.target as HTMLInputElement).value)"
+                    @blur="handleCellBlur(rIdx, cIdx)"
                   />
                 </td>
                 <td class="sheet-row-index">
@@ -386,6 +409,7 @@ import SpotlightCard from "./SpotlightCard.vue";
 import {
   downloadExportedTables,
   extractApiError,
+  upsertModelDict,
   type ColumnSemanticType,
   type ExtractedSheet,
   type QuotationGroup,
@@ -402,6 +426,7 @@ const emit = defineEmits<{
   (e: "update:quotations", val: QuotationGroup[]): void;
   (e: "update:mergePerImage", val: boolean): void;
   (e: "clear-draft"): void;
+  (e: "dict-updated", total: number): void;
 }>();
 
 const activeQuoteIdx = ref(0);
@@ -409,6 +434,8 @@ const activeSubSheetIdx = ref(0);
 const showPreview = ref(true);
 const zoom = ref(100);
 const exportingKey = ref<"" | "current_xlsx" | "batch_zip" | "all_in_one_xlsx" | "csv">("");
+const importingDict = ref(false);
+const dirtyLearnRows = new Set<string>();
 
 watch(
   () => props.quotations.length,
@@ -506,13 +533,201 @@ function updateColType(cIdx: number, val: ColumnSemanticType) {
   emit("update:quotations", next);
 }
 
+function detectModelAndCodeCols(headers: string[]): { modelCol: number; codeCol: number } {
+  const normed = (headers || []).map((h) => String(h || "").replace(/\s+/g, "").toLowerCase());
+  let modelCol = -1;
+  let codeCol = -1;
+  for (let i = 0; i < normed.length; i++) {
+    const h = normed[i];
+    if (modelCol === -1 && ["型号", "机型", "model", "设备名称", "手机型号", "平板型号"].includes(h)) {
+      modelCol = i;
+    }
+  }
+  for (let i = 0; i < normed.length; i++) {
+    if (i === modelCol) continue;
+    const h = normed[i];
+    if (codeCol === -1 && ["网络型号", "小型号", "型号编码", "机器编码", "代号", "sku", "编码"].some((k) => h.includes(k))) {
+      codeCol = i;
+    } else if (modelCol === -1 && ["型号", "机型", "model", "系列", "pad", "平板"].some((k) => h.includes(k))) {
+      modelCol = i;
+    }
+  }
+  if (codeCol === -1 && modelCol === 0 && normed.length > 1 && normed[1].includes("具体型号")) {
+    codeCol = 1;
+  }
+  return { modelCol, codeCol };
+}
+
+const activeModelCodeCols = computed(() => {
+  const sh = activeSheet.value;
+  if (!sh || sh.style_preset === "general") return { modelCol: -1, codeCol: -1 };
+  return detectModelAndCodeCols(sh.headers || []);
+});
+
+const hasModelAndCodeCols = computed(
+  () => activeModelCodeCols.value.modelCol >= 0 && activeModelCodeCols.value.codeCol >= 0
+);
+
 function updateCell(rIdx: number, cIdx: number, val: string) {
   const next = cloneQuotations();
   const sh = getMutableTargetSheet(next);
   if (!sh) return;
+  const cols = detectModelAndCodeCols(sh.headers || []);
+  const wasWarned = Boolean(sh.warnings?.some((w) => w.row === rIdx && w.col === cIdx));
+  if (
+    sh.style_preset !== "general" &&
+    cols.modelCol >= 0 &&
+    cols.codeCol >= 0 &&
+    (cIdx === cols.modelCol || cIdx === cols.codeCol)
+  ) {
+    dirtyLearnRows.add(`${activeQuoteIdx.value}:${activeSubSheetIdx.value}:${rIdx}:${wasWarned ? "1" : "0"}`);
+  }
   sh.rows[rIdx][cIdx] = val;
   sh.warnings = sh.warnings.filter((w) => !(w.row === rIdx && w.col === cIdx));
   emit("update:quotations", next);
+}
+
+async function handleCellBlur(rIdx: number, cIdx: number) {
+  const sh = activeSheet.value;
+  if (!sh || sh.style_preset === "general") return;
+  const cols = activeModelCodeCols.value;
+  if (cols.modelCol < 0 || cols.codeCol < 0 || (cIdx !== cols.modelCol && cIdx !== cols.codeCol)) return;
+
+  const kWarn = `${activeQuoteIdx.value}:${activeSubSheetIdx.value}:${rIdx}:1`;
+  const kNorm = `${activeQuoteIdx.value}:${activeSubSheetIdx.value}:${rIdx}:0`;
+  const hadDirty = dirtyLearnRows.has(kWarn) || dirtyLearnRows.has(kNorm);
+  if (!hadDirty) return;
+  dirtyLearnRows.delete(kWarn);
+  dirtyLearnRows.delete(kNorm);
+
+  const row = sh.rows[rIdx];
+  if (!row) return;
+  const modelVal = String(row[cols.modelCol] || "").trim();
+  const codeVal = String(row[cols.codeCol] || "").trim();
+  if (!modelVal || !codeVal || modelVal.endsWith("系列")) return;
+
+  // 若用户在型号列填入了准确机型，自动顺手填充本表内其余「同网络型号且为空白标黄」的行（如截图 3 的第 59、60 行 ADA-AL10U！）
+  let siblingFilled = 0;
+  if (cIdx === cols.modelCol) {
+    const normCode = codeVal.replace(/[\s\-_/]+/g, "").toLowerCase();
+    const next = cloneQuotations();
+    const targetSh = getMutableTargetSheet(next);
+    if (targetSh) {
+      for (let i = 0; i < targetSh.rows.length; i++) {
+        if (i === rIdx) continue;
+        const r = targetSh.rows[i];
+        const rModel = String(r[cols.modelCol] || "").trim();
+        const rCode = String(r[cols.codeCol] || "").replace(/[\s\-_/]+/g, "").toLowerCase();
+        if (!rModel && rCode && rCode === normCode) {
+          r[cols.modelCol] = modelVal;
+          targetSh.warnings = targetSh.warnings.filter((w) => !(w.row === i && w.col === cols.modelCol));
+          siblingFilled++;
+        }
+      }
+      if (siblingFilled > 0) {
+        emit("update:quotations", next);
+      }
+    }
+  }
+
+  // 自动写入云端「机型 ↔ 网络型号」记忆库（零阻塞，静默记住下次直接消歧）
+  try {
+    const brandHint = (activeQuotation.value?.quote_title || "").split(/\s+/)[0]?.slice(0, 12) || "";
+    const res = await upsertModelDict({
+      items: [{ model_name: modelVal, network_code: codeVal, brand_hint: brandHint }],
+      source: "auto_edit",
+    });
+    emit("dict-updated", res.total);
+    ElMessage.success(
+      siblingFilled > 0
+        ? `已同步填充同网码 ${siblingFilled} 行并记住「${modelVal} ↔ ${codeVal}」，下次遇歧义自动补全`
+        : `已自动记住「${modelVal} ↔ ${codeVal}」，下次遇歧义自动消歧`
+    );
+  } catch {
+    // 静默忽略网络偶发波动，不影响表格编辑
+  }
+}
+
+function collectCleanPairsFromSheet(sh: ExtractedSheet, brandHint: string): Array<{ model_name: string; network_code: string; brand_hint: string }> {
+  if (!sh || sh.style_preset === "general") return [];
+  const { modelCol, codeCol } = detectModelAndCodeCols(sh.headers || []);
+  if (modelCol < 0 || codeCol < 0) return [];
+  const secSet = new Set(sh.section_header_rows || []);
+  const warnRows = new Set((sh.warnings || []).filter((w) => w.col === modelCol || w.col === codeCol).map((w) => w.row));
+  const seen = new Set<string>();
+  const out: Array<{ model_name: string; network_code: string; brand_hint: string }> = [];
+  for (let i = 0; i < (sh.rows || []).length; i++) {
+    if (secSet.has(i) || warnRows.has(i)) continue;
+    const m = String(sh.rows[i][modelCol] || "").trim();
+    const c = String(sh.rows[i][codeCol] || "").trim();
+    if (!m || !c || m.endsWith("系列") || !/[A-Za-z0-9]/.test(c)) continue;
+    const key = `${m.toLowerCase()}||${c.toLowerCase()}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push({ model_name: m, network_code: c, brand_hint: brandHint });
+    }
+  }
+  return out;
+}
+
+async function importCurrentSheetToDict() {
+  const sh = activeSheet.value;
+  if (!sh || importingDict.value) return;
+  const brandHint = (activeQuotation.value?.quote_title || "").split(/\s+/)[0]?.slice(0, 12) || "";
+  const pairs = collectCleanPairsFromSheet(sh, brandHint);
+  if (pairs.length === 0) {
+    ElMessage.warning("当前表没有可收录的「机型 + 网络型号」完整记录");
+    return;
+  }
+  importingDict.value = true;
+  try {
+    const res = await upsertModelDict({ items: pairs, source: "sheet_import" });
+    emit("dict-updated", res.total);
+    ElMessage.success(`当前表已收录进云端字典：新增 ${res.created} 条、更新 ${res.updated} 条（共 ${res.total} 条）`);
+  } catch (err) {
+    ElMessage.error(extractApiError(err));
+  } finally {
+    importingDict.value = false;
+  }
+}
+
+async function importAllSheetsToDict() {
+  if (importingDict.value || props.quotations.length === 0) return;
+  const allPairs: Array<{ model_name: string; network_code: string; brand_hint: string }> = [];
+  const seen = new Set<string>();
+  for (const q of props.quotations) {
+    const brandHint = (q.quote_title || "").split(/\s+/)[0]?.slice(0, 12) || "";
+    for (const pair of collectCleanPairsFromSheet(q.merged_sheet, brandHint)) {
+      const k = `${pair.model_name.toLowerCase()}||${pair.network_code.toLowerCase()}`;
+      if (!seen.has(k)) {
+        seen.add(k);
+        allPairs.push(pair);
+      }
+    }
+  }
+  if (allPairs.length === 0) {
+    ElMessage.warning("本批表格暂无可收录的完整机型映射");
+    return;
+  }
+  importingDict.value = true;
+  try {
+    let totalCreated = 0;
+    let totalUpdated = 0;
+    let finalTotal = 0;
+    // 分批提交（每批最多 500 条）
+    for (let i = 0; i < allPairs.length; i += 500) {
+      const res = await upsertModelDict({ items: allPairs.slice(i, i + 500), source: "sheet_import" });
+      totalCreated += res.created;
+      totalUpdated += res.updated;
+      finalTotal = res.total;
+    }
+    emit("dict-updated", finalTotal);
+    ElMessage.success(`全部 ${props.quotations.length} 份表已收录进云端字典：新增 ${totalCreated} 条、更新 ${totalUpdated} 条（共 ${finalTotal} 条）`);
+  } catch (err) {
+    ElMessage.error(extractApiError(err));
+  } finally {
+    importingDict.value = false;
+  }
 }
 
 function addRow() {

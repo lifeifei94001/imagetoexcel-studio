@@ -14,7 +14,7 @@ from sqlalchemy import update
 from sqlmodel import Session, desc, select
 
 from database import DB_MODE, _get_clean_env, get_session
-from models import BatchJob, BatchJobItem, ConversionRecord, DailyQuota, utc_now_str, utc_today_str
+from models import BatchJob, BatchJobItem, ConversionRecord, DailyQuota, ModelCodeMapping, utc_now_str, utc_today_str
 from services.auth_service import require_auth
 from services.b2_storage import (
     b2_is_enabled,
@@ -31,6 +31,14 @@ from services.excel_exporter import (
     build_xlsx_bytes,
     export_tables_package,
     make_download_headers,
+)
+from services.model_dict_service import (
+    apply_model_dict_to_result,
+    clear_all_mappings,
+    count_mappings,
+    delete_mapping,
+    list_mappings,
+    upsert_mappings,
 )
 from services.ocr_service import (
     extract_tables_from_image,
@@ -300,6 +308,7 @@ def get_quota(session: Session = Depends(get_session)) -> Dict[str, Any]:
         "gemini_key_count": get_gemini_key_count(),
         "model": get_active_model(),
         "b2_configured": b2_is_enabled(),
+        "model_dict_count": count_mappings(session),
     }
 
 
@@ -350,7 +359,69 @@ def update_quota_config(req: UpdateQuotaRequest, session: Session = Depends(get_
         "gemini_key_count": get_gemini_key_count(),
         "model": get_active_model(),
         "b2_configured": b2_is_enabled(),
+        "model_dict_count": count_mappings(session),
     }
+
+
+class ModelDictItemIn(BaseModel):
+    model_name: str
+    network_code: str
+    brand_hint: str = ""
+    source: str = ""
+
+
+class ModelDictUpsertRequest(BaseModel):
+    items: List[ModelDictItemIn] = []
+    source: str = "manual"
+
+
+@router.get("/model-dict")
+def get_model_dict(
+    q: str = Query(default=""),
+    limit: int = Query(default=500, ge=1, le=2000),
+    session: Session = Depends(get_session),
+) -> Dict[str, Any]:
+    """查询云端「机型 ↔ 网络型号」记忆库（支持关键字模糊搜索）。"""
+    rows = list_mappings(session, query=q, limit=limit)
+    total = count_mappings(session)
+    return {
+        "total": total,
+        "items": [r.model_dump() for r in rows],
+    }
+
+
+@router.post("/model-dict/upsert")
+def upsert_model_dict(
+    req: ModelDictUpsertRequest,
+    session: Session = Depends(get_session),
+) -> Dict[str, Any]:
+    """新增或更新 1 条或批量「机型 ↔ 网络型号」映射（支持工作台修完自动记住、整表收录与粘贴批量导入）。"""
+    if not req.items:
+        return {"created": 0, "updated": 0, "skipped": 0, "total": count_mappings(session)}
+    if len(req.items) > 1000:
+        raise HTTPException(status_code=400, detail="单次最多批量导入 1000 条机型映射")
+    return upsert_mappings(
+        session,
+        entries=[it.model_dump() for it in req.items],
+        default_source=req.source or "manual",
+    )
+
+
+@router.delete("/model-dict/{mapping_id}")
+def remove_model_dict_item(
+    mapping_id: int,
+    session: Session = Depends(get_session),
+) -> Dict[str, Any]:
+    ok = delete_mapping(session, mapping_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="未找到该机型映射记录")
+    return {"deleted": True, "id": mapping_id, "total": count_mappings(session)}
+
+
+@router.delete("/model-dict")
+def clear_model_dict(session: Session = Depends(get_session)) -> Dict[str, Any]:
+    deleted = clear_all_mappings(session)
+    return {"cleared": True, "deleted": deleted, "total": 0}
 
 
 @router.get("/history")
@@ -738,6 +809,8 @@ def commit_sliced_quotation(
         merge_per_image=req.merge_per_image,
         doc_type=req.doc_type,
     )
+    # 零 AI Token 本地查表：仅对存在分歧/留空的机型或网络型号做唯一消歧，正常单元格绝不触碰
+    apply_model_dict_to_result(session, merged_result)
     return _persist_completed_quotation(
         session=session,
         job=job,
@@ -809,6 +882,7 @@ async def process_batch_item(
         session.commit()
         raise HTTPException(status_code=_ocr_error_status_code(str(exc)), detail=str(exc))
 
+    apply_model_dict_to_result(session, result)
     return _persist_completed_quotation(
         session=session,
         job=job,
@@ -1220,6 +1294,7 @@ async def extract_tables(
         except RuntimeError as exc:
             raise HTTPException(status_code=_ocr_error_status_code(str(exc)), detail=str(exc))
 
+        apply_model_dict_to_result(session, result)
         used_engine = result.get("engine", "demo")
         is_demo = bool(result.get("is_demo", True))
         if result.get("notice"):
