@@ -29,6 +29,18 @@
 
       <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap">
         <el-button
+          v-if="canRerunActive"
+          type="warning"
+          plain
+          size="small"
+          :loading="isRerunningActive"
+          :disabled="Boolean(extracting) && !isRerunningActive"
+          title="使用当前工作台参数重新识别这张原图（自动应用最新机型字典），完成后原位替换当前表格并刷新云端 .zip"
+          @click="$emit('rerun-quotation', activeQuoteIdx)"
+        >
+          {{ isRerunningActive ? "正在重跑此图..." : "重跑此图" }}
+        </el-button>
+        <el-button
           type="primary"
           size="small"
           :loading="exportingKey === 'current_xlsx'"
@@ -266,8 +278,8 @@
           <div v-else style="padding: 36px 16px; text-align: center">
             <div style="font-weight: 600; margin-bottom: 6px">已从云端记录 / 草稿恢复表格</div>
             <div class="glass-muted" style="font-size: 12.5px; line-height: 1.6">
-              为节约存储空间，云端存档与刷新草稿不留存原始图片文件。<br />
-              你可直接继续修改右侧表格并重新导出 .xlsx / .zip。
+              为节约存储空间，本地仅保留最近 1 批原图缓存，更早的历史批次不留存原图。<br />
+              你仍可直接继续修改右侧表格并重新导出 .xlsx / .zip。
             </div>
           </div>
         </div>
@@ -420,6 +432,9 @@ const props = defineProps<{
   mergePerImage: boolean;
   previewMap: Record<string, string>;
   mode: "excel" | "text";
+  canRerunMap?: Record<number, boolean>;
+  rerunningQuoteIdx?: number | null;
+  extracting?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -427,6 +442,7 @@ const emit = defineEmits<{
   (e: "update:mergePerImage", val: boolean): void;
   (e: "clear-draft"): void;
   (e: "dict-updated", total: number): void;
+  (e: "rerun-quotation", quoteIdx: number): void;
 }>();
 
 const activeQuoteIdx = ref(0);
@@ -476,6 +492,9 @@ const currentPreviewUrl = computed(() => {
   if (fname && props.previewMap[fname]) return props.previewMap[fname];
   return "";
 });
+
+const canRerunActive = computed(() => Boolean(props.canRerunMap?.[activeQuoteIdx.value]));
+const isRerunningActive = computed(() => props.rerunningQuoteIdx === activeQuoteIdx.value);
 
 function selectQuotation(idx: number) {
   activeQuoteIdx.value = idx;

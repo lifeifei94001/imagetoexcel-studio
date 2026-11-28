@@ -252,7 +252,7 @@
         </el-alert>
 
         <!-- 双栏队列式上传工作台 -->
-        <section class="glass-strong uploader-shell">
+        <section ref="uploaderAnchorRef" class="glass-strong uploader-shell">
           <div class="uploader-grid">
             <!-- 左栏：拖拽 / 粘贴 / 浏览 -->
             <div
@@ -492,6 +492,42 @@
           </div>
         </section>
 
+        <!-- 最近一批原图本地缓存条（仅保留最近 1 批，0 云端占用，支持整批装回队列或一键释放） -->
+        <section
+          v-if="recentBatchArchive && !pendingCheckpoint && !extracting"
+          class="glass"
+          style="
+            padding: 12px 16px;
+            margin-bottom: 18px;
+            border-radius: var(--glass-radius-sm);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            flex-wrap: wrap;
+          "
+        >
+          <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0">
+            <span class="gem-pill pill-violet">本地原图缓存 · 仅留最近 1 批</span>
+            <span style="font-size: 13px; color: var(--glass-text)">
+              「<strong>{{ recentBatchArchive.title }}</strong>」共
+              <strong class="num-tabular">{{ recentBatchArchive.files.length }}</strong> 张 · 约
+              <strong class="num-tabular">{{ formatSize(recentBatchArchive.totalBytes) }}</strong>
+            </span>
+            <span class="glass-muted" style="font-size: 12px">
+              0 云端占用，新一批开跑自动替换；支持下方点单张「重跑此图」或整批装回队列
+            </span>
+          </div>
+          <div style="display: flex; align-items: center; gap: 8px; flex-shrink: 0; flex-wrap: wrap">
+            <el-button size="small" type="primary" plain @click="reloadRecentBatchToQueue">
+              全部装回队列 ({{ recentBatchArchive.files.length }})
+            </el-button>
+            <el-button size="small" type="danger" plain @click="confirmClearRecentArchive">
+              释放本地缓存
+            </el-button>
+          </div>
+        </section>
+
         <!-- 实时批处理进度条面板（多张报价单时无需干等，可查看每张进度、防休眠状态与断点操作） -->
         <section v-if="progressItems.length > 0" class="glass-strong" style="padding: 18px 20px; margin-bottom: 22px">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; flex-wrap: wrap; gap: 8px">
@@ -579,8 +615,8 @@
           />
 
           <div v-auto-animate style="display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px">
-            <div v-for="pItem in progressItems" :key="pItem.id" class="queue-item">
-              <div style="min-width: 0">
+            <div v-for="(pItem, pIdx) in progressItems" :key="pItem.id" class="queue-item">
+              <div style="min-width: 0; flex: 1">
                 <div style="font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap">
                   {{ pItem.quoteTitle || pItem.filename }}
                 </div>
@@ -588,28 +624,40 @@
                   {{ pItem.message }}
                 </div>
               </div>
-              <span
-                class="gem-pill"
-                :class="
-                  pItem.status === 'completed'
-                    ? 'pill-emerald'
-                    : pItem.status === 'processing'
-                    ? 'pill-sky'
-                    : pItem.status === 'failed'
-                    ? 'pill-coral'
-                    : 'pill-gold'
-                "
-              >
-                {{
-                  pItem.status === "completed"
-                    ? "已完成"
-                    : pItem.status === "processing"
-                    ? "识别中"
-                    : pItem.status === "failed"
-                    ? "失败"
-                    : "排队中"
-                }}
-              </span>
+              <div style="display: flex; align-items: center; gap: 6px; flex-shrink: 0">
+                <el-button
+                  v-if="!extracting && canRerunProgressItem(pIdx)"
+                  size="small"
+                  type="warning"
+                  plain
+                  title="用当前工作台参数重新识别此图并原位更新结果"
+                  @click="rerunSingleImage({ itemIndex: pIdx })"
+                >
+                  重跑此图
+                </el-button>
+                <span
+                  class="gem-pill"
+                  :class="
+                    pItem.status === 'completed'
+                      ? 'pill-emerald'
+                      : pItem.status === 'processing'
+                      ? 'pill-sky'
+                      : pItem.status === 'failed'
+                      ? 'pill-coral'
+                      : 'pill-gold'
+                  "
+                >
+                  {{
+                    pItem.status === "completed"
+                      ? "已完成"
+                      : pItem.status === "processing"
+                      ? "识别中"
+                      : pItem.status === "failed"
+                      ? "失败"
+                      : "排队中"
+                  }}
+                </span>
+              </div>
             </div>
           </div>
         </section>
@@ -622,8 +670,12 @@
             v-model:merge-per-image="mergePerImage"
             :preview-map="previewMap"
             :mode="mode"
+            :can-rerun-map="editorCanRerunMap"
+            :rerunning-quote-idx="rerunningQuoteIdx"
+            :extracting="extracting"
             @clear-draft="clearDraft"
             @dict-updated="(total: number) => (modelDictCount = total)"
+            @rerun-quotation="handleRerunFromEditor"
           />
         </div>
       </template>
@@ -700,6 +752,17 @@
                 </div>
 
                 <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap">
+                  <el-button
+                    v-if="latestLocalImageBatch && latestLocalImageBatch.jobUid === job.job_uid"
+                    size="small"
+                    type="warning"
+                    plain
+                    :disabled="extracting"
+                    title="该批次的原图仍缓存在本地浏览器中，可一键装回工作台队列增删或调整参数后重跑"
+                    @click="reloadRecentBatchToQueue"
+                  >
+                    装回队列重跑
+                  </el-button>
                   <el-button
                     v-if="job.json_b2_key"
                     size="small"
@@ -931,10 +994,15 @@ import { splitLongImageSmart } from "./utils/imageCompressor";
 import {
   checkpointEntryToFile,
   clearBatchCheckpoint,
+  clearRecentBatchArchive,
   loadBatchCheckpoint,
+  loadRecentBatchArchive,
   saveBatchCheckpoint,
+  saveRecentBatchArchive,
   summarizeCheckpoint,
   type BatchCheckpointRecord,
+  type CheckpointFileEntry,
+  type RecentBatchArchive,
   type SliceCheckpoint,
 } from "./utils/batchCheckpoint";
 import {
@@ -1023,17 +1091,22 @@ const extracting = ref(false);
 const paletteVisible = ref(false);
 
 const fileInputRef = ref<HTMLInputElement | null>(null);
+const uploaderAnchorRef = ref<HTMLElement | null>(null);
 const editorAnchorRef = ref<HTMLElement | null>(null);
 
 const queue = ref<QueuedImage[]>([]);
 const quotations = ref<QuotationGroup[]>([]);
 const progressItems = ref<ProgressEntry[]>([]);
 const lastBatchJobUid = ref("");
+const activeEditorJobUid = ref("");
 const lastBatchSnapshot = ref<QueuedImage[]>([]);
 const lastBatchCollected = ref<Array<QuotationGroup | null>>([]);
 
-// 断点续传 + 手动停止 + 断网自动暂停 + 防休眠保活状态
+// 断点续传 + 最近一批原图本地缓存 + 手动停止 + 断网自动暂停 + 防休眠保活状态
 const pendingCheckpoint = ref<BatchCheckpointRecord | null>(null);
+const recentBatchArchive = ref<RecentBatchArchive | null>(null);
+const archivePreviewUrls = ref<Record<string, string>>({});
+const rerunningQuoteIdx = ref<number | null>(null);
 const stopRequested = ref(false);
 const stoppedByUser = ref(false);
 const networkPaused = ref(false);
@@ -1083,10 +1156,125 @@ const purgingB2 = ref(false);
 const downloadingKey = ref("");
 const loadingJobUid = ref("");
 
+const latestLocalImageBatch = computed<{
+  kind: "checkpoint" | "archive";
+  jobUid: string;
+  title: string;
+  updatedAt: number;
+  totalBytes: number;
+  files: CheckpointFileEntry[];
+  itemQuoteTitles: string[];
+} | null>(() => {
+  if (recentBatchArchive.value && recentBatchArchive.value.files.length > 0) {
+    const a = recentBatchArchive.value;
+    return {
+      kind: "archive",
+      jobUid: a.jobUid,
+      title: a.title,
+      updatedAt: a.updatedAt,
+      totalBytes: a.totalBytes || a.files.reduce((s, f) => s + (f.size || 0), 0),
+      files: a.files,
+      itemQuoteTitles: a.itemQuoteTitles || [],
+    };
+  }
+  if (pendingCheckpoint.value && pendingCheckpoint.value.files.length > 0) {
+    const c = pendingCheckpoint.value;
+    return {
+      kind: "checkpoint",
+      jobUid: c.jobUid,
+      title: c.title,
+      updatedAt: c.updatedAt,
+      totalBytes: c.files.reduce((s, f) => s + (f.size || 0), 0),
+      files: c.files,
+      itemQuoteTitles: c.itemQuoteTitles || [],
+    };
+  }
+  return null;
+});
+
+const isArchiveMatchingActiveEditor = computed(() => {
+  const b = latestLocalImageBatch.value;
+  if (!b) return false;
+  if (!activeEditorJobUid.value) return true;
+  return activeEditorJobUid.value === b.jobUid;
+});
+
+function revokeArchivePreviewUrls() {
+  for (const url of Object.values(archivePreviewUrls.value)) {
+    URL.revokeObjectURL(url);
+  }
+  archivePreviewUrls.value = {};
+}
+
+function rebuildArchivePreviewUrls() {
+  revokeArchivePreviewUrls();
+  const batch = latestLocalImageBatch.value;
+  if (!batch) return;
+  const nextMap: Record<string, string> = {};
+  for (const entry of batch.files) {
+    if (entry.blob && !nextMap[entry.name]) {
+      nextMap[entry.name] = URL.createObjectURL(entry.blob);
+    }
+  }
+  archivePreviewUrls.value = nextMap;
+}
+
+function resolveQuotationToSourceIndex(quoteIdx: number): number {
+  const q = quotations.value[quoteIdx];
+  if (!q || !isArchiveMatchingActiveEditor.value) return -1;
+
+  // 1. 优先匹配当前内存中的 lastBatchCollected / lastBatchSnapshot
+  if (lastBatchSnapshot.value.length > 0 && (!activeEditorJobUid.value || lastBatchJobUid.value === activeEditorJobUid.value)) {
+    const directIdx = lastBatchCollected.value.findIndex((c) => c === q);
+    if (directIdx >= 0 && lastBatchSnapshot.value[directIdx]) return directIdx;
+    if (
+      quoteIdx < lastBatchSnapshot.value.length &&
+      lastBatchSnapshot.value[quoteIdx]?.file.name === q.source_filename
+    ) {
+      return quoteIdx;
+    }
+    const bySnapName = lastBatchSnapshot.value.findIndex((s) => s.file.name === q.source_filename);
+    if (bySnapName >= 0) return bySnapName;
+  }
+
+  // 2. 兜底匹配浏览器本地 IndexedDB 中的最近一批原图缓存（刷新/重开浏览器后依然生效）
+  const batch = latestLocalImageBatch.value;
+  if (!batch) return -1;
+  if (quoteIdx < batch.files.length && batch.files[quoteIdx]?.name === q.source_filename) {
+    return quoteIdx;
+  }
+  return batch.files.findIndex((f) => f.name === q.source_filename);
+}
+
+const editorCanRerunMap = computed<Record<number, boolean>>(() => {
+  const map: Record<number, boolean> = {};
+  for (let i = 0; i < quotations.value.length; i++) {
+    map[i] = resolveQuotationToSourceIndex(i) >= 0;
+  }
+  return map;
+});
+
+function canRerunProgressItem(itemIdx: number): boolean {
+  if (lastBatchSnapshot.value[itemIdx]) return true;
+  if (latestLocalImageBatch.value?.files[itemIdx]) return true;
+  return false;
+}
+
 const previewMap = computed<Record<string, string>>(() => {
   const map: Record<string, string> = {};
+  if (!activeEditorJobUid.value || lastBatchJobUid.value === activeEditorJobUid.value) {
+    for (const item of lastBatchSnapshot.value) {
+      map[item.file.name] = item.previewUrl;
+    }
+  }
   for (const item of queue.value) {
     map[item.file.name] = item.previewUrl;
+  }
+  // 本地最近一批原图缓存 URL 独立维护，不受清空待处理队列影响
+  if (isArchiveMatchingActiveEditor.value) {
+    for (const [fname, url] of Object.entries(archivePreviewUrls.value)) {
+      map[fname] = url;
+    }
   }
   return map;
 });
@@ -1207,7 +1395,11 @@ watch(
       try {
         localStorage.setItem(
           DRAFT_STORAGE_KEY,
-          JSON.stringify({ mergePerImage: mergePerImage.value, quotations: val })
+          JSON.stringify({
+            jobUid: activeEditorJobUid.value,
+            mergePerImage: mergePerImage.value,
+            quotations: val,
+          })
         );
       } catch {
         // 忽略容量限制
@@ -1285,11 +1477,18 @@ function moveQueueItem(idx: number, delta: number) {
 
 function removeQueueItem(idx: number) {
   const [removed] = queue.value.splice(idx, 1);
-  if (removed) URL.revokeObjectURL(removed.previewUrl);
+  if (removed && !lastBatchSnapshot.value.some((s) => s.previewUrl === removed.previewUrl)) {
+    URL.revokeObjectURL(removed.previewUrl);
+  }
 }
 
 function clearQueue() {
-  for (const item of queue.value) URL.revokeObjectURL(item.previewUrl);
+  const retained = new Set(lastBatchSnapshot.value.map((s) => s.previewUrl));
+  for (const item of queue.value) {
+    if (!retained.has(item.previewUrl)) {
+      URL.revokeObjectURL(item.previewUrl);
+    }
+  }
   queue.value = [];
 }
 
@@ -1375,14 +1574,76 @@ async function refreshPendingCheckpoint() {
     }
     const summary = summarizeCheckpoint(cp);
     if (summary.remaining <= 0) {
+      // 若异常退出前已全部完成，转存为最近一批原图缓存后再清理断点
+      const archive: RecentBatchArchive = {
+        version: 1,
+        jobUid: cp.jobUid,
+        title: cp.title,
+        createdAt: cp.createdAt,
+        updatedAt: Date.now(),
+        totalBytes: cp.files.reduce((s, f) => s + (f.size || 0), 0),
+        settings: cp.settings,
+        files: cp.files,
+        itemQuoteTitles: cp.itemQuoteTitles || [],
+      };
+      await saveRecentBatchArchive(archive);
+      recentBatchArchive.value = archive;
       await clearBatchCheckpoint();
       pendingCheckpoint.value = null;
+      rebuildArchivePreviewUrls();
       return;
     }
     pendingCheckpoint.value = cp;
+    rebuildArchivePreviewUrls();
   } catch {
     pendingCheckpoint.value = null;
   }
+}
+
+async function refreshRecentBatchArchive() {
+  try {
+    recentBatchArchive.value = await loadRecentBatchArchive();
+    rebuildArchivePreviewUrls();
+  } catch {
+    recentBatchArchive.value = null;
+  }
+}
+
+function buildRecentArchiveFromSnapshot(params: {
+  jobUid: string;
+  title: string;
+  snapshot: QueuedImage[];
+  quoteTitles: string[];
+  createdAt?: number;
+}): RecentBatchArchive {
+  const files: CheckpointFileEntry[] = params.snapshot.map((q) => ({
+    id: q.id,
+    name: q.file.name,
+    type: q.file.type || "image/png",
+    size: q.file.size,
+    blob: q.file,
+  }));
+  return {
+    version: 1,
+    jobUid: params.jobUid,
+    title: params.title,
+    createdAt: params.createdAt || Date.now(),
+    updatedAt: Date.now(),
+    totalBytes: files.reduce((s, f) => s + (f.size || 0), 0),
+    settings: {
+      mode: mode.value,
+      docType: docType.value,
+      outputMode: outputMode.value,
+      mergePerImage: mergePerImage.value,
+      pricesOnly: pricesOnly.value,
+      dualVerify: dualVerify.value,
+      modelTier: modelTier.value,
+      forceDemo: forceDemo.value,
+      customHint: customHint.value,
+    },
+    files,
+    itemQuoteTitles: params.quoteTitles,
+  };
 }
 
 async function persistActiveCheckpoint(stoppedFlag?: boolean) {
@@ -1421,6 +1682,7 @@ async function discardCheckpoint() {
   progressItems.value = [];
   lastBatchSnapshot.value = [];
   lastBatchCollected.value = [];
+  rebuildArchivePreviewUrls();
   ElMessage.success("已清空本地断点缓存");
 }
 
@@ -1459,9 +1721,12 @@ async function runBatchIndices(
   snapshot: QueuedImage[],
   collected: Array<QuotationGroup | null>,
   targetIndices: number[],
-  signal: AbortSignal
+  signal: AbortSignal,
+  options?: { isSingleRerun?: boolean; backendItemIndexMap?: Record<number, number> }
 ) {
   if (targetIndices.length === 0) return;
+  const isSingleRerun = Boolean(options?.isSingleRerun);
+  const backendItemIndexMap = options?.backendItemIndexMap;
 
   // 「慢稳准」节流策略：
   // - 双模型交叉核验开启：严格 1 张图 × 1 切片匀速串行（单片周期 >= 4.5s，每个模型 <= 13 次/分，稳压在 Google 免费 15 RPM 以内！）
@@ -1518,7 +1783,7 @@ async function runBatchIndices(
               res = await processBatchJobItem({
                 jobUid,
                 file: targetFile,
-                itemIndex: myIdx,
+                itemIndex: backendItemIndexMap?.[myIdx] ?? myIdx,
                 mode: mode.value,
                 forceDemo: forceDemo.value,
                 customHint: customHint.value,
@@ -1591,7 +1856,9 @@ async function runBatchIndices(
           const anchorTag = slicePlan.hasHeaderAnchor ? "·列头锚定" : "";
           const sliceResults: Array<Record<string, unknown> | null> = new Array(slices.length).fill(null);
 
-          const existingSliceCp: SliceCheckpoint | undefined = activeCheckpointRef?.sliceProgress?.[myIdx];
+          const existingSliceCp: SliceCheckpoint | undefined = isSingleRerun
+            ? undefined
+            : activeCheckpointRef?.sliceProgress?.[myIdx];
           let completedSlices = 0;
           if (existingSliceCp && existingSliceCp.totalSlices === slices.length && existingSliceCp.completedSlices) {
             for (const [kStr, v] of Object.entries(existingSliceCp.completedSlices)) {
@@ -1748,7 +2015,7 @@ async function runBatchIndices(
             try {
               committed = await commitSlicedQuotation({
                 jobUid,
-                itemIndex: myIdx,
+                itemIndex: backendItemIndexMap?.[myIdx] ?? myIdx,
                 sourceFilename: qItem.file.name,
                 fileSizeBytes: qItem.file.size,
                 mode: mode.value,
@@ -1803,8 +2070,10 @@ async function runBatchIndices(
           await persistActiveCheckpoint();
         }
 
-        // 实时把已完成报价单展示进工作台
-        quotations.value = collected.filter((x): x is QuotationGroup => x !== null);
+        // 实时把已完成报价单展示进工作台（单张重跑时交由外层精确原位替换，避免覆盖其他表）
+        if (!isSingleRerun) {
+          quotations.value = collected.filter((x): x is QuotationGroup => x !== null);
+        }
       } catch (err) {
         imageAborted = true;
         if (isRequestCanceledError(err) || signal.aborted || stopRequested.value) {
@@ -1895,11 +2164,27 @@ async function executeManagedBatchRun(params: {
 
     const allCompleted = progressItems.value.length > 0 && progressItems.value.every((p) => p.status === "completed");
     if (allCompleted) {
+      const archiveTitle =
+        activeCheckpointRef?.title ||
+        (snapshot.length === 1
+          ? snapshot[0].file.name.replace(/\.[^.]+$/, "")
+          : `批量表格_${snapshot.length}份`);
+      const archive = buildRecentArchiveFromSnapshot({
+        jobUid,
+        title: archiveTitle,
+        snapshot,
+        quoteTitles: progressItems.value.map((p, i) => p.quoteTitle || collected[i]?.quote_title || p.filename),
+        createdAt: activeCheckpointRef?.createdAt || Date.now(),
+      });
+      await saveRecentBatchArchive(archive);
+      recentBatchArchive.value = archive;
       await clearBatchCheckpoint();
       activeCheckpointRef = null;
       pendingCheckpoint.value = null;
+      activeEditorJobUid.value = jobUid;
       stoppedByUser.value = false;
-      ElMessage.success(`全部 ${validQuotations.length} 份表格已提取并打包归档！`);
+      rebuildArchivePreviewUrls();
+      ElMessage.success(`全部 ${validQuotations.length} 份表格已提取并打包归档！（本地已缓存本批原图支持随时重跑）`);
       await nextTick();
       editorAnchorRef.value?.scrollIntoView({ behavior: "smooth", block: "start" });
     } else if (stopRequested.value) {
@@ -1990,6 +2275,12 @@ async function startBatchExtraction() {
       clientId: clientSessionId,
     });
     lastBatchJobUid.value = createdJob.job_uid;
+    activeEditorJobUid.value = createdJob.job_uid;
+
+    // 新一批开跑即自动替换清理上一批原图缓存，保证本地永远最多仅占用最近 1 批空间
+    await clearRecentBatchArchive();
+    recentBatchArchive.value = null;
+    revokeArchivePreviewUrls();
 
     // 立即将全部原图与任务配置落盘至 IndexedDB，确保任何中断/休眠/刷新均可一键续跑！
     activeCheckpointRef = {
@@ -2147,6 +2438,7 @@ async function resumeFromCheckpoint() {
   }
 
   lastBatchJobUid.value = activeJobUid;
+  activeEditorJobUid.value = activeJobUid;
   lastBatchSnapshot.value = restoredSnapshot;
   lastBatchCollected.value = collected;
   activeCheckpointRef = {
@@ -2158,9 +2450,19 @@ async function resumeFromCheckpoint() {
 
   if (remainingIndices.length === 0) {
     await finalizeJobWithRetry(activeJobUid);
+    const archive = buildRecentArchiveFromSnapshot({
+      jobUid: activeJobUid,
+      title: cp.title,
+      snapshot: restoredSnapshot,
+      quoteTitles: progressItems.value.map((p, i) => p.quoteTitle || collected[i]?.quote_title || p.filename),
+      createdAt: cp.createdAt,
+    });
+    await saveRecentBatchArchive(archive);
+    recentBatchArchive.value = archive;
     await clearBatchCheckpoint();
     activeCheckpointRef = null;
     pendingCheckpoint.value = null;
+    rebuildArchivePreviewUrls();
     ElMessage.success("断点任务中的所有图片均已完成并归档至 B2！");
     return;
   }
@@ -2202,6 +2504,326 @@ async function retryFailedItems() {
   });
 }
 
+function formatCurrentRerunParamsSummary(): string {
+  const modelText = dualVerify.value ? "双模型交叉核验" : "单模型";
+  const docText =
+    docType.value === "auto" ? "智能自动" : docType.value === "quotation" ? "报价单" : "通用表";
+  const noteText =
+    docType.value === "general"
+      ? "完整表格"
+      : pricesOnly.value
+      ? "仅提机型+价格"
+      : "完整保留备注";
+  const hintText = customHint.value.trim() ? " · 含自定义提示词" : "";
+  return `${modelText} · ${docText} · ${noteText}${hintText}`;
+}
+
+async function handleRerunFromEditor(quoteIdx: number) {
+  const itemIdx = resolveQuotationToSourceIndex(quoteIdx);
+  if (itemIdx < 0) {
+    ElMessage.warning("本地未找到该图的原图缓存（仅保留最近 1 批），请重新上传原图后再提取");
+    return;
+  }
+  await rerunSingleImage({ itemIndex: itemIdx, quoteIdx });
+}
+
+async function rerunSingleImage(params: { itemIndex: number; quoteIdx?: number }) {
+  if (extracting.value) return;
+  const { itemIndex, quoteIdx } = params;
+
+  // 1. 还原完整的同批原图数组，保证单张重跑绝不丢失其余原图
+  const cachedBatch = latestLocalImageBatch.value;
+  let snapshot: QueuedImage[] = [];
+  if (
+    lastBatchSnapshot.value.length > 0 &&
+    lastBatchSnapshot.value[itemIndex] &&
+    (!cachedBatch || !lastBatchJobUid.value || lastBatchJobUid.value === cachedBatch.jobUid)
+  ) {
+    snapshot = lastBatchSnapshot.value;
+  } else if (cachedBatch && cachedBatch.files[itemIndex]) {
+    snapshot = cachedBatch.files.map((entry) => {
+      const f = checkpointEntryToFile(entry);
+      const url = archivePreviewUrls.value[entry.name] || URL.createObjectURL(f);
+      return { id: entry.id, file: f, previewUrl: url };
+    });
+  }
+
+  const targetItem = snapshot[itemIndex];
+  if (!targetItem) {
+    ElMessage.warning("本地未找到该图的原图缓存，请重新上传原图");
+    return;
+  }
+
+  const displayName =
+    (quoteIdx !== undefined ? quotations.value[quoteIdx]?.quote_title : "") ||
+    progressItems.value[itemIndex]?.quoteTitle ||
+    cachedBatch?.itemQuoteTitles?.[itemIndex] ||
+    targetItem.file.name;
+
+  // 2. 轻量确认当前工作台识别参数（按用户选择直接沿用当前开关，少点一次操作）
+  try {
+    await ElMessageBox.confirm(
+      `将使用当前工作台参数（${formatCurrentRerunParamsSummary()}）强制重新识别此图，并自动应用最新「机型字典」消歧。完成后将原位替换当前批次里的该表格并自动重打云端 .zip，确认立即重跑？`,
+      `重跑「${displayName}」`,
+      {
+        confirmButtonText: "立即重跑此图",
+        cancelButtonText: "取消",
+        type: "info",
+      }
+    );
+  } catch {
+    return;
+  }
+
+  // 3. 构造完整 collected 与 progressItems（兼容刷新浏览器后直接从草稿/缓存触发单张重跑）
+  const collected: Array<QuotationGroup | null> = new Array(snapshot.length).fill(null);
+  for (let i = 0; i < snapshot.length; i++) {
+    if (lastBatchCollected.value[i]) {
+      collected[i] = lastBatchCollected.value[i];
+    }
+  }
+  const usedQuoteIndices = new Set<number>();
+  for (let i = 0; i < snapshot.length; i++) {
+    if (collected[i]) continue;
+    const exactAtI =
+      i < quotations.value.length &&
+      !usedQuoteIndices.has(i) &&
+      quotations.value[i].source_filename === snapshot[i].file.name
+        ? i
+        : quotations.value.findIndex(
+            (q, qIdx) => !usedQuoteIndices.has(qIdx) && q.source_filename === snapshot[i].file.name
+          );
+    if (exactAtI >= 0) {
+      collected[i] = quotations.value[exactAtI];
+      usedQuoteIndices.add(exactAtI);
+    }
+  }
+  if (quoteIdx !== undefined && quotations.value[quoteIdx]) {
+    collected[itemIndex] = quotations.value[quoteIdx];
+  }
+
+  const prevQuotation = collected[itemIndex];
+  if (progressItems.value.length !== snapshot.length) {
+    progressItems.value = snapshot.map((q, idx) => ({
+      id: q.id,
+      filename: q.file.name,
+      quoteTitle: collected[idx]?.quote_title || cachedBatch?.itemQuoteTitles?.[idx] || "",
+      status: collected[idx] || cachedBatch?.kind === "archive" ? "completed" : "pending",
+      message: collected[idx]
+        ? `已完成 (${collected[idx]!.merged_sheet.rows.length} 行 · 已存 B2)`
+        : cachedBatch?.kind === "archive"
+        ? "已完成 · 已存 B2"
+        : "等待处理",
+    }));
+  }
+  const prevProgressSnap = { ...progressItems.value[itemIndex] };
+  progressItems.value[itemIndex].status = "pending";
+  progressItems.value[itemIndex].message = "准备重新识别此图（强制清空旧切片缓存）...";
+
+  // 若存在未完成断点，清除该图的旧切片缓存以强制全新识别
+  if (activeCheckpointRef?.sliceProgress && activeCheckpointRef.sliceProgress[itemIndex]) {
+    delete activeCheckpointRef.sliceProgress[itemIndex];
+  }
+
+  // 4. 续期原云端批次以原位覆盖；若原批次已被用户在转换记录中删除(404)，平稳降级为新建单图批次
+  let effectiveJobUid = activeEditorJobUid.value || lastBatchJobUid.value || cachedBatch?.jobUid || "";
+  let backendItemIndexMap: Record<number, number> | undefined = undefined;
+  let fallbackNewJob = false;
+  try {
+    if (effectiveJobUid) {
+      await resumeBatchJob(effectiveJobUid, clientSessionId);
+    } else {
+      fallbackNewJob = true;
+    }
+  } catch (err) {
+    if (axios.isAxiosError(err) && err.response?.status === 404) {
+      fallbackNewJob = true;
+    } else {
+      progressItems.value[itemIndex] = prevProgressSnap;
+      ElMessage.error(extractApiError(err));
+      return;
+    }
+  }
+
+  if (fallbackNewJob) {
+    try {
+      const created = await createBatchJob({
+        title: displayName.replace(/\.[^.]+$/, "") || "单图重跑",
+        mode: mode.value,
+        outputMode: outputMode.value,
+        mergePerImage: mergePerImage.value,
+        totalItems: 1,
+        clientId: clientSessionId,
+      });
+      effectiveJobUid = created.job_uid;
+      backendItemIndexMap = { [itemIndex]: 0 };
+    } catch (err) {
+      progressItems.value[itemIndex] = prevProgressSnap;
+      ElMessage.error(extractApiError(err));
+      return;
+    }
+  }
+
+  extracting.value = true;
+  rerunningQuoteIdx.value = quoteIdx ?? null;
+  stopRequested.value = false;
+  networkPaused.value = false;
+  autoRescuing.value = false;
+
+  batchAbortController = new AbortController();
+  const signal = batchAbortController.signal;
+
+  activeKeepAlive?.release();
+  activeKeepAlive = await acquireBatchKeepAlive();
+
+  stopHeartbeat();
+  heartbeatTimer = window.setInterval(() => {
+    sendJobHeartbeat(effectiveJobUid, clientSessionId).catch(() => {});
+  }, 20000);
+
+  try {
+    await runBatchIndices(effectiveJobUid, snapshot, collected, [itemIndex], signal, {
+      isSingleRerun: true,
+      backendItemIndexMap,
+    });
+
+    try {
+      await finalizeJobWithRetry(effectiveJobUid);
+    } catch {
+      // 网络瞬断时不阻断前端已更新结果展示
+    }
+
+    const updatedQuotation = collected[itemIndex];
+    const currentProgress = progressItems.value[itemIndex] as ProgressEntry | undefined;
+    if (currentProgress?.status === "completed" && updatedQuotation) {
+      lastBatchSnapshot.value = snapshot;
+      lastBatchCollected.value = collected;
+      if (!fallbackNewJob) {
+        lastBatchJobUid.value = effectiveJobUid;
+        activeEditorJobUid.value = effectiveJobUid;
+      }
+
+      // 原位更新工作台表格列表，不丢失同批其他表格
+      const nonNullCollected = collected.filter((x): x is QuotationGroup => x !== null);
+      if (quoteIdx !== undefined && quotations.value[quoteIdx] && nonNullCollected.length < quotations.value.length) {
+        quotations.value = quotations.value.map((q, idx) => (idx === quoteIdx ? updatedQuotation : q));
+      } else if (nonNullCollected.length > 0) {
+        quotations.value = nonNullCollected;
+      }
+
+      // 同步刷新最近一批本地缓存元数据（完整保留全部原图）
+      if (recentBatchArchive.value && (!fallbackNewJob || recentBatchArchive.value.files.length === snapshot.length)) {
+        const nextTitles = [...(recentBatchArchive.value.itemQuoteTitles || [])];
+        nextTitles[itemIndex] = updatedQuotation.quote_title;
+        const nextArchive: RecentBatchArchive = {
+          ...recentBatchArchive.value,
+          itemQuoteTitles: nextTitles,
+          updatedAt: Date.now(),
+        };
+        await saveRecentBatchArchive(nextArchive);
+        recentBatchArchive.value = nextArchive;
+      } else if (activeCheckpointRef) {
+        await persistActiveCheckpoint(false);
+      }
+
+      ElMessage.success(
+        fallbackNewJob
+          ? `「${updatedQuotation.quote_title}」已重跑完成并归档为新记录`
+          : `「${updatedQuotation.quote_title}」已重跑完成并原位更新（云端表格与 .zip 已同步刷新）`
+      );
+    } else {
+      // 失败或手动取消时严保旧表格不受破坏
+      if (prevQuotation) {
+        collected[itemIndex] = prevQuotation;
+      }
+      const errDetail = progressItems.value[itemIndex]?.message || "已取消";
+      if (prevProgressSnap.status === "completed") {
+        progressItems.value[itemIndex] = {
+          ...prevProgressSnap,
+          message: `上次重跑未完成（${errDetail}），已保留原成品`,
+        };
+      }
+      ElMessage.warning(`单张重跑未完成（${errDetail}），原表格内容已完整保留`);
+    }
+  } catch (err) {
+    if (prevQuotation) {
+      collected[itemIndex] = prevQuotation;
+    }
+    if (!isRequestCanceledError(err)) {
+      ElMessage.error(extractApiError(err));
+    }
+  } finally {
+    stopHeartbeat();
+    activeKeepAlive?.release();
+    activeKeepAlive = null;
+    batchAbortController = null;
+    extracting.value = false;
+    rerunningQuoteIdx.value = null;
+    stopRequested.value = false;
+    networkPaused.value = false;
+    autoRescuing.value = false;
+    checkOtherActiveJobs();
+  }
+}
+
+async function reloadRecentBatchToQueue() {
+  if (extracting.value) return;
+  const batch = latestLocalImageBatch.value;
+  if (!batch || batch.files.length === 0) {
+    ElMessage.info("本地暂无最近一批原图缓存");
+    return;
+  }
+
+  if (queue.value.length > 0) {
+    try {
+      await ElMessageBox.confirm(
+        `当前待处理队列已有 ${queue.value.length} 张图片，是否替换为最近一批「${batch.title}」的 ${batch.files.length} 张原图？`,
+        "装回最近一批原图",
+        {
+          confirmButtonText: "替换装回队列",
+          cancelButtonText: "取消",
+          type: "info",
+        }
+      );
+    } catch {
+      return;
+    }
+  }
+
+  clearQueue();
+  const files = batch.files.map((entry) => checkpointEntryToFile(entry));
+  enqueueFiles(files);
+  activeTab.value = "workspace";
+  ElMessage.success(`已装回最近一批 ${files.length} 张原图到上传队列，可增删图片或改参数后点击「开始提取并归档」`);
+  await nextTick();
+  uploaderAnchorRef.value?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function confirmClearRecentArchive() {
+  if (extracting.value || !recentBatchArchive.value) return;
+  const count = recentBatchArchive.value.files.length;
+  const sizeText = formatSize(recentBatchArchive.value.totalBytes);
+  try {
+    await ElMessageBox.confirm(
+      `将删除浏览器本地缓存的最近一批 ${count} 张原图（约 ${sizeText}），删除后不可再对这批图点「重跑此图」或「装回队列」，不影响云端已保存的表格和 .zip。确认释放？`,
+      "释放本地原图缓存",
+      {
+        confirmButtonText: "确认释放",
+        cancelButtonText: "取消",
+        type: "warning",
+      }
+    );
+  } catch {
+    return;
+  }
+
+  await clearRecentBatchArchive();
+  recentBatchArchive.value = null;
+  lastBatchSnapshot.value = [];
+  rebuildArchivePreviewUrls();
+  ElMessage.success(`已释放本地原图缓存（${count} 张 · ${sizeText}）`);
+}
+
 async function downloadLastJobPackage() {
   if (!lastBatchJobUid.value) return;
   await downloadStoredArtifact(
@@ -2213,6 +2835,7 @@ async function downloadLastJobPackage() {
 
 function clearDraft() {
   quotations.value = [];
+  activeEditorJobUid.value = "";
 }
 
 async function loadHistory() {
@@ -2250,6 +2873,8 @@ async function restoreJobToEditor(jobUid: string) {
   loadingJobUid.value = jobUid;
   try {
     const data = await loadJobIntoEditor(jobUid);
+    activeEditorJobUid.value = jobUid;
+    lastBatchJobUid.value = jobUid;
     mergePerImage.value = data.merge_per_image;
     outputMode.value = data.output_mode;
     quotations.value = data.quotations;
@@ -2366,6 +2991,10 @@ async function loadWorkspaceBootstrap() {
     try {
       const parsed = JSON.parse(savedDraft);
       if (Array.isArray(parsed?.quotations) && parsed.quotations.length > 0) {
+        activeEditorJobUid.value = typeof parsed.jobUid === "string" ? parsed.jobUid : "";
+        if (activeEditorJobUid.value) {
+          lastBatchJobUid.value = activeEditorJobUid.value;
+        }
         mergePerImage.value = Boolean(parsed.mergePerImage ?? true);
         quotations.value = parsed.quotations;
       }
@@ -2393,7 +3022,7 @@ async function loadWorkspaceBootstrap() {
   if (activeTab.value === "history") {
     loadHistory();
   }
-  await refreshPendingCheckpoint();
+  await Promise.all([refreshPendingCheckpoint(), refreshRecentBatchArchive()]);
 }
 
 function openQuotaDialog() {
@@ -2476,13 +3105,21 @@ async function handleLogout() {
   authenticated.value = false;
   currentUsername.value = "";
   quotations.value = [];
+  activeEditorJobUid.value = "";
+  lastBatchJobUid.value = "";
   batchJobs.value = [];
   historyList.value = [];
   storageStats.value = null;
   progressItems.value = [];
+  pendingCheckpoint.value = null;
+  recentBatchArchive.value = null;
+  lastBatchSnapshot.value = [];
+  lastBatchCollected.value = [];
+  revokeArchivePreviewUrls();
   clearQueue();
+  clearRecentBatchArchive().catch(() => {});
   localStorage.removeItem(DRAFT_STORAGE_KEY);
-  ElMessage.info("已安全退出登录并清理本地草稿");
+  ElMessage.info("已安全退出登录并清理本地草稿与原图缓存");
 }
 
 const commandItems = computed<CommandItem[]>(() => [
@@ -2593,5 +3230,6 @@ onBeforeUnmount(() => {
   activeKeepAlive = null;
   stopHeartbeat();
   stopActiveJobsPolling();
+  revokeArchivePreviewUrls();
 });
 </script>

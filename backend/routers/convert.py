@@ -18,6 +18,7 @@ from models import BatchJob, BatchJobItem, ConversionRecord, DailyQuota, ModelCo
 from services.auth_service import require_auth
 from services.b2_storage import (
     b2_is_enabled,
+    delete_object_versions,
     delete_prefix_objects,
     get_b2_bucket_name,
     get_storage_stats,
@@ -665,13 +666,18 @@ def _persist_completed_quotation(
     except Exception:
         pass
 
-    # 若该 item_index 此前有失败占位记录（如点击「仅重试失败图片」补跑成功），先清除旧失败行避免重复计数
+    # 若该 item_index 此前已有记录（失败重试或单张原位重跑），清除旧行并在提交后清理已被替换的旧 .xlsx 对象键
     old_items = session.exec(
         select(BatchJobItem).where(
             BatchJobItem.job_uid == job.job_uid,
             BatchJobItem.item_index == item_index,
         )
     ).all()
+    superseded_xlsx_keys = [
+        it.xlsx_b2_key
+        for it in old_items
+        if it.xlsx_b2_key and it.xlsx_b2_key != stored_xlsx_ref
+    ]
     for old_it in old_items:
         session.delete(old_it)
     session.flush()
@@ -723,12 +729,69 @@ def _persist_completed_quotation(
     session.refresh(job_item)
     session.refresh(quota)
 
+    for old_key in superseded_xlsx_keys:
+        try:
+            delete_object_versions(old_key)
+        except Exception:
+            pass
+
     return {
         "job_uid": job.job_uid,
         "item": job_item.model_dump(),
         "quotation": quotation_obj,
         "quota": _format_quota_payload(quota),
     }
+
+
+def _record_item_failure_safely(
+    session: Session,
+    job: BatchJob,
+    item_index: int,
+    source_filename: str,
+    error_message: str,
+) -> Optional[BatchJobItem]:
+    """
+    安全写入单张失败记录：
+    - 若该 item_index 此前已有已完成且带云端 .xlsx 的存档（例如对已完成图片执行「重跑此图」时偶发 429/断网），
+      严禁覆盖或叠加重复失败行，完整保留原成品不被破坏；
+    - 否则先清除该 item_index 的旧失败占位行再写入最新错误，避免失败重试产生重复记录。
+    """
+    existing = list(
+        session.exec(
+            select(BatchJobItem).where(
+                BatchJobItem.job_uid == job.job_uid,
+                BatchJobItem.item_index == item_index,
+            )
+        ).all()
+    )
+    completed_existing = next((it for it in existing if it.status == "completed" and it.xlsx_b2_key), None)
+    if completed_existing is not None:
+        job.updated_at = utc_now_str()
+        session.add(job)
+        session.commit()
+        return completed_existing
+
+    for old_it in existing:
+        session.delete(old_it)
+    session.flush()
+
+    failed_item = BatchJobItem(
+        job_uid=job.job_uid,
+        item_index=item_index,
+        source_filename=source_filename[:120],
+        quote_title=Path(source_filename).stem[:48],
+        status="failed",
+        error_message=error_message[:300],
+        created_at=utc_now_str(),
+    )
+    session.add(failed_item)
+    session.flush()
+    _reconcile_job_state(session, job)
+    job.updated_at = utc_now_str()
+    session.add(job)
+    session.commit()
+    session.refresh(failed_item)
+    return failed_item
 
 
 def _ocr_error_status_code(err_msg: str) -> int:
@@ -785,22 +848,14 @@ def commit_sliced_quotation(
         raise HTTPException(status_code=404, detail="未找到对应的批处理任务")
 
     if req.failed_error and not req.slice_results:
-        failed_item = BatchJobItem(
-            job_uid=job_uid,
+        item_res = _record_item_failure_safely(
+            session=session,
+            job=job,
             item_index=req.item_index,
-            source_filename=req.source_filename[:120],
-            quote_title=Path(req.source_filename).stem[:48],
-            status="failed",
-            error_message=req.failed_error[:300],
-            created_at=utc_now_str(),
+            source_filename=req.source_filename,
+            error_message=req.failed_error,
         )
-        session.add(failed_item)
-        session.flush()
-        _reconcile_job_state(session, job)
-        job.updated_at = utc_now_str()
-        session.add(job)
-        session.commit()
-        return {"job_uid": job_uid, "item": failed_item.model_dump()}
+        return {"job_uid": job_uid, "item": item_res.model_dump() if item_res else None}
 
     quota = _get_or_create_today_quota(session)
     merged_result = merge_quotation_slices(
@@ -865,21 +920,13 @@ async def process_batch_item(
             dual_verify=dual_verify,
         )
     except RuntimeError as exc:
-        failed_item = BatchJobItem(
-            job_uid=job_uid,
+        _record_item_failure_safely(
+            session=session,
+            job=job,
             item_index=item_index,
-            source_filename=fname[:120],
-            quote_title=Path(fname).stem[:48],
-            status="failed",
-            error_message=str(exc)[:300],
-            created_at=utc_now_str(),
+            source_filename=fname,
+            error_message=str(exc),
         )
-        session.add(failed_item)
-        session.flush()
-        _reconcile_job_state(session, job)
-        job.updated_at = utc_now_str()
-        session.add(job)
-        session.commit()
         raise HTTPException(status_code=_ocr_error_status_code(str(exc)), detail=str(exc))
 
     apply_model_dict_to_result(session, result)
